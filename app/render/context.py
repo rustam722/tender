@@ -19,7 +19,9 @@
     tender             поля тендера; vat_rate -- итоговая ставка по цепочке,
                        vat_percent -- она же текстом: «5», «5,5»
     items              позиции лота: number, position, name, price (текст
-                       через money), price_value (Decimal -- для ячейки Excel)
+                       через money), price_value (Decimal -- для ячейки Excel);
+                       vat и vat_value -- НДС позиции по ставке тендера,
+                       округлённый до копеек (ROUND_HALF_UP) на строке
     estimate           статьи калькуляции, Decimal
     materials,         строки материалов и субподряда: number, name, unit,
     subcontract        quantity (Decimal), price и amount (текст через money),
@@ -59,7 +61,7 @@ from app.calc import LaborLine, estimate
 from app.config import BASE_DIR
 from app.models import (
     COST_MATERIALS, COST_SUBCONTRACT, ROLE_CUSTOMER, ROLE_PARTICIPANT,
-    CustomerProfile, Organization, TenderCostItem, TenderLaborRow,
+    CustomerProfile, LotItem, Organization, TenderCostItem, TenderLaborRow,
 )
 from app.render.layouts import TableLayout, build_rows, load_layout
 from app.repo import Repo
@@ -214,6 +216,18 @@ def _labor_rows(rows: list[TenderLaborRow]) -> list[dict]:
     return result
 
 
+def _lot_rows(items: list[LotItem], rate: Decimal) -> list[dict]:
+    """Позиции лота; НДС позиции округляется до копеек один раз, на строке,
+    как amount у материалов, -- форма заказчика берёт его готовым числом."""
+    rows = []
+    for n, i in enumerate(items, start=1):
+        vat = _round(i.price * rate)
+        rows.append({"number": n, "position": i.position, "name": i.name,
+                     "price": money(i.price), "price_value": i.price,
+                     "vat": money(vat), "vat_value": vat})
+    return rows
+
+
 def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
                   experience_ids: list[int] | tuple[int, ...] | None = None) -> dict:
     """Собирает контекст тендера. Неизвестный id -- LookupError по-русски.
@@ -283,9 +297,7 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
         "org": org,
         "customer": customer,
         "tender": tender_fields,
-        "items": [{"number": n, "position": i.position, "name": i.name,
-                   "price": money(i.price), "price_value": i.price}
-                  for n, i in enumerate(repo.list_lot_items(tender_id), start=1)],
+        "items": _lot_rows(repo.list_lot_items(tender_id), rate),
         "estimate": asdict(calc),
         "materials": materials_table,
         "subcontract": subcontract_table,

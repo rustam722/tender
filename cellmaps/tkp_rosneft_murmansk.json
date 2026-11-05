@@ -1,0 +1,23 @@
+{
+  "sheet": "Лист1",
+  "cells": {
+    "D8": "Ставка НДС: {tender.vat_percent}%",
+    "E23": "{conditions.Цена и условия:}",
+    "E24": "{conditions.Форма, срок и порядок оплаты:}",
+    "E25": "{conditions.Условия и место оказания услуг:}",
+    "E26": "{conditions.Срок оказания услуг:}",
+    "E27": "{conditions.Срок действия коммерческого предложения:}",
+    "E28": "{conditions.Срок действия договора:}",
+    "E29": "{conditions.Возможность привлечения субподрядчиков/субисполнителей}",
+    "B31": "{org.head_position} {org.head_name}"
+  },
+  "rows": {
+    "first_row": 9,
+    "last_row": 19,
+    "source": "items",
+    "columns": {
+      "C": "{row.price_value}",
+      "D": "{row.vat_value}"
+    }
+  }
+}

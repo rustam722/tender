@@ -372,6 +372,31 @@ def test_items_are_ordered_numbered_and_priced_through_money(repo_with_koryazhma
     assert items[1]["price_value"] == Decimal("1234567.80")
 
 
+def test_items_carry_vat_of_each_position(repo_with_koryazhma):
+    # форма заказчика хочет сумму НДС по строке: она считается здесь один раз,
+    # как amount у материалов, а не в рендере Excel
+    items = ctx_of(repo_with_koryazhma)["items"]
+    assert items[0]["vat_value"] == Decimal("285000.00")      # 5 700 000 * 5 %
+    assert items[1]["vat_value"] == Decimal("61728.39")       # 1 234 567,80 * 5 %
+    assert items[0]["vat"] == f"285{NBSP}000,00"
+
+
+def test_item_vat_is_rounded_half_up_to_kopecks(repo_with_koryazhma):
+    repo = repo_with_koryazhma
+    repo.save_lot_item(LotItem(tender_id=repo.tender_id, position=3,
+                               name="Третья", price=Decimal("100.10")))
+    # 100,10 * 5 % = 5,005 -> 5,01, а не банковское 5,00
+    assert ctx_of(repo)["items"][2]["vat_value"] == Decimal("5.01")
+
+
+def test_item_vat_follows_the_tender_rate(repo_with_koryazhma):
+    repo = repo_with_koryazhma
+    tender = repo.get_tender(repo.tender_id)
+    tender.vat_rate = Decimal("0")                  # осознанное «без НДС»
+    repo.save_tender(tender)
+    assert ctx_of(repo)["items"][0]["vat_value"] == Decimal("0.00")
+
+
 # ---- таблицы справок ----------------------------------------------------------
 
 def test_assets_table_follows_customer_profile_layout(repo_with_koryazhma):
