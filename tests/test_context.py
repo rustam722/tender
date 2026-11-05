@@ -424,6 +424,29 @@ def test_document_listed_without_a_layout_warns_about_default_columns(repo):
     assert build_context(tid, repo)["warnings"] == []
 
 
+def test_document_without_a_table_gets_no_layout_warning(repo):
+    # декларация есть в составе пакета, раскладки у неё нет и быть не должно
+    customer = repo.save_organization(Organization(role=ROLE_CUSTOMER))
+    repo.save_customer_profile(CustomerProfile(
+        customer_id=customer,
+        documents=["Декларация соответствия", "Письмо о крупности сделки"]))
+    tid = add_tender(repo, customer, None)
+    for document in ("Декларация соответствия", "Письмо о крупности сделки"):
+        assert build_context(tid, repo, document=document)["warnings"] == []
+
+
+def test_all_four_table_documents_warn_when_they_have_no_layout(repo):
+    names = ["Справка о кадровых ресурсах", "Справка о наличии оборудования",
+             "Справка о МТР", "Справка об опыте"]
+    assert ctx_module.TABLE_DOCUMENTS == set(names)
+    customer = repo.save_organization(Organization(role=ROLE_CUSTOMER))
+    repo.save_customer_profile(CustomerProfile(customer_id=customer, documents=names))
+    tid = add_tender(repo, customer, None)
+    for document in names:
+        (warning,) = build_context(tid, repo, document=document)["warnings"]
+        assert document in warning
+
+
 def test_document_layout_replaces_only_its_own_source(repo_with_koryazhma):
     repo = repo_with_koryazhma
     ctx = ctx_of(repo, document=DOC_MTR)          # раскладка источника assets

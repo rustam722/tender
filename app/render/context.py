@@ -75,6 +75,21 @@ def _round(value: Decimal) -> Decimal:
     """До копеек, ROUND_HALF_UP -- как статьи калькулятора."""
     return value.quantize(_KOPECK, rounding=ROUND_HALF_UP)
 
+# Документы, несущие табличную справку, -- имена из списка документов
+# раздела 8 описания; они же ключи CustomerProfile.documents и .layouts.
+# Только для них отсутствие раскладки в профиле -- повод предупредить: у
+# декларации или письма о крупности сделки таблицы нет, и предупреждение
+# о них было бы шумом, который приучает пролистывать настоящие.
+# Контекст не знает, какой шаблон его отрендерит, поэтому список держится
+# вручную: его нужно держать в согласии с шаблонами задачи 9 и профилями,
+# которые засевает задача 14 (новый документ с таблицей -- добавить сюда).
+TABLE_DOCUMENTS = frozenset({
+    "Справка о кадровых ресурсах",
+    "Справка о наличии оборудования",
+    "Справка о МТР",
+    "Справка об опыте",
+})
+
 # Раскладка по умолчанию -- для заказчика без профиля или с профилем, где
 # нет документа, который выбирает другую раскладку.
 _DEFAULT_LAYOUTS = {
@@ -244,7 +259,8 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
 
     layouts = _layouts(profile, document)
     warnings = []
-    if (profile and document in profile.documents
+    if (profile and document in TABLE_DOCUMENTS
+            and document in profile.documents
             and document not in profile.layouts):
         warnings.append(
             f"Для документа «{document}» в профиле заказчика не назначена "
