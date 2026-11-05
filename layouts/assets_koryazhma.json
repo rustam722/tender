@@ -1,0 +1,13 @@
+{
+  "source": "assets",
+  "numbered": false,
+  "columns": [
+    {"header": "Наименование", "parts": ["name"]},
+    {"header": "Изготовитель, марка", "parts": ["maker_model"]},
+    {"header": "Количество", "parts": ["quantity"]},
+    {"header": "Год выпуска", "parts": ["year"]},
+    {"header": "Мощность (производительность)", "parts": []},
+    {"header": "Нынешнее состояние", "parts": ["location"]},
+    {"header": "Источник", "parts": ["ownership_basis", "ownership_doc"], "join": ": "}
+  ]
+}

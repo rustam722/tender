@@ -1,0 +1,11 @@
+{
+  "source": "employees",
+  "numbered": true,
+  "columns": [
+    {"header": "№ п/п"},
+    {"header": "Должность", "parts": ["position"]},
+    {"header": "ФИО", "parts": ["full_name"]},
+    {"header": "Образование, квалификация", "parts": ["education", "qualification"], "join": ", "},
+    {"header": "Стаж, лет", "parts": ["experience_years"]}
+  ]
+}

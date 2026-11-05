@@ -1,0 +1,13 @@
+{
+  "source": "assets",
+  "numbered": true,
+  "columns": [
+    {"header": "№ п/п"},
+    {"header": "Наименование", "parts": ["name", "maker_model"]},
+    {"header": "Место нахождения", "parts": ["location"]},
+    {"header": "Право собственности", "parts": ["ownership_basis", "ownership_doc"], "join": ": "},
+    {"header": "Назначение", "parts": ["purpose"]},
+    {"header": "Характеристика, состояние", "parts": ["condition"]},
+    {"header": "Примечание", "parts": []}
+  ]
+}
