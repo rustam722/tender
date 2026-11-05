@@ -264,11 +264,28 @@ Run: `venv/Scripts/python -c "from app.inn.fns import lookup; print(lookup('5904
 - Использует: `fns.lookup`, `FnsRecord`, `InnLookupError` из задачи 3;
   `Organization` из задачи 1.
 - Отдаёт: `@dataclass RusprofileRecord` с полями `legal_address, okpo, oktmo,
-  okato, okfs, okogu, okopf, okved, charter_capital, msp_status`;
-  `rusprofile.lookup(inn: str, *, timeout: float = 30.0, session=None) -> RusprofileRecord | None`
+  okved, msp_status_text`;
+  `rusprofile.fetch(url: str, *, timeout: float = 30.0, session=None) -> RusprofileRecord | None`
   (возвращает `None` вместо исключения, если страница недоступна или разметка не узнана);
-  `lookup.build_draft(inn: str) -> tuple[Organization, list[str]]` — черновик карточки
-  и список предупреждений на русском о том, что не удалось получить.
+  `lookup.build_draft(inn: str, *, rusprofile_url: str | None = None, session=None)
+  -> tuple[Organization, list[str]]` — черновик карточки и список предупреждений
+  на русском о том, что не удалось получить.
+
+Поиск на rusprofile по ИНН недоступен: `GET /search?query=<ИНН>` отдаёт 404 без
+переадресации, форма на сайте — Vue-компонент без обычного `<form>`. Поэтому
+страница адресуется прямой ссылкой, которую пользователь вставляет один раз
+на организацию — именно так заказчик работы и описал этот шаг. Без ссылки
+черновик собирается из данных ФНС, а недостающие поля перечисляются
+в предупреждениях.
+
+Поля `Organization` именно такие (проверено по `app/models.py`):
+`bank_bik`, `bank_name`, `bank_account`, `bank_corr_account`, `head_name`,
+`head_position`, `head_basis`, `website`, `phones`, `okpo`, `oktmo`, `okved`,
+`msp_status`. Полей под ОКАТО, ОКФС, ОКОГУ, ОКОПФ и уставный капитал нет —
+их не требует ни один документ пакета, и добавлять их не нужно. Поля под дату
+регистрации тоже нет, поэтому `FnsRecord.registered` не отображается никуда.
+`msp_status` — перечисление `'', 'micro', 'small', 'medium'`, так что текст
+rusprofile «микропредприятие…» отображается в `'micro'` внутри `build_draft`.
 
 `build_draft` обязателен к успеху, если ответил ФНС. Падение rusprofile даёт
 предупреждение, а не исключение. Банк, телефоны, почта и сайт в черновике пустые —
@@ -281,35 +298,49 @@ Run: `venv/Scripts/python -c "from app.inn.fns import lookup; print(lookup('5904
 - [ ] **Шаг 2: Написать падающие тесты**
 
 ```python
+RP_URL = "https://www.rusprofile.ru/id/2854025"
+
 def test_parses_address_and_codes():
-    r = rusprofile.lookup("5904188041", session=stub(FIXTURE))
+    r = rusprofile.fetch(RP_URL, session=stub(FIXTURE))
     assert "Куйбышева" in r.legal_address
     assert r.okpo == "85081307"
     assert r.oktmo == "57701000001"
-    assert r.msp_status.startswith("микропредприятие")
+    assert r.msp_status_text.startswith("микропредприятие")
 
 def test_unknown_markup_returns_none()             # пустой HTML → None, без исключения
 def test_network_error_returns_none()
+def test_non_200_returns_none()
 
-def test_draft_merges_both_sources(monkeypatch):
-    org, warn = build_draft("5904188041")
+def test_draft_merges_both_sources():
+    org, warn = build_draft("5904188041", rusprofile_url=RP_URL, session=stub(...))
     assert org.full_name.startswith("ОБЩЕСТВО")    # из ФНС
     assert "Куйбышева" in org.legal_address        # из rusprofile
+    assert org.msp_status == "micro"               # текст отображён в перечисление
     assert org.role == "customer"
 
-def test_draft_survives_rusprofile_failure(monkeypatch):
-    # rusprofile отдаёт None
-    org, warn = build_draft("5904188041")
+def test_draft_without_url_uses_fns_only():
+    org, warn = build_draft("5904188041", session=stub(...))
+    assert org.ogrn == "1085904010224"
+    assert org.legal_address == ""
+    assert any("адрес" in w.lower() for w in warn)
+
+def test_draft_survives_rusprofile_failure():
+    # rusprofile отдаёт None при переданной ссылке
+    org, warn = build_draft("5904188041", rusprofile_url=RP_URL, session=stub(...))
     assert org.inn == "5904188041"                 # данные ФНС на месте
     assert any("адрес" in w.lower() for w in warn) # Review Focus 3
 
 def test_draft_warns_about_bank_and_contacts():
-    org, warn = build_draft("5904188041")
+    org, warn = build_draft("5904188041", session=stub(...))
     assert any("банк" in w.lower() for w in warn)
-    assert org.bik == "" and org.email == ""
+    assert org.bank_bik == "" and org.email == ""
 
 def test_draft_propagates_fns_failure():
     # InnNotFound из ФНС поднимается наружу — карточку строить не из чего
+
+def test_draft_picks_row_matching_requested_inn():
+    # ФНС вернула несколько строк: берётся совпавшая по ИНН,
+    # при нескольких совпавших — первая, с предупреждением
 ```
 
 - [ ] **Шаг 3: Запустить, убедиться что падает**
