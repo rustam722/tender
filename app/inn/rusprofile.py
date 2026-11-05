@@ -28,18 +28,30 @@ class RusprofileRecord:
     msp_status_text: str
 
 
-def _is_rusprofile_url(url) -> bool:
+def normalize_url(url) -> str | None:
+    """Ссылка на rusprofile.ru, достроенная до https://; None, если ссылка ведёт не туда.
+
+    Допускает вставку без схемы (`www.rusprofile.ru/id/1`) и со схемой http://.
+    """
     if not isinstance(url, str):
-        return False
+        return None
+    url = url.strip()
+    if not url:
+        return None
+    if "://" not in url:
+        url = "https://" + url
+    elif url.lower().startswith("http://"):
+        url = "https://" + url[len("http://"):]
     try:
-        parts = urlparse(url.strip())
-        return (
+        parts = urlparse(url)
+        ok = (
             parts.scheme == "https"
             and parts.hostname in ALLOWED_HOSTS
             and parts.port in (None, 443)
         )
     except ValueError:
-        return False
+        return None
+    return url if ok else None
 
 
 def _norm(text: str) -> str:
@@ -94,10 +106,10 @@ def _parse(content: bytes) -> RusprofileRecord | None:
 
 
 def fetch(url: str, *, timeout: float = 30.0, session=None) -> RusprofileRecord | None:
-    """Читает страницу организации по ссылке. None при любой неудаче."""
-    if not _is_rusprofile_url(url):
+    """Читает страницу организации по ссылке (схему https:// можно не писать). None при любой неудаче."""
+    url = normalize_url(url)
+    if url is None:
         return None
-    url = url.strip()
     headers = {"User-Agent": USER_AGENT}
     try:
         if session is None:

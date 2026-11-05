@@ -100,7 +100,6 @@ def test_non_200_returns_none(status):
         "5904188041",
         "https://example.com/id/2854025",
         "https://www.rusprofile.ru.evil.com/id/1",
-        "http://www.rusprofile.ru/id/2854025",
         "file:///etc/passwd",
     ],
 )
@@ -113,3 +112,30 @@ def test_foreign_or_malformed_url_returns_none_without_any_request(bad):
 def test_accepts_bare_rusprofile_host():
     session = stub()
     assert rusprofile.fetch("https://rusprofile.ru/id/2854025", session=session) is not None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "www.rusprofile.ru/id/2854025",
+        "rusprofile.ru/id/2854025",
+        "http://www.rusprofile.ru/id/2854025",
+        "  https://www.rusprofile.ru/id/2854025\n",
+    ],
+)
+def test_url_without_scheme_or_with_http_is_completed_to_https(url):
+    session = stub()
+    assert rusprofile.fetch(url, session=session) is not None
+    ((called, _),) = session.calls
+    assert called == "https://" + url.strip().split("://")[-1]
+    assert rusprofile.normalize_url(url) == called
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "   ", "5904188041", "example.com/id/1", "rusprofile.ru.evil.com/id/1", "javascript:alert(1)"]
+)
+def test_normalize_url_rejects_foreign_hosts(bad):
+    assert rusprofile.normalize_url(bad) is None
+    session = stub()
+    assert rusprofile.fetch(bad, session=session) is None
+    assert session.calls == []

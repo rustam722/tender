@@ -46,7 +46,7 @@ class RoutingSession:
         self.calls.append(("GET", url))
         if "egrul.nalog.ru" in url:
             return Resp({"rows": self.rows})
-        assert url.startswith("https://www.rusprofile.ru/"), url
+        assert url.split("/")[2] in ("www.rusprofile.ru", "rusprofile.ru"), url
         if self.rp_error:
             raise self.rp_error
         return self.rp_response
@@ -66,13 +66,13 @@ def test_draft_merges_both_sources():
     assert org.short_name == 'ООО "ТЕХНОСФЕРА"'
     assert (org.inn, org.kpp, org.ogrn) == ("5904188041", "590401001", "1085904010224")
     assert org.head_name == "Рабичко Елена Михайловна"
-    assert org.head_position == "ДИРЕКТОР"
+    assert org.head_position == "Директор"
     assert "Куйбышева" in org.legal_address
     assert (org.okpo, org.oktmo, org.okved) == ("85081307", "57701000001", "71.12.13")
     assert org.msp_status == "micro"
     assert org.role == ROLE_CUSTOMER
     assert org.id is None
-    assert not any("адрес" in w.lower() for w in warn)
+    assert not any("юридический адрес" in w.lower() for w in warn)
     assert session.hosts_called() == {"egrul.nalog.ru", "www.rusprofile.ru"}
 
 
@@ -82,7 +82,7 @@ def test_draft_without_url_uses_fns_only():
     assert org.ogrn == "1085904010224"
     assert org.legal_address == ""
     assert org.okpo == org.oktmo == org.okved == org.msp_status == ""
-    assert any("адрес" in w.lower() for w in warn)
+    assert any("юридический адрес" in w.lower() for w in warn)
     assert any("rusprofile" in w.lower() for w in warn)
     assert "www.rusprofile.ru" not in session.hosts_called()
 
@@ -102,14 +102,35 @@ def test_draft_survives_rusprofile_failure(rp_kwargs):
     assert org.inn == "5904188041"
     assert org.full_name.startswith("ОБЩЕСТВО")
     assert org.legal_address == ""
-    assert any("адрес" in w.lower() for w in warn)
+    assert any("юридический адрес" in w.lower() for w in warn)
 
 
-def test_draft_with_foreign_url_makes_no_request_to_it_and_warns():
+def test_draft_with_foreign_url_makes_no_request_and_says_link_is_wrong():
     session = RoutingSession()
     _, warn = build_draft("5904188041", rusprofile_url="https://example.com/x", session=session)
     assert session.hosts_called() == {"egrul.nalog.ru"}
-    assert any("адрес" in w.lower() for w in warn)
+    assert any("юридический адрес" in w.lower() for w in warn)
+    assert any("должна вести на rusprofile.ru" in w for w in warn)
+    assert not any("Не удалось прочитать" in w for w in warn)
+
+
+def test_unreadable_page_and_wrong_link_get_different_messages():
+    wrong = build_draft("5904188041", rusprofile_url="https://example.com/x", session=RoutingSession())[1]
+    down = build_draft(
+        "5904188041", rusprofile_url=RP_URL, session=RoutingSession(rp_error=requests.Timeout("slow"))
+    )[1]
+    assert not any("должна вести" in w for w in down)
+    assert any("Не удалось прочитать" in w for w in down)
+    assert set(wrong) != set(down)
+
+
+@pytest.mark.parametrize(
+    "url", ["www.rusprofile.ru/id/2854025", "rusprofile.ru/id/2854025", "  " + RP_URL + "\n"]
+)
+def test_draft_accepts_link_pasted_without_scheme(url):
+    org, warn = build_draft("5904188041", rusprofile_url=url, session=RoutingSession())
+    assert "Куйбышева" in org.legal_address
+    assert not any("должна вести" in w for w in warn)
 
 
 def test_draft_partial_rusprofile_page_warns_about_missing_fields():
@@ -117,7 +138,7 @@ def test_draft_partial_rusprofile_page_warns_about_missing_fields():
     org, warn = build_draft("5904188041", rusprofile_url=RP_URL, session=with_page(page))
     assert org.okpo == "12345678"
     assert org.legal_address == ""
-    assert any("адрес" in w.lower() for w in warn)
+    assert any("юридический адрес" in w.lower() for w in warn)
     assert any("октмо" in w.lower() for w in warn)
     assert not any("окпо" in w.lower() for w in warn)
 
@@ -150,8 +171,11 @@ def test_draft_warns_about_bank_and_contacts():
     assert any("телефон" in w for w in low)
     assert any("e-mail" in w for w in low)
     assert any("сайт" in w for w in low)
+    assert any("основание полномочий" in w for w in low)
+    assert any("почтовый адрес" in w for w in low)
     assert org.bank_name == org.bank_bik == org.bank_account == org.bank_corr_account == ""
     assert org.phones == org.email == org.website == ""
+    assert org.head_basis == org.postal_address == ""
 
 
 def test_warnings_are_russian_sentences():
@@ -200,10 +224,33 @@ def test_draft_with_several_matching_rows_takes_first_and_warns():
     assert any("нескольк" in w.lower() for w in warn)
 
 
-def test_draft_with_no_row_matching_inn_raises_not_found():
+def test_draft_with_no_row_matching_inn_raises_not_found_with_plain_message():
     other = dict(FNS_ROW, i="5904000000")
-    with pytest.raises(InnNotFound):
+    with pytest.raises(InnNotFound) as info:
         build_draft("5904188041", session=RoutingSession(rows=[other]))
+    assert info.value.args[0] == (
+        "ФНС вернула записи, но ИНН в них не совпадает с запрошенным. Проверьте ИНН."
+    )
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("ДИРЕКТОР", "Директор"),
+        ("ГЕНЕРАЛЬНЫЙ ДИРЕКТОР", "Генеральный директор"),
+        ("", ""),
+    ],
+)
+def test_head_position_is_normalised_to_sentence_case(raw, expected):
+    row = dict(FNS_ROW, g=(f"{raw}: Рабичко Елена Михайловна" if raw else "Рабичко Елена Михайловна"))
+    org, _ = build_draft("5904188041", session=RoutingSession(rows=[row]))
+    assert org.head_position == expected
+    assert org.head_name == "Рабичко Елена Михайловна"
+
+
+def test_fns_record_keeps_raw_head_post():
+    record = fns.lookup("5904188041", session=RoutingSession())[0]
+    assert record.head_post == "ДИРЕКТОР"
 
 
 def test_unreadable_registration_date_does_not_break_draft():

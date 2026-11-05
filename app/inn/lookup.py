@@ -13,7 +13,7 @@ _PAGE_FIELDS = "юридический адрес, ОКПО, ОКТМО, ОКВ�
 def _pick_record(inn: str, records: list[fns.FnsRecord]) -> tuple[fns.FnsRecord, list[str]]:
     matching = [r for r in records if r.inn == inn]
     if not matching:
-        raise fns.InnNotFound("ФНС вернула организации, но ни у одной нет запрошенного ИНН")
+        raise fns.InnNotFound("ФНС вернула записи, но ИНН в них не совпадает с запрошенным. Проверьте ИНН.")
     warnings = []
     if len(matching) > 1:
         warnings.append(
@@ -21,6 +21,12 @@ def _pick_record(inn: str, records: list[fns.FnsRecord]) -> tuple[fns.FnsRecord,
             "Взята первая, проверьте реквизиты."
         )
     return matching[0], warnings
+
+
+def _normalize_position(post: str) -> str:
+    """«ГЕНЕРАЛЬНЫЙ ДИРЕКТОР» -> «Генеральный директор»: ФНС отдаёт должность capslock'ом."""
+    post = post.strip()
+    return post[:1].upper() + post[1:].lower()
 
 
 def _msp_code(text: str) -> str:
@@ -74,7 +80,7 @@ def build_draft(
         short_name=record.short_name,
         full_name=record.full_name,
         head_name=record.head_fio,
-        head_position=record.head_post,
+        head_position=_normalize_position(record.head_post),
     )
     if not rusprofile_url:
         warnings.append(
@@ -82,18 +88,32 @@ def build_draft(
             f"{_PAGE_FIELDS}. Вставьте ссылку вида https://www.rusprofile.ru/id/… "
             "или введите эти данные вручную."
         )
+    elif rusprofile.normalize_url(rusprofile_url) is None:
+        warnings.append(
+            f"Ссылка должна вести на rusprofile.ru (например, https://www.rusprofile.ru/id/…). "
+            f"Страница не прочитана, поэтому не заполнены: {_PAGE_FIELDS}. "
+            "Исправьте ссылку или введите эти данные вручную."
+        )
     else:
         page = rusprofile.fetch(rusprofile_url, session=session)
         if page is None:
             warnings.append(
-                f"Не удалось прочитать страницу rusprofile по указанной ссылке, поэтому не заполнены: "
-                f"{_PAGE_FIELDS}. Проверьте ссылку или введите эти данные вручную."
+                f"Не удалось прочитать страницу rusprofile по указанной ссылке (сайт недоступен "
+                f"или страница устроена иначе), поэтому не заполнены: {_PAGE_FIELDS}. "
+                "Повторите позже или введите эти данные вручную."
             )
         else:
             warnings.extend(_apply_rusprofile(org, page))
     warnings.append(
         "Банковские реквизиты (банк, БИК, расчётный и корреспондентский счета) "
         "не найдены ни в одном источнике. Введите их вручную."
+    )
+    warnings.append(
+        "Основание полномочий руководителя (например, «на основании Устава») "
+        "не найдено ни в одном источнике. Введите его вручную."
+    )
+    warnings.append(
+        "Почтовый адрес не найден ни в одном источнике. Введите его вручную."
     )
     warnings.append(
         "Телефоны, e-mail и сайт организации не найдены ни в одном источнике "
