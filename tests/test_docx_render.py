@@ -10,10 +10,13 @@ import docx
 import pytest
 from lxml import etree
 
+from app.models import Asset
 from app.render.context import money
+from app.render.layouts import build_rows, load_layout
 from app.render.docx_render import TemplateError, render_docx
 
 FIXTURE = Path(__file__).parent / "fixtures" / "minimal.docx"
+LAYOUTS = Path(__file__).parent.parent / "layouts"
 NBSP = "\u00a0"
 
 
@@ -186,3 +189,63 @@ def test_line_break_and_edge_spaces_in_value_survive(tmp_path):
                       tmp_path / "o.docx")
     assert docx.Document(out).paragraphs[0].text == value
     assert _table(out)[1][1] == value
+
+
+def _assets(count):
+    return [Asset(name=f"Прибор {i}", maker_model=f"Марка-{i}", quantity=i, year=2000 + i,
+                  location=f"Склад {i}", ownership_basis="собственность",
+                  ownership_doc=f"св-во № {i}", purpose=f"цель {i}",
+                  condition="рабочее")
+            for i in range(1, count + 1)]
+
+
+def _layout_context(path, count):
+    layout = load_layout(path)
+    return {"org": {"short_name": "ООО «Техносфера»"},
+            "assets": {"headers": [c.header for c in layout.columns],
+                       "rows": build_rows(layout, _assets(count))}}
+
+
+@pytest.mark.parametrize("layout_file", ["assets_koryazhma.json", "assets_rnpk.json"])
+def test_one_template_renders_any_layout(tmp_path, layout_file):
+    """Число колонок задаёт раскладка, а не шаблон: шаблон один."""
+    ctx = _layout_context(LAYOUTS / layout_file, 23)
+    out = render_docx(FIXTURE, ctx, tmp_path / "o.docx")
+    table = _table(out)
+    assert len(table) == 1 + 23
+    assert table[0] == ctx["assets"]["headers"]
+    assert table[1:] == ctx["assets"]["rows"]
+    assert {len(row) for row in table} == {7}
+
+
+def test_same_template_renders_six_and_seven_columns(tmp_path):
+    seven = _layout_context(LAYOUTS / "assets_koryazhma.json", 3)
+    six = {"org": seven["org"],
+           "assets": {"headers": seven["assets"]["headers"][:6],
+                      "rows": [r[:6] for r in seven["assets"]["rows"]]}}
+    for name, ctx, width in (("six", six, 6), ("seven", seven, 7)):
+        out = render_docx(FIXTURE, ctx, tmp_path / f"{name}.docx")
+        table = docx.Document(out).tables[0]
+        assert [len(r.cells) for r in table.rows] == [width] * 4
+        assert _table(out) == [ctx["assets"]["headers"]] + ctx["assets"]["rows"]
+        grid = table._tbl.tblGrid.findall(
+            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}gridCol")
+        assert len(grid) == width                     # сетка таблицы сходится с клетками
+
+
+def test_header_formatting_follows_every_generated_cell(tmp_path):
+    """Оформление несёт клетка-прототип: жирный шрифт и заливка шапки на всех колонках."""
+    ctx = _layout_context(LAYOUTS / "assets_koryazhma.json", 2)
+    out = render_docx(FIXTURE, ctx, tmp_path / "o.docx")
+    header = docx.Document(out).tables[0].rows[0].cells
+    assert len(header) == 7
+    for cell in header:
+        assert all(run.bold for run in cell.paragraphs[0].runs if run.text)
+        assert 'w:fill="D9D9D9"' in cell._tc.xml
+
+
+def test_empty_rows_keep_every_header_cell(tmp_path):
+    ctx = _layout_context(LAYOUTS / "assets_rnpk.json", 0)
+    out = render_docx(FIXTURE, ctx, tmp_path / "o.docx")
+    assert _table(out) == [ctx["assets"]["headers"]]
+    assert len(_table(out)[0]) == 7
