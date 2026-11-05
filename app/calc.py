@@ -1,10 +1,11 @@
-"""Калькулятор цены: прямой счёт от состава работ к итогу с НДС.
+"""Калькулятор цены: прямой счёт от состава работ к итогу с НДС и обратный --
+подбор часов под заданную цену без НДС.
 
 Чистая арифметика над Decimal, без ввода-вывода. Каждая статья округляется
 до копеек (ROUND_HALF_UP), а следующие статьи считаются от уже округлённых:
 итог всегда равен сумме статей, как её видит читатель формы.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal
 
 from app.models import OrgSettings
@@ -63,3 +64,67 @@ def estimate(labor: list[LaborLine], materials: Decimal, subcontract: Decimal,
     return Estimate(materials=materials, labor=fot, insurance=insurance,
                     subcontract=subcontract, overhead=overhead, profit=profit,
                     total_wo_vat=total, vat=vat, total_with_vat=total + vat)
+
+
+class TargetTooLow(ValueError):
+    """Целевая цена не оставляет денег на работу (или работы в расчёте нет)."""
+
+
+def _rub(value: Decimal) -> str:
+    return f"{_money(value):,.2f}".replace(",", " ")
+
+
+def solve_hours(target_wo_vat: Decimal, labor: list[LaborLine], materials: Decimal,
+                subcontract: Decimal, settings: OrgSettings) -> list[LaborLine]:
+    """Подбирает часы так, чтобы цена без НДС была как можно ближе к цели.
+
+    Ставки, проценты, материалы и субподряд не трогаются. Один множитель k
+    на все строки (замкнутая форма), часы -- целые; затем жадная доводка.
+    Исходные строки не меняются, возвращаются новые."""
+    fot0 = sum((Decimal(x.headcount) * x.hours * x.rate for x in labor),
+               Decimal("0"))
+    # a: сколько рублей итога до прибыли даёт один рубль ФОТ со всеми надбавками
+    a = fot0 * (1 + settings.insurance_rate + settings.injury_rate
+                + settings.overhead_rate)
+    if a == 0:
+        raise TargetTooLow("В расчёте нет трудозатрат: нет строк с часами и ставкой, "
+                           "подбирать часы не из чего. Добавьте строки трудозатрат.")
+    k = ((target_wo_vat - materials) / (1 + settings.profit_rate) - subcontract) / a
+    if k <= 0:
+        fixed = materials + subcontract * (1 + settings.profit_rate)
+        raise TargetTooLow(
+            f"Цена {_rub(target_wo_vat)} руб. без НДС не больше неизбежных расходов "
+            f"(материалы и субподряд с прибылью -- {_rub(fixed)} руб.): на работу "
+            "ничего не остаётся. Увеличьте цену или уменьшите материалы и субподряд.")
+
+    hours = [(k * x.hours).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+             for x in labor]
+
+    def gap(current: list[Decimal]) -> Decimal:
+        lines = [replace(x, hours=h) for x, h in zip(labor, current)]
+        return abs(target_wo_vat - estimate(lines, materials, subcontract,
+                                            settings).total_wo_vat)
+
+    # Жадная доводка: часы округлены, и шаг сетки итогов -- стоимость часа самой
+    # дешёвой строки. Каждый проход берёт ровно один сдвиг на час (строка, знак),
+    # который сильнее всего уменьшает расхождение. Расхождение в копейках строго
+    # убывает, поэтому цикл конечен. Ничья -- первая строка, сначала +1. Часы не
+    # уходят ниже нуля; строки без часов не трогаем.
+    best = gap(hours)
+    while True:
+        move = None
+        for i, line in enumerate(labor):
+            if line.hours <= 0:
+                continue
+            for step in (1, -1):
+                new = hours[i] + step
+                if new < 0:
+                    continue
+                trial = hours[:i] + [new] + hours[i + 1:]
+                g = gap(trial)
+                if g < best:
+                    best, move = g, trial
+        if move is None:
+            break
+        hours = move
+    return [replace(x, hours=h) for x, h in zip(labor, hours)]
