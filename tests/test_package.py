@@ -19,7 +19,7 @@ from app.models import (
 )
 from app.render import package as package_module
 from app.render.package import (
-    PackageError, PackageResult, build_package, safe_filename,
+    PackageError, PackageResult, build_package, planned_files, safe_filename,
 )
 from app.repo import Repo
 
@@ -852,3 +852,109 @@ def test_one_missing_template_in_an_existing_folder_stays_a_skip(
     result = build_package(tid, [DECLARATION, MTR], tmp_path / "out", repo)
     assert len(result.written) == 1
     assert [d for d, _ in result.skipped] == [MTR]
+
+
+# ---- planned_files: что будет записано, до записи -----------------------------
+
+def test_planned_files_equal_what_build_package_then_writes(repo, dirs, tmp_path):
+    templates, cellmaps = dirs
+    shutil.copy(REAL_FORM, templates / "forma_tkp_rosneft_murmansk.xlsx")
+    shutil.copy(ROOT / "cellmaps" / "tkp_rosneft_murmansk.json", cellmaps)
+    for name in (DECLARATION, MTR, EQUIPMENT):
+        make_template(templates / f"{name}.docx", "x")
+    docs = {
+        DECLARATION: DocSpec(prefix="1."),
+        MTR: DocSpec(prefix="8.1_ "),
+        EQUIPMENT: DocSpec(prefix="П" * 300),            # имя обрежется
+        TKP: DocSpec(template="forma_tkp_rosneft_murmansk.xlsx",
+                     cellmap="tkp_rosneft_murmansk.json", prefix="3."),
+    }
+    tid = make_tender(repo, documents=list(docs), docs=docs,
+                      deal_answers={c: "подтверждаю" for c in CONDITIONS})
+    repo.save_lot_item(LotItem(tender_id=tid, position=1, name="П",
+                               price=Decimal("1.00")))
+    documents = [DECLARATION, MTR, EQUIPMENT, TKP, DECLARATION]
+    out = tmp_path / "out"
+
+    plan = planned_files(tid, documents, out, repo)
+    result = build_package(tid, documents, out, repo)
+
+    assert [path for _, path in plan] == result.written
+    assert [doc for doc, _ in plan] == [DECLARATION, MTR, EQUIPMENT, TKP]
+
+
+def test_planned_files_writes_nothing_and_creates_no_folder(repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION])
+    out = tmp_path / "нет" / "такой"
+    plan = planned_files(tid, [DECLARATION], out, repo)
+    assert plan == [(DECLARATION, out / f"{DECLARATION}.docx")]
+    assert not (tmp_path / "нет").exists()
+
+
+def test_planned_files_include_files_that_already_exist(repo, dirs, tmp_path):
+    # именно по этому списку экран выбирает, о чём спросить про замену
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    make_template(templates / f"{MTR}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION, MTR])
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / f"{MTR}.docx").write_bytes(b"old")
+    plan = planned_files(tid, [DECLARATION, MTR], out, repo)
+    existing = [doc for doc, path in plan if path.exists()]
+    assert existing == [MTR]
+    assert [doc for doc, _ in plan] == [DECLARATION, MTR]
+
+
+def test_planned_files_leave_out_documents_that_will_certainly_be_skipped(
+        repo, dirs, tmp_path):
+    templates, _ = dirs
+    shutil.copy(REAL_FORM, templates / "forma_tkp_rosneft_murmansk.xlsx")
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    (templates / "форма.pdf").write_bytes(b"%PDF")
+    docs = {
+        TKP: DocSpec(template="forma_tkp_rosneft_murmansk.xlsx",
+                     cellmap="нет_карты.json"),               # карты нет
+        EXPERIENCE: DocSpec(template="форма.pdf"),            # не Word и не Excel
+    }
+    tid = make_tender(repo, documents=[DECLARATION, MTR, TKP, EXPERIENCE],
+                      docs=docs)
+    # МТР -- шаблона нет вовсе
+    plan = planned_files(tid, [DECLARATION, MTR, TKP, EXPERIENCE], tmp_path / "o", repo)
+    assert [doc for doc, _ in plan] == [DECLARATION]
+    built = build_package(tid, [DECLARATION, MTR, TKP, EXPERIENCE], tmp_path / "o", repo)
+    assert [doc for doc, _ in built.skipped] == [MTR, TKP, EXPERIENCE]
+
+
+def test_planned_files_do_not_promise_two_documents_one_name(repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / "a.docx", "первый")
+    make_template(templates / "b.docx", "второй")
+    tid = make_tender(repo, documents=["Справка: 1", "Справка? 1"], docs={
+        "Справка: 1": DocSpec(template="a.docx"),
+        "Справка? 1": DocSpec(template="b.docx")})
+    documents = ["Справка: 1", "Справка? 1"]
+    plan = planned_files(tid, documents, tmp_path / "out", repo)
+    assert [doc for doc, _ in plan] == ["Справка: 1"]
+    assert [p for _, p in plan] == build_package(
+        tid, documents, tmp_path / "out", repo).written
+
+
+def test_planned_files_unknown_tender_is_lookup_error(repo, dirs, tmp_path):
+    with pytest.raises(LookupError):
+        planned_files(999, [DECLARATION], tmp_path / "out", repo)
+
+
+def test_planned_files_missing_templates_folder_is_package_error(
+        repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(package_module, "TEMPLATES_DOCS_DIR", tmp_path / "нет")
+    tid = make_tender(repo, documents=[DECLARATION])
+    with pytest.raises(PackageError):
+        planned_files(tid, [DECLARATION], tmp_path / "out", repo)
+
+
+def test_planned_files_for_an_empty_package_is_empty(repo, dirs, tmp_path):
+    tid = make_tender(repo)
+    assert planned_files(tid, [], tmp_path / "out", repo) == []

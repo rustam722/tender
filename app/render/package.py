@@ -157,11 +157,12 @@ def _template_path(document: str, template: str) -> Path:
     return path
 
 
-def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
-               taken: set[str], warnings: list[tuple[str, str]],
-               overwrite: bool) -> Path:
-    """Собирает один документ; при отказе поднимает исключение. Нового файла
-    после отказа не остаётся, а прежний (при overwrite) остаётся целым."""
+def _plan_one(document: str, spec, out_dir: Path,
+              taken: set[str]) -> tuple[Path, Path]:
+    """Шаблон и итоговый путь документа, либо _Refusal, если документ заведомо
+    не будет записан. Общий шаг для planned_files и build_package: путь, о
+    котором спросил экран, и путь, который запишет сборка, считаются одним кодом.
+    Занятое имя вносится в `taken`."""
     template = _template_path(document, spec.template if spec else "")
     target = _target(out_dir, document, spec.prefix if spec else "",
                      template.suffix.lower())
@@ -173,6 +174,25 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
             f"Имя файла «{target.name}» совпало с другим документом пакета: "
             "второй не записан. Задайте документам разные префиксы в профиле "
             "заказчика.")
+    if template.suffix.lower() == ".xlsx":
+        if not spec or not spec.cellmap:
+            raise _Refusal(
+                f"Для книги «{template.name}» в профиле заказчика не указана "
+                "карта ячеек. Добавьте её в описание документа.")
+        if not (CELLMAPS_DIR / spec.cellmap).is_file():
+            raise _Refusal(
+                f"Карта ячеек {spec.cellmap} не найдена в папке "
+                f"{CELLMAPS_DIR.name}. Проверьте имя файла в профиле заказчика.")
+    taken.add(target.name.casefold())
+    return template, target
+
+
+def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
+               taken: set[str], warnings: list[tuple[str, str]],
+               overwrite: bool) -> Path:
+    """Собирает один документ; при отказе поднимает исключение. Нового файла
+    после отказа не остаётся, а прежний (при overwrite) остаётся целым."""
+    template, target = _plan_one(document, spec, out_dir, taken)
     replacing = target.exists()
     if replacing and not overwrite:
         raise _Refusal(
@@ -189,10 +209,6 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
             if replacing else target)
     try:
         if template.suffix.lower() == ".xlsx":
-            if not spec or not spec.cellmap:
-                raise _Refusal(
-                    f"Для книги «{template.name}» в профиле заказчика не указана "
-                    "карта ячеек. Добавьте её в описание документа.")
             fill_workbook(template, load_cellmap(CELLMAPS_DIR / spec.cellmap),
                           context, work)
         else:
@@ -212,6 +228,52 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
     return target
 
 
+def _prepare(tender_id: int, documents: list[str], out_dir: Path, repo: Repo):
+    """Проверки, общие для планирования и сборки: тендер, папка шаблонов.
+    Возвращает профиль заказчика (или None) и абсолютную папку пакета."""
+    tender = repo.get_tender(tender_id)
+    profile = (repo.find_customer_profile(tender.customer_id)
+               if tender.customer_id is not None else None)
+    if documents and not TEMPLATES_DOCS_DIR.is_dir():
+        # одна причина на весь пакет -- одно сообщение, а не по строке на документ
+        raise PackageError(
+            f"Папка шаблонов «{TEMPLATES_DOCS_DIR}» не найдена: без неё не "
+            "собрать ни один документ. Проверьте, что папка templates_docs "
+            "лежит рядом с программой и в ней есть шаблоны.")
+    return profile, Path(os.path.abspath(out_dir))
+
+
+def planned_files(tender_id: int, documents: list[str], out_dir: Path,
+                  repo: Repo) -> list[tuple[str, Path]]:
+    """Пары «документ, итоговый путь» -- что `build_package` попытается записать.
+
+    Ничего не пишет и папку не создаёт. Пути считаются тем же кодом, что и в
+    сборке, поэтому совпадают с `PackageResult.written`. Файлы, которые уже
+    лежат в папке, в список входят: по нему экран и узнаёт, какие документы
+    будут заменены. Документы, которые заведомо не будут записаны (нет шаблона
+    или карты, неподдерживаемый тип, повтор, совпавшее имя, слишком длинный
+    путь), не входят. Ошибки те же, что у `build_package`: `LookupError` для
+    неизвестного тендера, `PackageError` без папки шаблонов. Документ, который
+    упадёт при самой сборке (ошибка в шаблоне, данных), заранее не угадать --
+    он в списке остаётся.
+    """
+    profile, out_dir = _prepare(tender_id, documents, out_dir, repo)
+    plan: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    taken: set[str] = set()
+    for document in documents:
+        if document in seen:
+            continue
+        seen.add(document)
+        spec = profile.docs.get(document) if profile else None
+        try:
+            _, target = _plan_one(document, spec, out_dir, taken)
+        except _Refusal:
+            continue
+        plan.append((document, target))
+    return plan
+
+
 def build_package(tender_id: int, documents: list[str], out_dir: Path,
                   repo: Repo, overwrite: bool = False) -> PackageResult:
     """Собирает документы `documents` тендера в папку `out_dir`.
@@ -225,16 +287,7 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
     папку пакета -- `PackageError`; в обоих случаях на диск ничего не пишется.
     Сбой одного документа в исключение не превращается: см. `PackageResult.skipped`.
     """
-    tender = repo.get_tender(tender_id)
-    profile = (repo.find_customer_profile(tender.customer_id)
-               if tender.customer_id is not None else None)
-    if documents and not TEMPLATES_DOCS_DIR.is_dir():
-        # одна причина на весь пакет -- одно сообщение, а не по строке на документ
-        raise PackageError(
-            f"Папка шаблонов «{TEMPLATES_DOCS_DIR}» не найдена: без неё не "
-            "собрать ни один документ. Проверьте, что папка templates_docs "
-            "лежит рядом с программой и в ней есть шаблоны.")
-    out_dir = Path(os.path.abspath(out_dir))
+    profile, out_dir = _prepare(tender_id, documents, out_dir, repo)
     _make_folder(out_dir)
 
     result = PackageResult()
@@ -260,5 +313,4 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
                 f"({type(exc).__name__}). Остальные документы пакета не затронуты.")))
         else:
             result.written.append(path)
-            taken.add(path.name.casefold())
     return result
