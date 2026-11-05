@@ -698,3 +698,46 @@ def test_docs_record_with_unknown_key_is_refused_in_russian(repo):
                       ('{"Справка о МТР": {"layout": "assets_rnpk.json"}}', pid))
     assert repo.get_customer_profile(pid).docs == {
         "Справка о МТР": DocSpec(layout="assets_rnpk.json")}
+
+
+def _set_docs_raw(repo, raw):
+    cid = repo.save_organization(make_org(role=ROLE_CUSTOMER))
+    pid = repo.save_customer_profile(CustomerProfile(customer_id=cid))
+    repo.conn.execute("UPDATE customer_profile SET docs = ? WHERE id = ?", (raw, pid))
+    return pid
+
+
+def test_docs_record_with_non_string_value_is_refused_in_russian(repo):
+    # null, число, список и булево вместо строки -- отказ с документом и полем
+    for bad in ("null", "5", "[]", "true"):
+        pid = _set_docs_raw(repo, '{"Справка о МТР": {"template": %s}}' % bad)
+        with pytest.raises(ValueError) as err:
+            repo.get_customer_profile(pid)
+        assert "Справка о МТР" in str(err.value) and "template" in str(err.value)
+        assert "строк" in str(err.value)
+    pid = _set_docs_raw(repo, '{"Анкета участника": {"prefix": "01", "layout": 7}}')
+    with pytest.raises(ValueError, match="Анкета участника.*layout|layout.*Анкета"):
+        repo.get_customer_profile(pid)
+
+
+def test_docs_top_level_must_be_an_object(repo):
+    for bad in ("[]", '"x"', "5", "null"):
+        pid = _set_docs_raw(repo, bad)
+        with pytest.raises(ValueError, match="docs"):
+            repo.get_customer_profile(pid)
+
+
+def test_docspec_refuses_non_string_fields_in_russian():
+    with pytest.raises(ValueError, match="template"):
+        DocSpec(template=None)
+    with pytest.raises(ValueError, match="prefix"):
+        DocSpec(prefix=1)
+
+
+def test_docspec_trims_template_and_cellmap():
+    # пробелы не должны прятать расширение от проверки
+    with pytest.raises(ValueError, match="карт"):
+        DocSpec(template=" form.xlsx ")
+    spec = DocSpec(template=" form.xlsx ", cellmap=" form.json ")
+    assert (spec.template, spec.cellmap) == ("form.xlsx", "form.json")
+    assert DocSpec(template="  ").template == ""

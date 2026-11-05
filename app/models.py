@@ -133,8 +133,17 @@ class DocSpec:
     prefix: str = ""
 
     def __post_init__(self):
+        for name in ("template", "cellmap", "layout", "prefix"):
+            if not isinstance(getattr(self, name), str):
+                raise ValueError(
+                    f"Поле «{name}» описания документа должно быть строкой "
+                    "(может быть пустой).")
+        # Пробелы по краям имён файлов -- опечатка, а не часть имени: без обрезки
+        # « форма.xlsx » прошёл бы мимо проверки расширения.
+        object.__setattr__(self, "template", self.template.strip())
+        object.__setattr__(self, "cellmap", self.cellmap.strip())
         # Книгу заполняют по карте ячеек: без неё заполнять нечем.
-        if self.template.lower().endswith(".xlsx") and not self.cellmap.strip():
+        if self.template.lower().endswith(".xlsx") and not self.cellmap:
             raise ValueError(
                 f"Для шаблона «{self.template}» не указана карта ячеек: "
                 "без неё книгу Excel заполнить нечем. Укажите файл карты "

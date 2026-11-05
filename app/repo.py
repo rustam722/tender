@@ -37,10 +37,16 @@ def _dataclass_to_json(obj):
     raise TypeError(f"Нельзя сохранить в JSON: {type(obj).__name__}")
 
 
-def _docs_from_json(raw: dict) -> dict[str, DocSpec]:
-    """Колонка docs -> {документ: DocSpec}. Запись, отредактированная руками,
-    с неизвестным ключом -- русский отказ с именем документа, а не TypeError."""
+def _docs_from_json(raw) -> dict[str, DocSpec]:
+    """Колонка docs -> {документ: DocSpec}. Запись, отредактированная руками, --
+    русский отказ с документом и полем, а не TypeError или AttributeError:
+    docs обязан быть объектом, описание документа -- объектом с известными
+    ключами, значения -- строками."""
     allowed = [f.name for f in fields(DocSpec)]
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "Поле docs профиля заказчика должно быть объектом "
+            "«документ -> описание».")
     docs = {}
     for name, spec in raw.items():
         if not isinstance(spec, dict):
@@ -52,6 +58,11 @@ def _docs_from_json(raw: dict) -> dict[str, DocSpec]:
             raise ValueError(
                 f"Описание документа «{name}» в профиле заказчика: неизвестный "
                 f"ключ «{extra[0]}»; допустимы {', '.join(allowed)}.")
+        for key, value in spec.items():
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"Описание документа «{name}» в профиле заказчика: поле "
+                    f"«{key}» должно быть строкой (может быть пустой).")
         docs[name] = DocSpec(**spec)
     return docs
 
@@ -81,7 +92,7 @@ _EXPERIENCE = _Entity("experience", ExperienceRecord, "Опыт")
 _SERVICE = _Entity("service", Service, "Услуга", extra_fields=("norms",))
 _PROFILE = _Entity("customer_profile", CustomerProfile, "Профиль заказчика",
                    json_fields=("documents", "docs"),
-                   decoders={"docs": lambda raw: _docs_from_json(raw)})
+                   decoders={"docs": _docs_from_json})
 _TENDER = _Entity("tender", Tender, "Тендер",
                   json_fields=("deal_answers", "experience_ids"))
 _LOT_ITEM = _Entity("lot_item", LotItem, "Позиция лота")
