@@ -429,9 +429,26 @@ def test_money_is_rounded_to_kopecks()             # ни одного float в 
 k = ((target − материалы) / (1 + прибыль) − субподряд) / A
 ```
 
-`k ≤ 0` или `A == 0` → `TargetTooLow`. Часы округляются до целых,
-поэтому точное попадание в копейку не гарантируется — остаточное расхождение
-показывает интерфейс (задача 13).
+`k ≤ 0` или `A == 0` → `TargetTooLow`.
+
+Часы округляются до целых, поэтому точное попадание в целевую сумму
+недостижимо в принципе: один час работы стоит денег, и шаг сетки равен
+стоимости одного часа самой дешёвой строки с её наценками. Для КП Арктикгаза
+пропорциональное масштабирование даёт `k ≈ 1,0112`, часы 1213 и 364 и итог
+3 999 340,62 — на 659 рублей ниже цели 4 000 000.
+
+Поэтому после пропорционального масштабирования выполняется жадная доводка:
+часы отдельных строк меняются на ±1, пока расхождение с целью уменьшается.
+В том же примере добавление одного часа начальнику отдела (420 руб/ч) стоит
+420 × 1,352 × 1,10 = 624,60 и выводит итог на 3 999 965,20 — расхождение 34,80.
+
+Инвариант, который закрепляет тест: остаточное расхождение не превышает
+стоимости одного часа самой дешёвой строки с наценками. Это настоящая граница
+достижимого, а не произвольное число. Пропорции между должностями сохраняются
+с точностью до одного часа на строку.
+
+Остаточное расхождение показывает интерфейс (задача 13) всегда, даже когда оно
+в копейках.
 
 - [ ] **Шаг 1: Написать падающие тесты**
 
@@ -440,10 +457,23 @@ def test_solved_hours_reproduce_target():
     solved = solve_hours(Decimal("4000000"), ARKTIK,
                          Decimal("41686"), Decimal("1620000"), DEFAULTS)
     got = estimate(solved, Decimal("41686"), Decimal("1620000"), DEFAULTS)
-    assert abs(got.total_wo_vat - Decimal("4000000")) < Decimal("100")
+    assert abs(got.total_wo_vat - Decimal("4000000")) < Decimal("1000")
+
+def test_residual_is_within_one_hour_of_the_cheapest_line():
+    # настоящая граница достижимого: расхождение не больше стоимости
+    # одного часа самой дешёвой строки с наценками
+    solved = solve_hours(Decimal("4000000"), ARKTIK,
+                         Decimal("41686"), Decimal("1620000"), DEFAULTS)
+    got = estimate(solved, Decimal("41686"), Decimal("1620000"), DEFAULTS)
+    step = min(l.headcount * l.rate for l in ARKTIK) * Decimal("1.352") * Decimal("1.10")
+    assert abs(got.total_wo_vat - Decimal("4000000")) <= step
+
+def test_greedy_refinement_beats_plain_scaling():
+    # жадная доводка обязана быть лучше простого масштабирования:
+    # 3 999 340,62 без неё против расхождения в десятки рублей с ней
 
 def test_proportions_between_posts_are_preserved():
-    # отношение часов 1200:360 сохраняется после подбора
+    # отношение часов 1200:360 сохраняется с точностью до одного часа на строку
 
 def test_target_below_fixed_costs_raises():        # Review Focus 4
     with pytest.raises(TargetTooLow):
@@ -453,6 +483,7 @@ def test_target_below_fixed_costs_raises():        # Review Focus 4
 def test_target_exactly_at_fixed_costs_raises()
 def test_no_labor_lines_raises_rather_than_dividing_by_zero()
 def test_hours_are_whole_numbers()
+def test_solve_does_not_mutate_input_lines()
 ```
 
 - [ ] **Шаг 2: Запустить, убедиться что падает**
