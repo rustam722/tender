@@ -98,14 +98,19 @@ class Service:
 
 @dataclass
 class OrgSettings:
-    """Проценты калькуляции. Значений по умолчанию нет намеренно: нулевые
-    ставки дали бы правдоподобное КП без взносов, накладных, прибыли и НДС.
-    Умолчания живут в repo.DEFAULT_SETTINGS."""
+    """Проценты калькуляции. У ставок значений по умолчанию нет намеренно:
+    нулевые ставки дали бы правдоподобное КП без взносов, накладных, прибыли
+    и НДС. Умолчания ставок живут в repo.DEFAULT_SETTINGS.
+
+    total_rounding_digits -- до какого знака округляется итог без НДС, как
+    второй аргумент ROUND в книге КП.xlsx (0 -- целые рубли, 2 -- копейки,
+    -3 -- тысячи). Здесь умолчание безопасно: 0 -- именно то, что делает книга."""
     insurance_rate: Decimal
     injury_rate: Decimal
     overhead_rate: Decimal
     profit_rate: Decimal
     vat_rate: Decimal
+    total_rounding_digits: int = 0
 
 
 @dataclass

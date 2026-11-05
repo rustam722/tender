@@ -2,8 +2,9 @@
 подбор часов под заданную цену без НДС.
 
 Чистая арифметика над Decimal, без ввода-вывода. Каждая статья округляется
-до копеек (ROUND_HALF_UP), а следующие статьи считаются от уже округлённых:
-итог всегда равен сумме статей, как её видит читатель формы.
+до копеек (ROUND_HALF_UP), а следующие статьи считаются от уже округлённых.
+Итог без НДС -- сумма этих статей, округлённая до total_rounding_digits знаков
+(по умолчанию до целых рублей), как ROUND(..., +D88) в книге КП.xlsx.
 """
 from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal
@@ -27,7 +28,7 @@ class Estimate:
     """Статьи калькуляции, все в рублях с копейками."""
     materials: Decimal
     labor: Decimal          # ФОТ
-    insurance: Decimal      # страховые взносы и травматизм
+    insurance: Decimal      # страховые взносы и травматизм (ФОТ + они = расходы на ОТ)
     subcontract: Decimal
     overhead: Decimal
     profit: Decimal
@@ -43,23 +44,32 @@ def _money(value: Decimal) -> Decimal:
 
 def estimate(labor: list[LaborLine], materials: Decimal, subcontract: Decimal,
              settings: OrgSettings) -> Estimate:
-    """Считает все статьи. Накладные -- от ФОТ; прибыль -- от ФОТ, страховых,
-    субподряда и накладных (материалы в базу прибыли не входят)."""
+    """Считает все статьи по формулам книги КП.xlsx.
+
+    Накладные -- от расходов на оплату труда, то есть от ФОТ вместе со
+    страховыми (D15 = SUM(D16:D18)); прибыль -- от расходов на ОТ, субподряда
+    и накладных, материалы в базу прибыли не входят. Итог без НДС округляется
+    до settings.total_rounding_digits знаков."""
     fot = _money(sum((Decimal(x.headcount) * x.hours * x.rate for x in labor),
                      Decimal("0")))
     materials = _money(materials)
     subcontract = _money(subcontract)
     # Базы берём из уже округлённых статей (fot, insurance, ...), а не из
     # сырых произведений: каждая строка формы должна пересчитываться вручную
-    # от соседних напечатанных строк. Тест test_rounding_base_is_printed_articles
-    # закрепляет это числами, на которых оба подхода расходятся.
+    # от соседних напечатанных строк. Тесты test_rounding_base_is_printed_articles
+    # и test_overhead_and_profit_are_taken_from_printed_articles закрепляют это
+    # числами, на которых оба подхода расходятся.
     insurance = _money(fot * (settings.insurance_rate + settings.injury_rate))
-    overhead = _money(fot * settings.overhead_rate)
-    profit = _money((fot + insurance + subcontract + overhead)
-                    * settings.profit_rate)
-    # Итог намеренно СУММА напечатанных округлённых статей. Не заменять на
-    # _money(сырой итог): итог перестанет сходиться со своими строками.
-    total = materials + fot + insurance + subcontract + overhead + profit
+    labor_cost = fot + insurance                      # расходы на ОТ, D15
+    overhead = _money(labor_cost * settings.overhead_rate)
+    profit = _money((labor_cost + subcontract + overhead) * settings.profit_rate)
+    # Итог -- СУММА напечатанных округлённых статей, округлённая как в книге.
+    # Не заменять на округление сырой суммы: итог перестанет сходиться со
+    # статьями. Расхождение с суммой статей -- только само округление итога
+    # (до 0,50 руб. при целых рублях); в книге оно то же самое.
+    articles = materials + labor_cost + subcontract + overhead + profit
+    total = _money(articles.quantize(Decimal(1).scaleb(-settings.total_rounding_digits),
+                                     rounding=ROUND_HALF_UP))
     vat = _money(total * settings.vat_rate)
     return Estimate(materials=materials, labor=fot, insurance=insurance,
                     subcontract=subcontract, overhead=overhead, profit=profit,
@@ -83,9 +93,11 @@ def solve_hours(target_wo_vat: Decimal, labor: list[LaborLine], materials: Decim
     Исходные строки не меняются, возвращаются новые."""
     fot0 = sum((Decimal(x.headcount) * x.hours * x.rate for x in labor),
                Decimal("0"))
-    # a: сколько рублей итога до прибыли даёт один рубль ФОТ со всеми надбавками
-    a = fot0 * (1 + settings.insurance_rate + settings.injury_rate
-                + settings.overhead_rate)
+    # a: сколько рублей итога до прибыли дают ФОТ со всеми надбавками.
+    # Накладные считаются от расходов на ОТ (ФОТ со страховыми), поэтому
+    # наценки перемножаются, а не складываются: ФОТ * 1,302 * 1,05.
+    a = (fot0 * (1 + settings.insurance_rate + settings.injury_rate)
+         * (1 + settings.overhead_rate))
     if a == 0:
         raise TargetTooLow("В расчёте нет трудозатрат: нет строк с часами и ставкой, "
                            "подбирать часы не из чего. Добавьте строки трудозатрат.")

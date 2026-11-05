@@ -23,6 +23,7 @@ DEFAULT_SETTINGS = OrgSettings(
     overhead_rate=Decimal("0.05"),
     profit_rate=Decimal("0.10"),
     vat_rate=Decimal("0.05"),
+    total_rounding_digits=0,  # целые рубли, как ROUND(..., +D88) в КП.xlsx
 )
 
 _SETTINGS_ID = 1  # в org_settings ровно одна строка

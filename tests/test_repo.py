@@ -1,4 +1,5 @@
 import sqlite3
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -114,6 +115,16 @@ def test_settings_have_defaults_on_empty_db(repo):
     assert s.overhead_rate == Decimal("0.05")
     assert s.profit_rate == Decimal("0.10")
     assert s.vat_rate == Decimal("0.05")
+    assert s.total_rounding_digits == 0           # целые рубли, как в книге КП.xlsx
+
+
+def test_total_rounding_digits_round_trips_as_an_int(repo):
+    base = repo.get_settings()
+    for digits in (2, 0, -3):
+        repo.save_settings(replace(base, total_rounding_digits=digits))
+        got = repo.get_settings().total_rounding_digits
+        assert got == digits and type(got) is int
+    assert repo.conn.execute("SELECT COUNT(*) FROM org_settings").fetchone()[0] == 1
 
 
 def test_settings_save_and_update(repo):
@@ -319,7 +330,7 @@ def test_migrate_twice_keeps_version_and_data(tmp_path):
     repo.save_tender_labor(TenderLaborRow(tender_id=tid, post="a"))
     repo.save_tender_cost_item(TenderCostItem(tender_id=tid, kind="materials"))
     db.migrate(conn)  # повторный вызов ничего не меняет и не стирает
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 4
     assert len(repo.list_tender_labor(tid)) == 1
     assert len(repo.list_tender_cost_items(tid)) == 1
     assert repo.get_tender(tid).experience_ids == [4, 7]
@@ -367,7 +378,7 @@ def test_version_2_database_upgrades_to_3_keeping_data(tmp_path):
     db.migrate(conn)                      # и повторный вызов безопасен
 
     repo = Repo(conn)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     tender = repo.get_tender(1)
     assert tender.purchase_number == "42"
     assert str(tender.price_wo_vat) == "5700000.00"
@@ -381,6 +392,37 @@ def test_version_2_database_upgrades_to_3_keeping_data(tmp_path):
     repo.save_tender_cost_item(TenderCostItem(tender_id=1, kind="subcontract"))
     assert len(repo.list_tender_cost_items(1)) == 1
     conn.close()
+
+
+def test_version_3_database_upgrades_to_4_keeping_saved_settings(tmp_path):
+    # настройки, сохранённые до появления total_rounding_digits, не теряются,
+    # а округление итога у них -- целые рубли, как в книге
+    conn = old_db(tmp_path / "old3.db", 3)
+    conn.execute("INSERT INTO org_settings VALUES (1, '0.302', '0.004', '0.07', "
+                 "'0.15', '0.20')")
+    conn.commit()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(org_settings)")}
+    assert "total_rounding_digits" not in cols
+
+    db.migrate(conn)
+    db.migrate(conn)                      # и повторный вызов безопасен
+
+    repo = Repo(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+    s = repo.get_settings()
+    assert (s.insurance_rate, s.overhead_rate, s.vat_rate) == (
+        Decimal("0.302"), Decimal("0.07"), Decimal("0.20"))
+    assert s.total_rounding_digits == 0
+    repo.save_settings(replace(s, total_rounding_digits=2))
+    assert repo.get_settings().total_rounding_digits == 2
+    conn.close()
+
+
+def test_migration_4_is_one_transaction():
+    script = db._MIGRATIONS[3].upper()
+    begin, pragma, commit = (script.index("BEGIN;"), script.index("PRAGMA USER_VERSION"),
+                             script.rindex("COMMIT;"))
+    assert begin < script.index("ALTER TABLE") < pragma < commit
 
 
 def test_migration_3_is_one_transaction(tmp_path):

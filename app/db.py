@@ -190,6 +190,15 @@ _MIGRATIONS = [
     PRAGMA user_version = 3;  -- номер этой миграции: при копировании сменить
     COMMIT;
     """,
+    # 4: до какого знака округляется итог без НДС (0 -- целые рубли, как
+    # ROUND(..., +D88) в книге КП.xlsx). Уже сохранённые настройки получают 0.
+    """
+    BEGIN;
+    ALTER TABLE org_settings
+        ADD COLUMN total_rounding_digits INTEGER NOT NULL DEFAULT 0;
+    PRAGMA user_version = 4;  -- номер этой миграции: при копировании сменить
+    COMMIT;
+    """,
 ]
 
 SCHEMA_VERSION = len(_MIGRATIONS)

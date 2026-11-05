@@ -206,7 +206,7 @@ def test_estimate_is_built_from_stored_labor_rows(repo_with_koryazhma):
     est = ctx_of(repo_with_koryazhma)["estimate"]
     assert est["labor"] == Decimal("1447200.00")      # 4*1200*270 + 1*360*420
     assert est["insurance"] == Decimal("437054.40")   # 30,2 %
-    assert est["overhead"] == Decimal("72360.00")
+    assert est["overhead"] == Decimal("94212.72")     # 5 % от ФОТ со страховыми: 1 884 254,40
     # у этого тендера нет строк материалов и субподряда
     assert est["materials"] == Decimal("0.00")
     assert est["subcontract"] == Decimal("0.00")
@@ -294,6 +294,10 @@ def test_estimate_sums_cost_items_by_kind(repo_with_koryazhma):
     est = ctx_of(repo)["estimate"]
     assert est["materials"] == Decimal("41686.00")        # 24 000 + 17 686
     assert est["subcontract"] == Decimal("1620000.00")    # 1 500 000 + 70 000 + 50 000
+    # сборка из строк тендера даёт те же статьи и тот же итог, что книга КП.xlsx
+    assert est["overhead"] == Decimal("94212.72")
+    assert est["profit"] == Decimal("359846.71")
+    assert est["total_wo_vat"] == Decimal("4000000")      # 3 999 999,83 -> целые рубли
     lines = [LaborLine(p, n, Decimal(h), Decimal(r)) for p, n, h, r in ARKTIK]
     expected = estimate(lines, Decimal("41686"), Decimal("1620000"),
                         repo.get_settings())

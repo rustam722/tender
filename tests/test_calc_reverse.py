@@ -11,8 +11,10 @@ SUBCONTRACT = Decimal("1620000")
 TARGET = Decimal("4000000")
 # Надбавки выводим из настроек, а не числами: ставки меняются по требованию
 # заказчика, и инвариант обязан идти за ними вместе с estimate.
-LABOR_MARKUP = (1 + DEFAULTS.insurance_rate + DEFAULTS.injury_rate
-                + DEFAULTS.overhead_rate)       # ФОТ -> статьи до прибыли
+# Накладные считаются от расходов на ОТ (ФОТ со страховыми), поэтому наценки
+# перемножаются: A = ФОТ * (1 + страховые + травматизм) * (1 + накладные).
+LABOR_MARKUP = ((1 + DEFAULTS.insurance_rate + DEFAULTS.injury_rate)
+                * (1 + DEFAULTS.overhead_rate))  # ФОТ -> статьи до прибыли
 PROFIT_MARKUP = 1 + DEFAULTS.profit_rate
 MARKUP = LABOR_MARKUP * PROFIT_MARKUP           # рубль ФОТ -> рубли итога
 
@@ -56,26 +58,50 @@ def test_residual_is_within_one_hour_of_the_cheapest_line():
     assert abs(got - TARGET) <= one_hour_step(ARKTIK)
 
 
-def test_arktikgaz_numbers_match_the_worked_example():
-    # k ~ 1,011168; пропорциональное масштабирование даёт 1213 и 364 часа
-    # и итог 3 999 340,62; доводка добавляет час начальнику отдела. Час стоит
-    # 420 * 1,352 * 1,10 = 624,624, а со статьями, округлёнными до копеек,
-    # итог 3 999 965,25 (в тексте задачи -- 3 999 965,20: там 624,60 округлено).
-    assert Decimal("1.011168") <= exact_multiplier() < Decimal("1.011169")
-    plain = [LaborLine("Эколог-проектировщик", 4, Decimal("1213"), Decimal("270")),
-             LaborLine("Начальник отдела проектирования", 1, Decimal("364"), Decimal("420"))]
-    assert total_of(plain) == Decimal("3999340.62")
+def test_default_markups_multiply_to_the_numbers_in_the_plan():
+    # 1,302 * 1,05 = 1,3671 (раньше 1,352); с прибылью 1,3671 * 1,10 = 1,50381
+    assert LABOR_MARKUP == Decimal("1.36710")
+    assert MARKUP == Decimal("1.503810")
+    # шаг сетки: час начальника отдела, 420 * 1,50381 = 631,6002
+    assert one_hour_step(ARKTIK) == Decimal("631.600200")
+
+
+def test_arktikgaz_own_hours_solve_for_four_million():
+    # A = 1 447 200 * 1,3671 = 1 978 467,12;
+    # k = ((4 000 000 - 41 686) / 1,10 - 1 620 000) / A = 1,0000000772:
+    # собственные часы фирмы -- 1200 и 360 -- и есть решение для 4 000 000.
+    # Доводке делать нечего: пропорциональное масштабирование уже попадает точно.
+    assert Decimal("1.0000000771") < exact_multiplier() < Decimal("1.0000000773")
     solved = solve()
-    assert [x.hours for x in solved] == [Decimal("1213"), Decimal("365")]
-    assert total_of(solved) == Decimal("3999965.25")
+    assert [x.hours for x in solved] == [Decimal("1200"), Decimal("360")]
+    assert total_of(solved) == Decimal("4000000")
+    assert abs(total_of(solved) - TARGET) == 0
+
+
+# Цель 3 911 964: k = 0,9595482, масштабирование даёт 1151 и 345 часов и итог
+# 3 910 944 (расхождение 1 020). Доводка идёт по шагу в 631,60 руб. (час
+# начальника отдела): +1 час -> 3 911 576 (388), ещё +1 -> 3 912 207 (-243);
+# следующий шаг в любую сторону расхождение увеличивает (875 / 1 868 / 1 381).
+GREEDY_TARGET = Decimal("3911964")
 
 
 def test_greedy_refinement_beats_plain_scaling():
-    # без доводки: 3 999 340,62, расхождение 659,38; с ней -- десятки рублей
-    plain_gap = TARGET - Decimal("3999340.62")
-    refined_gap = abs(total_of(solve()) - TARGET)
+    k = exact_multiplier(GREEDY_TARGET)
+    assert Decimal("0.95954819") < k < Decimal("0.95954820")
+    plain = [LaborLine("Эколог-проектировщик", 4, Decimal("1151"), Decimal("270")),
+             LaborLine("Начальник отдела проектирования", 1, Decimal("345"), Decimal("420"))]
+    assert [round(k * x.hours) for x in ARKTIK] == [1151, 345]
+    assert total_of(plain) == Decimal("3910944.00")
+    plain_gap = GREEDY_TARGET - total_of(plain)
+    assert plain_gap == Decimal("1020.00")
+
+    solved = solve(GREEDY_TARGET)
+    assert [x.hours for x in solved] == [Decimal("1151"), Decimal("347")]
+    assert total_of(solved) == Decimal("3912207.00")
+    refined_gap = abs(total_of(solved) - GREEDY_TARGET)
+    assert refined_gap == Decimal("243.00")
     assert refined_gap < plain_gap
-    assert refined_gap < Decimal("100")
+    assert refined_gap <= one_hour_step(ARKTIK)
 
 
 def test_proportions_between_posts_are_preserved():
