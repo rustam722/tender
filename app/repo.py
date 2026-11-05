@@ -12,7 +12,7 @@ from decimal import Decimal
 
 from app.models import (
     Asset, CustomerProfile, Employee, ExperienceRecord, LotItem, Organization,
-    OrgSettings, Service, Tender, TenderLaborRow,
+    OrgSettings, Service, Tender, TenderCostItem, TenderLaborRow,
 )
 
 # Значения по умолчанию для настроек калькуляции (общие ограничения плана).
@@ -49,10 +49,13 @@ _ASSET = _Entity("asset", Asset, "Ресурс")
 _EXPERIENCE = _Entity("experience", ExperienceRecord, "Опыт")
 _SERVICE = _Entity("service", Service, "Услуга", extra_fields=("norms",))
 _PROFILE = _Entity("customer_profile", CustomerProfile, "Профиль заказчика",
-                   json_fields=("documents", "file_prefixes"))
-_TENDER = _Entity("tender", Tender, "Тендер", json_fields=("deal_answers",))
+                   json_fields=("documents", "file_prefixes", "layouts"))
+_TENDER = _Entity("tender", Tender, "Тендер",
+                  json_fields=("deal_answers", "experience_ids"))
 _LOT_ITEM = _Entity("lot_item", LotItem, "Позиция лота")
 _TENDER_LABOR = _Entity("tender_labor", TenderLaborRow, "Строка трудозатрат")
+_TENDER_COST_ITEM = _Entity("tender_cost_item", TenderCostItem,
+                            "Строка материалов или субподряда")
 _SETTINGS = _Entity("org_settings", OrgSettings, "Настройки")
 
 
@@ -266,6 +269,22 @@ class Repo:
 
     def delete_tender_labor(self, id: int) -> None:
         self._delete(_TENDER_LABOR, id)
+
+    # ---- материалы и субподряд тендера -----------------------------------
+
+    def save_tender_cost_item(self, item: TenderCostItem) -> int:
+        return self._save(_TENDER_COST_ITEM, item)
+
+    def list_tender_cost_items(self, tender_id: int,
+                               kind: str | None = None) -> list[TenderCostItem]:
+        if kind is None:
+            return self._select(_TENDER_COST_ITEM, "tender_id = ?", (tender_id,),
+                                order="position, id")
+        return self._select(_TENDER_COST_ITEM, "tender_id = ? AND kind = ?",
+                            (tender_id, kind), order="position, id")
+
+    def delete_tender_cost_item(self, id: int) -> None:
+        self._delete(_TENDER_COST_ITEM, id)
 
     # ---- настройки калькуляции -------------------------------------------
 

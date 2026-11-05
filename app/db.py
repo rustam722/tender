@@ -163,6 +163,33 @@ _MIGRATIONS = [
     CREATE INDEX IF NOT EXISTS idx_tender_labor_tender
         ON tender_labor (tender_id, position, id);
     """,
+    # 3: раскладки в профиле заказчика, отбор опыта при тендере, материалы и
+    # субподряд. ALTER TABLE не имеет IF NOT EXISTS, поэтому скрипт -- одна
+    # транзакция вместе с номером версии: обрыв не оставит половину колонок,
+    # на которой следующий запуск упал бы с «duplicate column».
+    """
+    BEGIN;
+    ALTER TABLE customer_profile
+        ADD COLUMN layouts TEXT NOT NULL DEFAULT '{}';   -- JSON: документ -> файл
+    ALTER TABLE tender
+        ADD COLUMN experience_ids TEXT NOT NULL DEFAULT '[]';  -- JSON: id опыта
+    CREATE TABLE IF NOT EXISTS tender_cost_item (
+        id INTEGER PRIMARY KEY,
+        tender_id INTEGER NOT NULL REFERENCES tender (id) ON DELETE CASCADE,
+        kind TEXT NOT NULL DEFAULT 'materials'
+            CHECK (kind IN ('materials', 'subcontract')),
+        position INTEGER NOT NULL DEFAULT 0,
+        name TEXT NOT NULL DEFAULT '',
+        unit TEXT NOT NULL DEFAULT '',
+        quantity DECIMAL TEXT NOT NULL DEFAULT '1',
+        price DECIMAL TEXT NOT NULL DEFAULT '0',
+        note TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_tender_cost_item_tender
+        ON tender_cost_item (tender_id, kind, position, id);
+    PRAGMA user_version = 3;
+    COMMIT;
+    """,
 ]
 
 SCHEMA_VERSION = len(_MIGRATIONS)

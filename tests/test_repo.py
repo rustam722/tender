@@ -1,3 +1,4 @@
+import sqlite3
 from decimal import Decimal
 
 import pytest
@@ -6,7 +7,7 @@ from app import db
 from app.models import (
     ROLE_CUSTOMER, ROLE_PARTICIPANT, Asset, CustomerProfile, Employee,
     ExperienceRecord, LotItem, Organization, OrgSettings, Service, Tender,
-    TenderLaborRow,
+    TenderCostItem, TenderLaborRow,
 )
 from app.repo import Repo
 
@@ -314,30 +315,145 @@ def test_migrate_twice_keeps_version_and_data(tmp_path):
     conn = db.connect(tmp_path / "t.db")
     db.migrate(conn)
     repo = Repo(conn)
-    tid = make_tender(repo)
+    tid = make_tender(repo, experience_ids=[4, 7])
     repo.save_tender_labor(TenderLaborRow(tender_id=tid, post="a"))
+    repo.save_tender_cost_item(TenderCostItem(tender_id=tid, kind="materials"))
     db.migrate(conn)  # повторный вызов ничего не меняет и не стирает
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 3
     assert len(repo.list_tender_labor(tid)) == 1
+    assert len(repo.list_tender_cost_items(tid)) == 1
+    assert repo.get_tender(tid).experience_ids == [4, 7]
     conn.close()
 
 
-def test_version_1_database_upgrades_to_2_keeping_data(tmp_path):
-    conn = db.connect(tmp_path / "old.db")
-    # база, созданная до появления миграции 2: применяем только первую
-    conn.executescript(db._MIGRATIONS[0])
-    conn.execute("PRAGMA user_version = 1")
+def old_db(path, version):
+    """База, созданная до последних миграций: применены только первые version."""
+    conn = db.connect(path)
+    for number in range(version):
+        conn.executescript(db._MIGRATIONS[number])
+    conn.execute(f"PRAGMA user_version = {version}")
+    conn.execute("INSERT INTO organization (id, role, inn) VALUES (1, 'customer', '1')")
+    conn.execute(
+        "INSERT INTO tender (id, customer_id, purchase_number, price_wo_vat) "
+        "VALUES (1, 1, '42', '5700000.00')")
+    conn.execute(
+        "INSERT INTO customer_profile (customer_id, documents, declaration_text) "
+        "VALUES (1, '[\"Заявка\"]', 'Декларация')")
+    conn.commit()
+    return conn
+
+
+def test_version_1_database_upgrades_to_latest_keeping_data(tmp_path):
+    conn = old_db(tmp_path / "old1.db", 1)
+    db.migrate(conn)
     repo = Repo(conn)
-    tid = make_tender(repo, purchase_number="42", price_wo_vat=Decimal("5700000.00"))
-    assert conn.execute(
-        "SELECT name FROM sqlite_master WHERE name = 'tender_labor'").fetchone() is None
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert repo.get_tender(1).purchase_number == "42"
+    assert repo.list_tender_labor(1) == []
+    repo.save_tender_labor(TenderLaborRow(tender_id=1, post="a"))
+    assert len(repo.list_tender_labor(1)) == 1
+    conn.close()
+
+
+def test_version_2_database_upgrades_to_3_keeping_data(tmp_path):
+    conn = old_db(tmp_path / "old2.db", 2)
+    conn.execute("INSERT INTO tender_labor (tender_id, post, hours, rate) "
+                 "VALUES (1, 'Эколог', '1200.00', '270.50')")
+    conn.commit()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(tender)")}
+    assert "experience_ids" not in cols
 
     db.migrate(conn)
+    db.migrate(conn)                      # и повторный вызов безопасен
 
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
-    assert repo.get_tender(tid).purchase_number == "42"
-    assert str(repo.get_tender(tid).price_wo_vat) == "5700000.00"
-    assert repo.list_tender_labor(tid) == []
-    repo.save_tender_labor(TenderLaborRow(tender_id=tid, post="a"))
-    assert len(repo.list_tender_labor(tid)) == 1
+    repo = Repo(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    tender = repo.get_tender(1)
+    assert tender.purchase_number == "42"
+    assert str(tender.price_wo_vat) == "5700000.00"
+    assert tender.experience_ids == []            # значение по умолчанию
+    profile = repo.find_customer_profile(1)
+    assert profile.declaration_text == "Декларация"
+    assert profile.documents == ["Заявка"]
+    assert profile.layouts == {}
+    (row,) = repo.list_tender_labor(1)
+    assert str(row.hours) == "1200.00" and str(row.rate) == "270.50"
+    repo.save_tender_cost_item(TenderCostItem(tender_id=1, kind="subcontract"))
+    assert len(repo.list_tender_cost_items(1)) == 1
     conn.close()
+
+
+def test_migration_3_is_one_transaction(tmp_path):
+    # обрыв посередине не должен оставить половину ALTER: следующий запуск
+    # упал бы на «duplicate column». Скрипт сам открывает и закрывает транзакцию.
+    script = db._MIGRATIONS[2].strip().upper()
+    assert script.startswith("BEGIN") and script.rstrip().endswith("COMMIT;")
+
+
+# ---- профиль: раскладки, тендер: отбор опыта ----------------------------------
+
+def test_customer_profile_layouts_round_trip(repo):
+    cid = repo.save_organization(make_org(role=ROLE_CUSTOMER))
+    pid = repo.save_customer_profile(CustomerProfile(
+        customer_id=cid,
+        layouts={"Справка о МТР": "assets_rnpk.json",
+                 "Справка о кадрах": "employees_koryazhma.json"}))
+    got = repo.get_customer_profile(pid)
+    assert got.layouts == {"Справка о МТР": "assets_rnpk.json",
+                           "Справка о кадрах": "employees_koryazhma.json"}
+    assert list(got.layouts) == ["Справка о МТР", "Справка о кадрах"]   # порядок
+    assert CustomerProfile().layouts == {}
+
+
+def test_tender_experience_ids_round_trip(repo):
+    tid = make_tender(repo, experience_ids=[7, 3, 12])
+    assert repo.get_tender(tid).experience_ids == [7, 3, 12]   # порядок отбора
+    assert make_tender(repo) and Tender().experience_ids == []
+
+
+# ---- материалы и субподряд тендера (миграция 3) --------------------------------
+
+def test_tender_cost_item_round_trips_with_scale(repo):
+    tid = make_tender(repo)
+    cid = repo.save_tender_cost_item(TenderCostItem(
+        tender_id=tid, kind="materials", position=1,
+        name="инвентарь, оборудование", unit="усл.ед.",
+        quantity=Decimal("1.000"), price=Decimal("24000.00"), note="прим."))
+    (got,) = repo.list_tender_cost_items(tid)
+    assert got.id == cid
+    assert (got.kind, got.position, got.name, got.unit, got.note) == (
+        "materials", 1, "инвентарь, оборудование", "усл.ед.", "прим.")
+    assert isinstance(got.quantity, Decimal) and isinstance(got.price, Decimal)
+    assert str(got.quantity) == "1.000" and str(got.price) == "24000.00"
+
+
+def test_tender_cost_item_columns_are_declared_decimal_text(repo):
+    cols = {r[1]: r[2] for r in repo.conn.execute("PRAGMA table_info(tender_cost_item)")}
+    assert cols["quantity"] == "DECIMAL TEXT" and cols["price"] == "DECIMAL TEXT"
+
+
+def test_tender_cost_item_keeps_position_order_and_filters_by_kind(repo):
+    tid = make_tender(repo)
+    for kind, pos, name in [("subcontract", 2, "б"), ("materials", 1, "в"),
+                            ("subcontract", 1, "а")]:
+        repo.save_tender_cost_item(TenderCostItem(
+            tender_id=tid, kind=kind, position=pos, name=name))
+    assert [i.name for i in repo.list_tender_cost_items(tid, "subcontract")] == ["а", "б"]
+    assert [i.name for i in repo.list_tender_cost_items(tid, "materials")] == ["в"]
+    assert len(repo.list_tender_cost_items(tid)) == 3
+
+
+def test_tender_cost_item_kind_is_restricted(repo):
+    tid = make_tender(repo)
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.save_tender_cost_item(TenderCostItem(tender_id=tid, kind="прочее"))
+
+
+def test_tender_cost_item_cascades_and_deletes(repo):
+    tid = make_tender(repo)
+    gone = repo.save_tender_cost_item(TenderCostItem(tender_id=tid, kind="materials"))
+    repo.save_tender_cost_item(TenderCostItem(tender_id=tid, kind="materials", name="b"))
+    repo.delete_tender_cost_item(gone)
+    assert [i.name for i in repo.list_tender_cost_items(tid)] == ["b"]
+    repo.delete_tender(tid)
+    assert repo.conn.execute("SELECT COUNT(*) FROM tender_cost_item").fetchone()[0] == 0

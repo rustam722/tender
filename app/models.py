@@ -114,6 +114,7 @@ class CustomerProfile:
     customer_id: int | None = None    # organization.id заказчика
     documents: list[str] = field(default_factory=list)            # состав пакета
     file_prefixes: dict[str, str] = field(default_factory=dict)   # документ -> префикс
+    layouts: dict[str, str] = field(default_factory=dict)         # документ -> файл раскладки
     declaration_text: str = ""
     id: int | None = None
 
@@ -136,6 +137,7 @@ class Tender:
     platform: str = ""
     output_dir: str = ""              # папка, куда собирается пакет
     deal_answers: dict[str, str] = field(default_factory=dict)    # условие -> ответ
+    experience_ids: list[int] = field(default_factory=list)       # отобранный опыт, по порядку
     id: int | None = None
 
 
@@ -158,4 +160,23 @@ class TenderLaborRow:
     headcount: int = 1                # человек
     hours: Decimal = ZERO             # часов на человека
     rate: Decimal = ZERO              # руб/ч
+    id: int | None = None
+
+
+COST_MATERIALS = "materials"
+COST_SUBCONTRACT = "subcontract"
+
+
+@dataclass
+class TenderCostItem:
+    """Строка материалов или субподряда в калькуляции тендера. Хранится
+    разбивкой: форма калькуляции печатает обе статьи подтаблицами."""
+    tender_id: int | None = None
+    kind: str = COST_MATERIALS        # 'materials' | 'subcontract'
+    position: int = 0                 # порядок внутри статьи
+    name: str = ""
+    unit: str = ""                    # единица измерения: «усл.ед.», «шт.»
+    quantity: Decimal = Decimal("1")
+    price: Decimal = ZERO             # цена за единицу, руб.
+    note: str = ""
     id: int | None = None
