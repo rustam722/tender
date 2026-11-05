@@ -682,3 +682,103 @@ def test_empty_value_in_a_row_block_is_allowed(tmp_path):
     context["materials"][0]["name"] = ""
     out = fill_workbook(form, multi_map(), context, tmp_path / "out.xlsx")
     assert "B35" not in cells_of(out)
+
+
+# ---- пробелы, фамилия подписанта, необязательные клетки -------------------------
+
+def test_whitespace_only_deal_answer_refuses(form, tmp_path):
+    context = make_context()
+    context["conditions"]["Цена и условия:"] = "   "
+    with pytest.raises(CellMapError) as caught:
+        fill_workbook(form, basic_map(), context, tmp_path / "out.xlsx")
+    assert "E23" in str(caught.value) and "пуст" in str(caught.value)
+
+
+def test_non_breaking_space_answer_refuses(form, tmp_path):
+    context = make_context()
+    context["conditions"]["Цена и условия:"] = " "
+    with pytest.raises(CellMapError):
+        fill_workbook(form, basic_map(), context, tmp_path / "out.xlsx")
+
+
+def test_lone_text_value_is_trimmed_like_interpolated_text(form, tmp_path):
+    context = make_context()
+    context["conditions"]["Цена и условия:"] = "  подтверждаю "
+    out = fill_workbook(form, basic_map(), context, tmp_path / "out.xlsx")
+    assert cells_of(out)["E23"] == "подтверждаю"
+
+
+def test_signer_position_without_name_refuses(form, tmp_path):
+    context = make_context(org={"head_name": "", "head_position": "Директор"})
+    out = tmp_path / "out.xlsx"
+    with pytest.raises(CellMapError) as caught:
+        fill_workbook(form, basic_map(), context, out)
+    text = str(caught.value)
+    assert "B31" in text and "org.head_name" in text and "пуст" in text
+    assert not out.exists()
+
+
+def test_signer_name_without_position_refuses(form, tmp_path):
+    context = make_context(org={"head_name": "Рабичко Е. М.", "head_position": " "})
+    with pytest.raises(CellMapError) as caught:
+        fill_workbook(form, basic_map(), context, tmp_path / "out.xlsx")
+    assert "org.head_position" in str(caught.value)
+
+
+def optional_map(expr="{org.head_name}"):
+    return CellMap("Лист1", {"B31": expr}, optional={"B31"})
+
+
+def test_optional_cell_with_empty_value_is_left_as_the_customer_had_it(form, tmp_path):
+    context = make_context(org={"head_name": "  ", "head_position": ""})
+    out = fill_workbook(form, optional_map(), context, tmp_path / "out.xlsx")
+    assert cells_of(out)["B31"] == "[Руководитель/Должность/ФИО]"
+
+
+def test_optional_cell_with_a_value_is_written(form, tmp_path):
+    out = fill_workbook(form, optional_map(), make_context(), tmp_path / "out.xlsx")
+    assert cells_of(out)["B31"] == "Рабичко Е. М."
+
+
+def test_optional_interpolated_cell_tolerates_empty_parts(form, tmp_path):
+    context = make_context(org={"head_name": "Рабичко Е. М.", "head_position": ""})
+    cell_map = optional_map("{org.head_position} {org.head_name}")
+    out = fill_workbook(form, cell_map, context, tmp_path / "out.xlsx")
+    assert cells_of(out)["B31"] == "Рабичко Е. М."
+
+
+def test_optional_does_not_excuse_a_missing_path(form, tmp_path):
+    # «может быть пустым» -- не «может отсутствовать»: опечатка в карте видна
+    with pytest.raises(CellMapError) as caught:
+        fill_workbook(form, optional_map("{org.head_nmae}"), make_context(),
+                      tmp_path / "out.xlsx")
+    assert "org.head_nmae" in str(caught.value)
+
+
+def test_cellmap_file_reads_optional_cells(tmp_path):
+    data = {"sheet": "Лист1", "cells": {
+        "D88": {"value": "{tender.rounding}", "optional": True},
+        "B31": "{org.head_name}",
+        "C5": {"value": "x"}}}
+    cell_map = load_cellmap(write_map(tmp_path, data))
+    assert cell_map.cells == {"D88": "{tender.rounding}", "B31": "{org.head_name}",
+                              "C5": "x"}
+    assert cell_map.optional == {"D88"}
+
+
+@pytest.mark.parametrize("cell, fragment", [
+    ({"value": "x", "optional": "yes"}, "optional"),          # не логическое
+    ({"optional": True}, "value"),                            # нет выражения
+    ({"value": "x", "required": False}, "required"),          # неизвестный ключ
+    ({"value": 5}, "B31"),
+])
+def test_bad_optional_cell_is_rejected(tmp_path, cell, fragment):
+    data = {"sheet": "Лист1", "cells": {"B31": cell}}
+    with pytest.raises(CellMapError) as caught:
+        load_cellmap(write_map(tmp_path, data))
+    assert fragment in str(caught.value)
+
+
+def test_real_map_has_no_optional_cells():
+    # у Роснефти каждая графа обязательна: пустая -- отказ
+    assert load_cellmap(REAL_MAP).optional == set()

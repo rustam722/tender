@@ -15,7 +15,8 @@
       "cells": {                                   // одиночные клетки
         "D8":  "Ставка НДС: {tender.vat_percent}%",
         "E23": "{conditions.Цена и условия:}",
-        "B31": "{org.head_position} {org.head_name}"
+        "B31": "{org.head_position} {org.head_name}",
+        "D88": {"value": "{tender.rounding}", "optional": true}  // пример: может быть пусто
       },
       "rows": [                                    // блоки повторяющихся строк
         {"first_row": 9, "last_row": 19,           // сколько строк в форме
@@ -38,9 +39,16 @@
   * Выражение из одного `{путь}` пишет значение как есть: Decimal остаётся
     числом, и ячейка получает число (SUM книги считает только числа).
   * Выражение с текстом вокруг (`Ставка НДС: {..}%`) пишет строку.
-  * Одиночная клетка (`cells`) не может получить пустое значение: нет ответа
-    по условию или он пуст -- отказ, а не пустая графа, из-за которой заявку
-    отклонят молча. В строках блоков пустое значение допустимо (примечание).
+  * Одиночная клетка (`cells`) по умолчанию обязательна: если значение пусто
+    (нет ответа по условию, одни пробелы) или пуста любая часть текстового
+    выражения (должность без фамилии), -- отказ, а не графа, которая выглядит
+    пустой и из-за которой заявку отклонят молча. Строки значений обрезаются
+    по краям. В строках блоков пустое значение допустимо (примечание).
+  * Поле ввода, которое законно может остаться пустым (например разрядность
+    округления в книге КП), помечается в самой карте: вместо строки объект
+    `{"value": "{путь}", "optional": true}`. Пустое значение такой клетки не
+    пишется, клетка остаётся как в форме заказчика. Отсутствующий путь и здесь
+    отказ: «может быть пустым» не значит «может отсутствовать».
 
 Чего здесь нет намеренно: клетки с названиями, номерами позиций и условиями
 заказчика (колонки A, B, C формы Роснефти) в карту не входят -- это его текст.
@@ -74,6 +82,7 @@ class CellMap:
     sheet: str
     cells: dict[str, str]             # адрес клетки -> выражение
     rows: list[RowBlock] = field(default_factory=list)
+    optional: set[str] = field(default_factory=set)   # клетки, где пусто -- законно
 
 
 _ADDRESS = re.compile(r"[A-Z]{1,3}[1-9][0-9]*")
@@ -180,12 +189,34 @@ def load_cellmap(path: Path) -> CellMap:
         raise CellMapError(
             f"Карта ячеек {name}: cells должно быть объектом "
             "«адрес клетки -> выражение».")
-    for address, expr in raw_cells.items():
+    cells: dict[str, str] = {}
+    optional: set[str] = set()
+    for address, raw in raw_cells.items():
         if not _ADDRESS.fullmatch(address):
             raise CellMapError(
                 f"Карта ячеек {name}: «{address}» не адрес клетки "
                 "(например D8, заглавными).")
+        expr = raw
+        if isinstance(raw, dict):
+            extra = set(raw) - {"value", "optional"}
+            if extra:
+                raise CellMapError(
+                    f"Карта ячеек {name}: у клетки {address} неизвестный "
+                    f"ключ «{sorted(extra)[0]}»; допустимы value и optional.")
+            if "value" not in raw:
+                raise CellMapError(
+                    f"Карта ячеек {name}: у клетки {address} не найдено "
+                    "«value» (выражение).")
+            expr = raw["value"]
+            flag = raw.get("optional", False)
+            if not isinstance(flag, bool):
+                raise CellMapError(
+                    f"Карта ячеек {name}: optional у клетки {address} должен "
+                    f"быть true или false, а там {flag!r}.")
+            if flag:
+                optional.add(address)
         _check_expression(expr, f"клетки {address}", name)
+        cells[address] = expr
     raw_rows = data.get("rows")
     if raw_rows is None:
         raw_rows = []
@@ -194,8 +225,8 @@ def load_cellmap(path: Path) -> CellMap:
             f"Карта ячеек {name}: rows должно быть списком блоков строк "
             "(даже если блок один).")
     rows = [_row_block(raw, name) for raw in raw_rows]
-    _check_overlaps(raw_cells, rows, name)
-    return CellMap(sheet=sheet, cells=dict(raw_cells), rows=rows)
+    _check_overlaps(cells, rows, name)
+    return CellMap(sheet=sheet, cells=cells, rows=rows, optional=optional)
 
 
 # ---- вычисление выражений --------------------------------------------------------
@@ -218,26 +249,40 @@ def _text(value: object) -> str:
     return "" if value is None else str(value)
 
 
+def _blank(value: object) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def _evaluate(expr: str, scope: Mapping, address: str, required: bool = False):
-    """required -- одиночная клетка: пустой результат не пишется, а отказывает."""
+    """required -- обязательная одиночная клетка: пустое значение (в том числе
+    из одних пробелов) или пустая часть текста -- отказ, а не пустая графа.
+    Не required -- пустое значение даёт None (или пустой текст)."""
     where = f"клетки {address}"
     lone = _PLACEHOLDER.fullmatch(expr)
     if lone:
         path = lone.group(1).strip()
         value = _lookup(scope, path, where)
-        if value is None or value == "":
+        if _blank(value):
             if required:
                 raise CellMapError(
                     f"Для {where} значение «{path}» пусто. Графа не должна "
                     "остаться незаполненной: задайте значение в данных тендера.")
             return None
-        return value
-    text = _PLACEHOLDER.sub(
-        lambda m: _text(_lookup(scope, m.group(1), where)), expr).strip()
+        return value.strip() if isinstance(value, str) else value
+
+    def part(match):
+        path = match.group(1).strip()
+        value = _lookup(scope, path, where)
+        if required and _blank(value):
+            raise CellMapError(
+                f"Для {where} значение «{path}» пусто, а оно входит в текст "
+                f"«{expr}». Графа не должна остаться неполной: задайте "
+                "значение в данных тендера.")
+        return _text(value)
+
+    text = _PLACEHOLDER.sub(part, expr).strip()
     if required and not text:
-        raise CellMapError(
-            f"Для {where} из «{expr}» получился пустой текст: нужные поля "
-            "в данных тендера пусты.")
+        raise CellMapError(f"Для {where} из «{expr}» получился пустой текст.")
     return text
 
 
@@ -298,8 +343,11 @@ def fill_workbook(template: Path, cell_map: CellMap, context: dict,
 
         writes = []                                   # (адрес, значение)
         for address, expr in cell_map.cells.items():
-            writes.append((address, _evaluate(expr, context, address,
-                                              required=True)))
+            required = address not in cell_map.optional
+            value = _evaluate(expr, context, address, required=required)
+            if not required and _blank(value):
+                continue              # законно пусто: клетка как в форме заказчика
+            writes.append((address, value))
         for block in cell_map.rows:
             writes.extend(_row_writes(block, context))
         for address, _ in writes:
