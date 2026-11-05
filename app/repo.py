@@ -37,6 +37,25 @@ def _dataclass_to_json(obj):
     raise TypeError(f"Нельзя сохранить в JSON: {type(obj).__name__}")
 
 
+def _docs_from_json(raw: dict) -> dict[str, DocSpec]:
+    """Колонка docs -> {документ: DocSpec}. Запись, отредактированная руками,
+    с неизвестным ключом -- русский отказ с именем документа, а не TypeError."""
+    allowed = [f.name for f in fields(DocSpec)]
+    docs = {}
+    for name, spec in raw.items():
+        if not isinstance(spec, dict):
+            raise ValueError(
+                f"Описание документа «{name}» в профиле заказчика должно быть "
+                f"набором полей ({', '.join(allowed)}).")
+        extra = sorted(set(spec) - set(allowed))
+        if extra:
+            raise ValueError(
+                f"Описание документа «{name}» в профиле заказчика: неизвестный "
+                f"ключ «{extra[0]}»; допустимы {', '.join(allowed)}.")
+        docs[name] = DocSpec(**spec)
+    return docs
+
+
 @dataclass(frozen=True)
 class _Entity:
     """Как датакласс ложится в таблицу."""
@@ -62,8 +81,7 @@ _EXPERIENCE = _Entity("experience", ExperienceRecord, "Опыт")
 _SERVICE = _Entity("service", Service, "Услуга", extra_fields=("norms",))
 _PROFILE = _Entity("customer_profile", CustomerProfile, "Профиль заказчика",
                    json_fields=("documents", "docs"),
-                   decoders={"docs": lambda raw: {
-                       name: DocSpec(**spec) for name, spec in raw.items()}})
+                   decoders={"docs": lambda raw: _docs_from_json(raw)})
 _TENDER = _Entity("tender", Tender, "Тендер",
                   json_fields=("deal_answers", "experience_ids"))
 _LOT_ITEM = _Entity("lot_item", LotItem, "Позиция лота")

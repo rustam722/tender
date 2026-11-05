@@ -674,3 +674,27 @@ def test_migration_5_is_one_transaction():
                              script.rindex("COMMIT;"))
     # перенос данных и снятие колонок -- до записи версии, всё внутри транзакции
     assert begin < script.index("ALTER TABLE") < script.index("DROP COLUMN") < pragma < commit
+
+
+def test_docs_record_with_unknown_key_is_refused_in_russian(repo):
+    cid = repo.save_organization(make_org(role=ROLE_CUSTOMER))
+    pid = repo.save_customer_profile(CustomerProfile(
+        customer_id=cid, docs={"Справка о МТР": DocSpec(prefix="05")}))
+    repo.conn.execute(
+        "UPDATE customer_profile SET docs = ? WHERE id = ?",
+        ('{"Справка о МТР": {"prefix": "05", "colour": "red"}}', pid))
+    with pytest.raises(ValueError) as err:
+        repo.get_customer_profile(pid)
+    text = str(err.value)
+    assert "Справка о МТР" in text and "colour" in text
+    assert "template, cellmap, layout, prefix" in text       # допустимые ключи
+    # запись не набором полей -- тоже русский отказ
+    repo.conn.execute("UPDATE customer_profile SET docs = ? WHERE id = ?",
+                      ('{"Справка о МТР": "assets_rnpk.json"}', pid))
+    with pytest.raises(ValueError, match="Справка о МТР"):
+        repo.get_customer_profile(pid)
+    # неполная запись допустима: недостающие поля пусты
+    repo.conn.execute("UPDATE customer_profile SET docs = ? WHERE id = ?",
+                      ('{"Справка о МТР": {"layout": "assets_rnpk.json"}}', pid))
+    assert repo.get_customer_profile(pid).docs == {
+        "Справка о МТР": DocSpec(layout="assets_rnpk.json")}
