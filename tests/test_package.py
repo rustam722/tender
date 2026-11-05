@@ -676,3 +676,179 @@ def test_half_written_file_of_a_failed_document_is_removed(
     result = build_package(tid, [DECLARATION], out, repo)
     assert len(result.skipped) == 1
     assert names(out) == []
+
+
+# ---- пересборка: overwrite ----------------------------------------------------
+
+def test_overwrite_false_is_the_default_and_refuses(repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "новый")
+    tid = make_tender(repo, documents=[DECLARATION])
+    out = tmp_path / "out"
+    out.mkdir()
+    existing = out / f"{DECLARATION}.docx"
+    existing.write_bytes(b"old")
+    result = build_package(tid, [DECLARATION], out, repo, overwrite=False)
+    assert result.written == [] and len(result.skipped) == 1
+    assert existing.read_bytes() == b"old"
+
+
+def test_overwrite_true_replaces_the_existing_file(repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "новый {{ org.short_name }}")
+    make_template(templates / f"{MTR}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION, MTR])
+    out = tmp_path / "out"
+    out.mkdir()
+    existing = out / f"{DECLARATION}.docx"
+    existing.write_bytes(b"old")
+    result = build_package(tid, [DECLARATION, MTR], out, repo, overwrite=True)
+    assert result.skipped == []
+    assert sorted(p.name for p in result.written) == sorted(
+        [f"{DECLARATION}.docx", f"{MTR}.docx"])
+    assert text_of(existing) == ["новый ООО «Техносфера»"]
+    assert names(out) == sorted([f"{DECLARATION}.docx", f"{MTR}.docx"])  # без остатков
+
+
+def test_rebuild_after_a_data_fix_shows_the_new_value(repo, dirs, tmp_path):
+    # главный сценарий: собрал, увидел не ту цену, поправил, собрал снова
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "{{ tender.subject }}")
+    tid = make_tender(repo, documents=[DECLARATION], subject="Старый предмет")
+    out = tmp_path / "out"
+    build_package(tid, [DECLARATION], out, repo)
+    tender = repo.get_tender(tid)
+    tender.subject = "Исправленный предмет"
+    repo.save_tender(tender)
+    result = build_package(tid, [DECLARATION], out, repo, overwrite=True)
+    assert result.skipped == []
+    assert text_of(out / f"{DECLARATION}.docx") == ["Исправленный предмет"]
+
+
+def test_overwrite_true_keeps_the_old_file_when_the_new_one_cannot_be_built(
+        repo, dirs, tmp_path):
+    # пересборка не должна стоить пользователю прежнего файла
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "{{ нет_ключа }}")
+    tid = make_tender(repo, documents=[DECLARATION])
+    out = tmp_path / "out"
+    out.mkdir()
+    existing = out / f"{DECLARATION}.docx"
+    existing.write_bytes(b"old")
+    result = build_package(tid, [DECLARATION], out, repo, overwrite=True)
+    assert result.written == [] and len(result.skipped) == 1
+    assert existing.read_bytes() == b"old"
+    assert names(out) == [f"{DECLARATION}.docx"]
+
+
+def test_overwrite_true_keeps_the_old_file_when_saving_breaks_halfway(
+        repo, dirs, tmp_path, monkeypatch):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION])
+    out = tmp_path / "out"
+    out.mkdir()
+    existing = out / f"{DECLARATION}.docx"
+    existing.write_bytes(b"old")
+
+    def crash_after_writing(template, context, target):
+        Path(target).write_bytes(b"half")
+        raise package_module.TemplateError("Не удалось сохранить.")
+
+    monkeypatch.setattr(package_module, "render_docx", crash_after_writing)
+    result = build_package(tid, [DECLARATION], out, repo, overwrite=True)
+    assert len(result.skipped) == 1
+    assert existing.read_bytes() == b"old"
+    assert names(out) == [f"{DECLARATION}.docx"]
+
+
+def test_overwrite_true_with_a_file_open_in_word_is_a_skip_and_keeps_it(
+        repo, dirs, tmp_path, monkeypatch):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION])
+    out = tmp_path / "out"
+    out.mkdir()
+    existing = out / f"{DECLARATION}.docx"
+    existing.write_bytes(b"old")
+
+    def locked(src, dst):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(package_module.os, "replace", locked)
+    result = build_package(tid, [DECLARATION], out, repo, overwrite=True)
+    assert result.written == []
+    assert "открыт" in result.skipped[0][1]
+    assert existing.read_bytes() == b"old"
+    assert names(out) == [f"{DECLARATION}.docx"]       # временный файл убран
+
+
+def test_overwrite_true_does_not_let_two_documents_share_one_name(
+        repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / "a.docx", "первый")
+    make_template(templates / "b.docx", "второй")
+    tid = make_tender(repo, documents=["Справка: 1", "Справка? 1"], docs={
+        "Справка: 1": DocSpec(template="a.docx"),
+        "Справка? 1": DocSpec(template="b.docx")})
+    out = tmp_path / "out"
+    result = build_package(tid, ["Справка: 1", "Справка? 1"], out, repo,
+                           overwrite=True)
+    assert len(result.written) == 1 and len(result.skipped) == 1
+    assert text_of(result.written[0]) == ["первый"]
+
+
+def test_overwrite_true_replaces_an_excel_form_too(repo, dirs, tmp_path):
+    templates, cellmaps = dirs
+    shutil.copy(REAL_FORM, templates / "forma_tkp_rosneft_murmansk.xlsx")
+    shutil.copy(ROOT / "cellmaps" / "tkp_rosneft_murmansk.json", cellmaps)
+    tid = rosneft_tender(repo)
+    out = tmp_path / "out"
+    build_package(tid, [TKP], out, repo)
+    result = build_package(tid, [TKP], out, repo, overwrite=True)
+    assert result.skipped == [] and len(result.written) == 1
+    assert names(out) == [f"3.{TKP}.xlsx"]
+
+
+# ---- нет папки шаблонов: одна ошибка, а не по записи на документ ---------------
+
+def test_missing_templates_folder_is_one_error_not_one_skip_per_document(
+        repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(package_module, "TEMPLATES_DOCS_DIR",
+                        tmp_path / "нет_такой_папки")
+    monkeypatch.setattr(package_module, "CELLMAPS_DIR", tmp_path / "cellmaps")
+    tid = make_tender(repo, documents=[DECLARATION, MTR])
+    out = tmp_path / "out"
+    with pytest.raises(PackageError) as caught:
+        build_package(tid, [DECLARATION, MTR], out, repo)
+    assert "нет_такой_папки" in str(caught.value) or "templates" in str(caught.value)
+    assert "папк" in str(caught.value).lower()
+    assert not out.exists()                      # ничего не создано
+
+
+def test_templates_folder_that_is_a_file_is_the_same_single_error(
+        repo, tmp_path, monkeypatch):
+    blocker = tmp_path / "templates_docs"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(package_module, "TEMPLATES_DOCS_DIR", blocker)
+    tid = make_tender(repo, documents=[DECLARATION])
+    with pytest.raises(PackageError):
+        build_package(tid, [DECLARATION], tmp_path / "out", repo)
+
+
+def test_missing_templates_folder_with_nothing_to_build_is_not_an_error(
+        repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(package_module, "TEMPLATES_DOCS_DIR", tmp_path / "нет")
+    tid = make_tender(repo)
+    result = build_package(tid, [], tmp_path / "out", repo)
+    assert result == PackageResult(written=[], skipped=[])
+
+
+def test_one_missing_template_in_an_existing_folder_stays_a_skip(
+        repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION, MTR])
+    result = build_package(tid, [DECLARATION, MTR], tmp_path / "out", repo)
+    assert len(result.written) == 1
+    assert [d for d, _ in result.skipped] == [MTR]

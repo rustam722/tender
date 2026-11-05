@@ -17,9 +17,10 @@
   * Имя очищается от символов, запрещённых в Windows, и укорачивается так,
     чтобы влезть и в 255 знаков имени, и в 259 знаков полного пути. Обрезается
     только имя файла: содержимое документа остаётся целым.
-  * Существующий файл не перезаписывается: документ уходит в `skipped`. Так
-    пользователь не потеряет правки в уже поданной или подписанной версии.
-    Чтобы собрать заново, нужно убрать старый файл или выбрать другую папку.
+  * Существующий файл по умолчанию не перезаписывается: документ уходит в
+    `skipped`, чтобы не потерять правки в уже поданной или подписанной версии.
+    `overwrite=True` разрешает замену (пересборка после правки данных); новый
+    файл пишется рядом и подменяет старый только после успеха.
   * Ничего не пишется вне папки пакета: разделители пути в префиксе и названии
     документа заменяются при очистке имени.
   * Предупреждения контекста (`warnings`) собираются по документам в
@@ -27,6 +28,7 @@
 """
 import os
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -156,8 +158,10 @@ def _template_path(document: str, template: str) -> Path:
 
 
 def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
-               taken: set[str], warnings: list[tuple[str, str]]) -> Path:
-    """Собирает один документ; при отказе поднимает исключение, файла не остаётся."""
+               taken: set[str], warnings: list[tuple[str, str]],
+               overwrite: bool) -> Path:
+    """Собирает один документ; при отказе поднимает исключение. Нового файла
+    после отказа не остаётся, а прежний (при overwrite) остаётся целым."""
     template = _template_path(document, spec.template if spec else "")
     target = _target(out_dir, document, spec.prefix if spec else "",
                      template.suffix.lower())
@@ -169,14 +173,20 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
             f"Имя файла «{target.name}» совпало с другим документом пакета: "
             "второй не записан. Задайте документам разные префиксы в профиле "
             "заказчика.")
-    if target.exists():
+    replacing = target.exists()
+    if replacing and not overwrite:
         raise _Refusal(
             f"Файл «{target.name}» уже есть в папке: он не перезаписан, чтобы "
-            "не потерять ваши правки. Переименуйте или удалите его и соберите "
-            "пакет заново либо выберите другую папку.")
+            "не потерять ваши правки. Разрешите замену существующих файлов, "
+            "переименуйте или удалите его либо выберите другую папку.")
 
     context = build_context(tender_id, repo, document=document)
     warnings.extend((document, text) for text in context["warnings"])
+    # Заменяемый файл не трогается, пока новый не готов: пишется рядом под
+    # временным именем и подменяет прежний одним действием. Сбой посреди записи
+    # не должен стоить пользователю прежней версии.
+    work = (target.with_name(f"~{uuid.uuid4().hex[:8]}{target.suffix}")
+            if replacing else target)
     try:
         if template.suffix.lower() == ".xlsx":
             if not spec or not spec.cellmap:
@@ -184,27 +194,46 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
                     f"Для книги «{template.name}» в профиле заказчика не указана "
                     "карта ячеек. Добавьте её в описание документа.")
             fill_workbook(template, load_cellmap(CELLMAPS_DIR / spec.cellmap),
-                          context, target)
+                          context, work)
         else:
-            render_docx(template, context, target)
+            render_docx(template, context, work)
+        if replacing:
+            try:
+                os.replace(work, target)
+            except OSError as exc:
+                raise _Refusal(
+                    f"Файл «{target.name}» не заменён: он открыт в Word или Excel "
+                    "либо защищён от записи. Закройте его и соберите заново; "
+                    "прежняя версия осталась целой.") from exc
     except BaseException:
-        # файла до вызова не было (проверено выше), значит остаток -- наш
-        target.unlink(missing_ok=True)
+        # work -- либо новый файл, либо временный: прежнего файла он не касается
+        work.unlink(missing_ok=True)
         raise
     return target
 
 
 def build_package(tender_id: int, documents: list[str], out_dir: Path,
-                  repo: Repo) -> PackageResult:
+                  repo: Repo, overwrite: bool = False) -> PackageResult:
     """Собирает документы `documents` тендера в папку `out_dir`.
 
-    Папка создаётся, если её нет. Неизвестный тендер -- `LookupError`, папка
-    не создаётся; папку создать нельзя -- `PackageError`. Сбой одного документа
-    в исключение не превращается: см. `PackageResult.skipped`.
+    Папка создаётся, если её нет. `overwrite=False` (по умолчанию): существующий
+    файл не трогается, документ уходит в `skipped`. `overwrite=True`: файл
+    заменяется, но только когда новый готов; не собрался -- прежний цел.
+    Экран спрашивает пользователя один раз, если хоть один целевой файл есть.
+
+    Неизвестный тендер -- `LookupError`; нет папки шаблонов или нельзя создать
+    папку пакета -- `PackageError`; в обоих случаях на диск ничего не пишется.
+    Сбой одного документа в исключение не превращается: см. `PackageResult.skipped`.
     """
     tender = repo.get_tender(tender_id)
     profile = (repo.find_customer_profile(tender.customer_id)
                if tender.customer_id is not None else None)
+    if documents and not TEMPLATES_DOCS_DIR.is_dir():
+        # одна причина на весь пакет -- одно сообщение, а не по строке на документ
+        raise PackageError(
+            f"Папка шаблонов «{TEMPLATES_DOCS_DIR}» не найдена: без неё не "
+            "собрать ни один документ. Проверьте, что папка templates_docs "
+            "лежит рядом с программой и в ней есть шаблоны.")
     out_dir = Path(os.path.abspath(out_dir))
     _make_folder(out_dir)
 
@@ -220,7 +249,7 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
         spec = profile.docs.get(document) if profile else None
         try:
             path = _build_one(tender_id, document, spec, out_dir, repo,
-                              taken, result.warnings)
+                              taken, result.warnings, overwrite)
         except _Refusal as exc:
             result.skipped.append((document, str(exc)))
         except (TemplateError, CellMapError, LayoutError) as exc:
