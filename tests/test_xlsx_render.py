@@ -87,8 +87,9 @@ def basic_map():
         cells={"D8": "Ставка НДС: {tender.vat_percent}%",
                "E23": "{conditions.Цена и условия:}",
                "B31": "{org.head_position} {org.head_name}"},
-        rows=RowBlock(first_row=9, last_row=19, source="items",
-                      columns={"C": "{row.price_value}", "D": "{row.vat_value}"}))
+        rows=[RowBlock(first_row=9, last_row=19, source="items",
+                       columns={"C": "{row.price_value}",
+                                "D": "{row.vat_value}"})])
 
 
 def make_items(count, price="100000.00", vat="5000.00"):
@@ -182,7 +183,7 @@ def test_more_rows_than_template_raises_with_counts(form, tmp_path):
         fill_workbook(form, basic_map(), make_context(12), out)
     text = str(caught.value)
     assert "12" in text and "11" in text
-    assert "строк" in text and "позиц" in text
+    assert "строк" in text and "позиц" in text.lower()
     assert not out.exists()                    # половинчатого файла нет
 
 
@@ -214,7 +215,7 @@ def test_formatted_price_string_would_not_be_a_number(form, tmp_path):
     # то, чего карта делать не должна: «5 700 000,00» -- текст, SUM его не видит
     block = RowBlock(first_row=9, last_row=19, source="items",
                      columns={"C": "{row.price}"})
-    out = fill_workbook(form, CellMap("Лист1", {}, block), make_context(1),
+    out = fill_workbook(form, CellMap("Лист1", {}, [block]), make_context(1),
                         tmp_path / "out.xlsx")
     assert load_workbook(out)["Лист1"]["C9"].data_type == "s"
 
@@ -255,7 +256,7 @@ def test_formula_cells_have_no_stale_cached_value(form, tmp_path):
 
 def test_string_starting_with_equals_is_text_not_formula(form, tmp_path):
     context = make_context(org={"head_name": "=1+1", "head_position": ""})
-    cell_map = CellMap("Лист1", {"B31": "{org.head_name}"}, None)
+    cell_map = CellMap("Лист1", {"B31": "{org.head_name}"})
     out = fill_workbook(form, cell_map, context, tmp_path / "out.xlsx")
     ws = load_workbook(out)["Лист1"]
     assert ws["B31"].data_type == "s" and ws["B31"].value == "=1+1"
@@ -263,7 +264,7 @@ def test_string_starting_with_equals_is_text_not_formula(form, tmp_path):
 
 def test_lone_placeholder_keeps_the_type_of_the_value(form, tmp_path):
     cell_map = CellMap("Лист1", {"D8": "{tender.vat_rate}",
-                                 "B31": "{tender.vat_percent}"}, None)
+                                 "B31": "{tender.vat_percent}"})
     out = fill_workbook(form, cell_map, make_context(), tmp_path / "out.xlsx")
     ws = load_workbook(out)["Лист1"]
     assert ws["D8"].data_type == "n" and ws["D8"].value == 0.05
@@ -273,7 +274,7 @@ def test_lone_placeholder_keeps_the_type_of_the_value(form, tmp_path):
 # ---- отказы --------------------------------------------------------------------
 
 def test_refuses_to_write_over_a_formula(form, tmp_path):
-    cell_map = CellMap("Лист1", {"E9": "{tender.vat_percent}"}, None)
+    cell_map = CellMap("Лист1", {"E9": "{tender.vat_percent}"})
     with pytest.raises(CellMapError) as caught:
         fill_workbook(form, cell_map, make_context(), tmp_path / "out.xlsx")
     assert "E9" in str(caught.value) and "формул" in str(caught.value)
@@ -283,13 +284,13 @@ def test_refuses_to_write_over_a_formula_in_the_row_block(form, tmp_path):
     block = RowBlock(first_row=9, last_row=19, source="items",
                      columns={"E": "{row.price_value}"})
     with pytest.raises(CellMapError) as caught:
-        fill_workbook(form, CellMap("Лист1", {}, block), make_context(),
+        fill_workbook(form, CellMap("Лист1", {}, [block]), make_context(),
                       tmp_path / "out.xlsx")
     assert "E9" in str(caught.value)
 
 
 def test_refuses_to_write_into_a_merged_cell(form, tmp_path):
-    cell_map = CellMap("Лист1", {"D23": "x"}, None)          # C23:D23 слита
+    cell_map = CellMap("Лист1", {"D23": "x"})          # C23:D23 слита
     with pytest.raises(CellMapError) as caught:
         fill_workbook(form, cell_map, make_context(), tmp_path / "out.xlsx")
     assert "D23" in str(caught.value) and "объединён" in str(caught.value)
@@ -297,7 +298,7 @@ def test_refuses_to_write_into_a_merged_cell(form, tmp_path):
 
 def test_refuses_locked_cell_on_protected_sheet(tmp_path):
     protected = make_form(tmp_path / "protected.xlsx", protected=True)
-    cell_map = CellMap("Лист1", {"B9": "перезапись"}, None)   # B9 заблокирована
+    cell_map = CellMap("Лист1", {"B9": "перезапись"})   # B9 заблокирована
     with pytest.raises(CellMapError) as caught:
         fill_workbook(protected, cell_map, make_context(), tmp_path / "out.xlsx")
     assert "B9" in str(caught.value) and "защит" in str(caught.value)
@@ -305,7 +306,7 @@ def test_refuses_locked_cell_on_protected_sheet(tmp_path):
 
 def test_locked_cell_on_unprotected_sheet_is_fine(form, tmp_path):
     # без защиты листа «заблокирована» -- пустой флаг, как в форме Роснефти
-    cell_map = CellMap("Лист1", {"B31": "x"}, None)
+    cell_map = CellMap("Лист1", {"B31": "x"})
     out = fill_workbook(form, cell_map, make_context(), tmp_path / "out.xlsx")
     assert cells_of(out)["B31"] == "x"
 
@@ -340,13 +341,13 @@ def test_unknown_row_source_is_reported(form, tmp_path):
     block = RowBlock(first_row=9, last_row=19, source="nothing",
                      columns={"C": "{row.price_value}"})
     with pytest.raises(CellMapError) as caught:
-        fill_workbook(form, CellMap("Лист1", {}, block), make_context(),
+        fill_workbook(form, CellMap("Лист1", {}, [block]), make_context(),
                       tmp_path / "out.xlsx")
     assert "nothing" in str(caught.value)
 
 
 def test_missing_sheet_is_reported_in_russian(form, tmp_path):
-    cell_map = CellMap("Нет такого", {"B31": "x"}, None)
+    cell_map = CellMap("Нет такого", {"B31": "x"})
     with pytest.raises(CellMapError) as caught:
         fill_workbook(form, cell_map, make_context(), tmp_path / "out.xlsx")
     text = str(caught.value)
@@ -385,21 +386,21 @@ def write_map(tmp_path, data):
 
 GOOD = {"sheet": "Лист1",
         "cells": {"D8": "Ставка НДС: {tender.vat_percent}%"},
-        "rows": {"first_row": 9, "last_row": 19, "source": "items",
-                 "columns": {"C": "{row.price_value}"}}}
+        "rows": [{"first_row": 9, "last_row": 19, "source": "items",
+                  "columns": {"C": "{row.price_value}"}}]}
 
 
 def test_load_cellmap_reads_the_shape(tmp_path):
     cell_map = load_cellmap(write_map(tmp_path, GOOD))
     assert cell_map == CellMap(
         sheet="Лист1", cells={"D8": "Ставка НДС: {tender.vat_percent}%"},
-        rows=RowBlock(first_row=9, last_row=19, source="items",
-                      columns={"C": "{row.price_value}"}))
+        rows=[RowBlock(first_row=9, last_row=19, source="items",
+                       columns={"C": "{row.price_value}"})])
 
 
 def test_cellmap_without_rows_loads(tmp_path):
     data = {"sheet": "Лист1", "cells": {"B31": "x"}}
-    assert load_cellmap(write_map(tmp_path, data)).rows is None
+    assert load_cellmap(write_map(tmp_path, data)).rows == []
 
 
 def test_missing_cellmap_file_is_reported_in_russian(tmp_path):
@@ -427,12 +428,18 @@ def test_broken_json_is_reported_in_russian(tmp_path):
     (lambda d: d["cells"].update({"B31": "{org.head_name"}), "B31"),   # скобка
     (lambda d: d["cells"].update({"B31": "}{"}), "B31"),
     (lambda d: d["cells"].update({"C12": "x"}), "C12"),          # внутри блока
-    (lambda d: d["rows"].pop("last_row"), "last_row"),
-    (lambda d: d["rows"].update(last_row=8), "last_row"),
-    (lambda d: d["rows"].update(first_row=0), "first_row"),
-    (lambda d: d["rows"]["columns"].update({"c": "x"}), "c"),
-    (lambda d: d["rows"]["columns"].update({"E": 7}), "E"),
-    (lambda d: d["rows"].update(columns={}), "columns"),
+    (lambda d: d["rows"][0].pop("last_row"), "last_row"),
+    (lambda d: d["rows"][0].update(last_row=8), "last_row"),
+    (lambda d: d["rows"][0].update(first_row=0), "first_row"),
+    (lambda d: d["rows"][0]["columns"].update({"c": "x"}), "c"),
+    (lambda d: d["rows"][0]["columns"].update({"E": 7}), "E"),
+    (lambda d: d["rows"][0].update(columns={}), "columns"),
+    (lambda d: d.update(rows={"first_row": 9}), "rows"),         # не список
+    (lambda d: d.update(rows=[5]), "rows"),
+    # второй блок пересекается с первым (колонка C, строки 15-25)
+    (lambda d: d["rows"].append({"first_row": 15, "last_row": 25,
+                                 "source": "labor",
+                                 "columns": {"C": "{row.amount_value}"}}), "C15"),
 ])
 def test_bad_cellmap_is_rejected_with_a_russian_reason(tmp_path, mutate, fragment):
     data = json.loads(json.dumps(GOOD))
@@ -486,12 +493,14 @@ def test_real_fixture_is_the_customers_form():
 
 def test_real_map_names_only_the_bidders_cells():
     cell_map = load_cellmap(REAL_MAP)
+    assert len(cell_map.rows) == 1
+    block = cell_map.rows[0]
     assert cell_map.sheet == "Лист1"
     assert set(cell_map.cells) == {"D8", "E23", "E24", "E25", "E26", "E27",
                                    "E28", "E29", "B31"}
-    assert cell_map.rows.first_row == 9 and cell_map.rows.last_row == 19
-    assert cell_map.rows.source == "items"
-    assert set(cell_map.rows.columns) == {"C", "D"}
+    assert block.first_row == 9 and block.last_row == 19
+    assert block.source == "items"
+    assert set(block.columns) == {"C", "D"}
 
 
 def test_real_form_formulas_survive(real_fill):
@@ -575,3 +584,101 @@ def test_real_form_refuses_twelve_positions(tmp_path):
     text = str(caught.value)
     assert "12" in text and "11" in text
     assert not (tmp_path / "ТКП.xlsx").exists()
+
+
+# ---- несколько блоков строк (подтаблицы КП Арктикгаза) ---------------------------
+
+def make_multi_form(path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Лист1"
+    ws["B34"] = "Итого материалы"
+    ws["F34"] = "=SUM(F35:F37)"
+    ws["E50"] = "=SUM(E48:E49)"
+    wb.save(path)
+    return path
+
+
+def multi_map():
+    return CellMap(sheet="Лист1", cells={}, rows=[
+        RowBlock(first_row=35, last_row=37, source="materials",
+                 columns={"B": "{row.name}", "F": "{row.amount_value}"}),
+        RowBlock(first_row=48, last_row=49, source="labor",
+                 columns={"B": "{row.post}", "E": "{row.amount_value}"}),
+    ])
+
+
+def multi_context(materials=2, labor=2):
+    return {
+        "materials": [{"name": f"Материал {n}", "amount_value": Decimal(f"{n}00.50")}
+                      for n in range(1, materials + 1)],
+        "labor": [{"post": f"Эколог {n}", "amount_value": Decimal(f"{n}000")}
+                  for n in range(1, labor + 1)],
+    }
+
+
+def test_several_row_blocks_are_filled_independently(tmp_path):
+    form = make_multi_form(tmp_path / "multi.xlsx")
+    out = fill_workbook(form, multi_map(), multi_context(3, 2),
+                        tmp_path / "out.xlsx")
+    cells = cells_of(out)
+    assert cells["B35"] == "Материал 1" and cells["F37"] == 300.5
+    assert cells["B48"] == "Эколог 1" and cells["E49"] == 2000
+    assert "B50" not in cells and "F38" not in cells
+    # итоги книги -- её формулы
+    assert cells["F34"] == "=SUM(F35:F37)" and cells["E50"] == "=SUM(E48:E49)"
+
+
+def test_overflow_of_the_second_block_names_its_counts(tmp_path):
+    form = make_multi_form(tmp_path / "multi.xlsx")
+    with pytest.raises(CellMapError) as caught:
+        fill_workbook(form, multi_map(), multi_context(2, 3),
+                      tmp_path / "out.xlsx")
+    text = str(caught.value)
+    assert "3" in text and "2" in text and "labor" in text
+    assert "строк" in text and "48" in text
+    assert not (tmp_path / "out.xlsx").exists()
+
+
+def test_each_block_has_its_own_capacity(tmp_path):
+    # три материала влезают в три строки, хотя во втором блоке строк две
+    form = make_multi_form(tmp_path / "multi.xlsx")
+    fill_workbook(form, multi_map(), multi_context(3, 2), tmp_path / "out.xlsx")
+
+
+# ---- пустое значение в клетке ответа -------------------------------------------
+
+def test_missing_deal_answer_refuses_and_names_the_condition(form, tmp_path):
+    context = make_context()
+    del context["conditions"]["Цена и условия:"]
+    out = tmp_path / "out.xlsx"
+    with pytest.raises(CellMapError) as caught:
+        fill_workbook(form, basic_map(), context, out)
+    text = str(caught.value)
+    assert "Цена и условия:" in text and "E23" in text
+    assert not out.exists()
+
+
+def test_empty_deal_answer_refuses_instead_of_blanking_the_cell(form, tmp_path):
+    context = make_context()
+    context["conditions"]["Цена и условия:"] = ""
+    with pytest.raises(CellMapError) as caught:
+        fill_workbook(form, basic_map(), context, tmp_path / "out.xlsx")
+    text = str(caught.value)
+    assert "Цена и условия:" in text and "E23" in text and "пуст" in text
+
+
+def test_empty_interpolated_text_in_a_scalar_cell_refuses(form, tmp_path):
+    context = make_context(org={"head_name": "", "head_position": ""})
+    with pytest.raises(CellMapError) as caught:
+        fill_workbook(form, basic_map(), context, tmp_path / "out.xlsx")
+    assert "B31" in str(caught.value) and "пуст" in str(caught.value)
+
+
+def test_empty_value_in_a_row_block_is_allowed(tmp_path):
+    # пустое примечание в строке подтаблицы -- обычное дело, не отказ
+    form = make_multi_form(tmp_path / "multi.xlsx")
+    context = multi_context(1, 1)
+    context["materials"][0]["name"] = ""
+    out = fill_workbook(form, multi_map(), context, tmp_path / "out.xlsx")
+    assert "B35" not in cells_of(out)

@@ -17,13 +17,16 @@
         "E23": "{conditions.Цена и условия:}",
         "B31": "{org.head_position} {org.head_name}"
       },
-      "rows": {                                    // повторяющийся блок строк
-        "first_row": 9, "last_row": 19,            // сколько строк в форме
-        "source": "items",                         // список из контекста
-        "columns": {"C": "{row.price_value}",      // буква колонки -> выражение
-                    "D": "{row.vat_value}"}
-      }
+      "rows": [                                    // блоки повторяющихся строк
+        {"first_row": 9, "last_row": 19,           // сколько строк в форме
+         "source": "items",                        // список из контекста
+         "columns": {"C": "{row.price_value}",     // буква колонки -> выражение
+                     "D": "{row.vat_value}"}}
+      ]
     }
+
+Блоков может быть несколько (книга с подтаблицами: материалы, трудозатраты,
+субподряд -- у каждого свои строки, список и колонки); блоки не пересекаются.
 
 Выражение -- строка, в которой `{путь}` подставляется из контекста шаблонов
 (задача 8). Путь -- ключи через точку: `org.head_name`, `tender.vat_percent`,
@@ -35,16 +38,19 @@
   * Выражение из одного `{путь}` пишет значение как есть: Decimal остаётся
     числом, и ячейка получает число (SUM книги считает только числа).
   * Выражение с текстом вокруг (`Ставка НДС: {..}%`) пишет строку.
+  * Одиночная клетка (`cells`) не может получить пустое значение: нет ответа
+    по условию или он пуст -- отказ, а не пустая графа, из-за которой заявку
+    отклонят молча. В строках блоков пустое значение допустимо (примечание).
 
 Чего здесь нет намеренно: клетки с названиями, номерами позиций и условиями
 заказчика (колонки A, B, C формы Роснефти) в карту не входят -- это его текст.
 Строки удалять и добавлять нельзя (форма это запрещает): позиций больше, чем
-строк, -- отказ; меньше -- лишние строки остаются как в чистой форме.
+строк в блоке, -- отказ; меньше -- лишние строки остаются как в чистой форме.
 """
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -67,7 +73,7 @@ class RowBlock:
 class CellMap:
     sheet: str
     cells: dict[str, str]             # адрес клетки -> выражение
-    rows: RowBlock | None = None
+    rows: list[RowBlock] = field(default_factory=list)
 
 
 _ADDRESS = re.compile(r"[A-Z]{1,3}[1-9][0-9]*")
@@ -94,9 +100,11 @@ def _check_expression(expr: object, label: str, name: str) -> None:
             f"лишняя фигурная скобка: {expr}")
 
 
-def _row_block(raw: object, cells: dict[str, str], name: str) -> RowBlock:
+def _row_block(raw: object, name: str) -> RowBlock:
     if not isinstance(raw, dict):
-        raise CellMapError(f"Карта ячеек {name}: rows должно быть объектом.")
+        raise CellMapError(
+            f"Карта ячеек {name}: каждый блок в rows должен быть объектом, "
+            f"а там {raw!r}.")
     for key in ("first_row", "last_row", "source", "columns"):
         if key not in raw:
             raise CellMapError(
@@ -124,15 +132,25 @@ def _row_block(raw: object, cells: dict[str, str], name: str) -> RowBlock:
                 f"Карта ячеек {name}: колонка «{letter}» не буква "
                 "колонки Excel (A, B, ... заглавными).")
         _check_expression(expr, f"колонки «{letter}»", name)
-    for address in cells:
-        column = re.match(r"[A-Z]+", address).group()
-        row = int(address[len(column):])
-        if column in columns and first <= row <= last:
-            raise CellMapError(
-                f"Карта ячеек {name}: клетка {address} уже входит в блок "
-                f"строк (колонка {column}, строки {first}-{last}).")
     return RowBlock(first_row=first, last_row=last, source=source,
                     columns=dict(columns))
+
+
+def _check_overlaps(cells: dict[str, str], rows: list[RowBlock],
+                    name: str) -> None:
+    """Одна клетка -- одна запись: ни клетка карты, ни два блока не делят адрес."""
+    owner: dict[str, str] = {}
+    for address in cells:
+        owner[address] = f"клеткой {address} из cells"
+    for number, block in enumerate(rows, start=1):
+        for letter in block.columns:
+            for row in range(block.first_row, block.last_row + 1):
+                address = f"{letter}{row}"
+                if address in owner:
+                    raise CellMapError(
+                        f"Карта ячеек {name}: клетка {address} из блока строк "
+                        f"№{number} уже занята {owner[address]}.")
+                owner[address] = f"блоком строк №{number}"
 
 
 def load_cellmap(path: Path) -> CellMap:
@@ -168,8 +186,15 @@ def load_cellmap(path: Path) -> CellMap:
                 f"Карта ячеек {name}: «{address}» не адрес клетки "
                 "(например D8, заглавными).")
         _check_expression(expr, f"клетки {address}", name)
-    rows = (_row_block(data["rows"], raw_cells, name)
-            if data.get("rows") is not None else None)
+    raw_rows = data.get("rows")
+    if raw_rows is None:
+        raw_rows = []
+    if not isinstance(raw_rows, list):
+        raise CellMapError(
+            f"Карта ячеек {name}: rows должно быть списком блоков строк "
+            "(даже если блок один).")
+    rows = [_row_block(raw, name) for raw in raw_rows]
+    _check_overlaps(raw_cells, rows, name)
     return CellMap(sheet=sheet, cells=dict(raw_cells), rows=rows)
 
 
@@ -184,7 +209,8 @@ def _lookup(scope: Mapping, path: str, where: str):
         else:
             raise CellMapError(
                 f"Для {where} в данных нет значения «{path.strip()}» "
-                f"(не найдено «{part}»). Проверьте карту ячеек и данные тендера.")
+                f"(не найдено «{part}»). Задайте его в данных тендера или "
+                "поправьте карту ячеек.")
     return node
 
 
@@ -192,15 +218,27 @@ def _text(value: object) -> str:
     return "" if value is None else str(value)
 
 
-def _evaluate(expr: str, scope: Mapping, address: str):
+def _evaluate(expr: str, scope: Mapping, address: str, required: bool = False):
+    """required -- одиночная клетка: пустой результат не пишется, а отказывает."""
     where = f"клетки {address}"
     lone = _PLACEHOLDER.fullmatch(expr)
     if lone:
-        value = _lookup(scope, lone.group(1), where)
-        return None if value == "" else value
+        path = lone.group(1).strip()
+        value = _lookup(scope, path, where)
+        if value is None or value == "":
+            if required:
+                raise CellMapError(
+                    f"Для {where} значение «{path}» пусто. Графа не должна "
+                    "остаться незаполненной: задайте значение в данных тендера.")
+            return None
+        return value
     text = _PLACEHOLDER.sub(
-        lambda m: _text(_lookup(scope, m.group(1), where)), expr)
-    return text.strip()
+        lambda m: _text(_lookup(scope, m.group(1), where)), expr).strip()
+    if required and not text:
+        raise CellMapError(
+            f"Для {where} из «{expr}» получился пустой текст: нужные поля "
+            "в данных тендера пусты.")
+    return text
 
 
 # ---- запись ------------------------------------------------------------------------
@@ -260,9 +298,9 @@ def fill_workbook(template: Path, cell_map: CellMap, context: dict,
 
         writes = []                                   # (адрес, значение)
         for address, expr in cell_map.cells.items():
-            writes.append((address, _evaluate(expr, context, address)))
-        block = cell_map.rows
-        if block is not None:
+            writes.append((address, _evaluate(expr, context, address,
+                                              required=True)))
+        for block in cell_map.rows:
             writes.extend(_row_writes(block, context))
         for address, _ in writes:
             _check_writable(ws, address, protected)
@@ -293,14 +331,14 @@ def _row_writes(block: RowBlock, context: dict) -> list[tuple[str, object]]:
                    f"блока строк (с {block.first_row}-й строки)")
     if isinstance(rows, (str, Mapping)) or not hasattr(rows, "__len__"):
         raise CellMapError(
-            f"«{block.source}» в данных не список позиций, а {type(rows).__name__}.")
+            f"«{block.source}» в данных не список, а {type(rows).__name__}.")
     capacity = block.last_row - block.first_row + 1
     if len(rows) > capacity:
         raise CellMapError(
-            f"Позиций ({len(rows)}) больше, чем строк в форме заказчика "
-            f"({capacity}, строки {block.first_row}-{block.last_row}). "
+            f"Позиций в «{block.source}» ({len(rows)}) больше, чем строк в форме "
+            f"заказчика ({capacity}, строки {block.first_row}-{block.last_row}). "
             "Строки в форме удалять и добавлять нельзя: сократите список "
-            "позиций или заполните форму вручную.")
+            "или заполните форму вручную.")
     writes = []
     for offset, item in enumerate(rows):
         row = block.first_row + offset

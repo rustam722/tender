@@ -11,13 +11,15 @@
     "E29": "{conditions.Возможность привлечения субподрядчиков/субисполнителей}",
     "B31": "{org.head_position} {org.head_name}"
   },
-  "rows": {
-    "first_row": 9,
-    "last_row": 19,
-    "source": "items",
-    "columns": {
-      "C": "{row.price_value}",
-      "D": "{row.vat_value}"
+  "rows": [
+    {
+      "first_row": 9,
+      "last_row": 19,
+      "source": "items",
+      "columns": {
+        "C": "{row.price_value}",
+        "D": "{row.vat_value}"
+      }
     }
-  }
+  ]
 }
