@@ -81,6 +81,12 @@ def load_layout(path: Path) -> TableLayout:
     path = Path(path)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        # имя файла берётся из данных, которые правит пользователь (профиль
+        # заказчика), а сообщение ОС по-английски в русский текст не годится
+        raise LayoutError(
+            f"Файл раскладки {path.name} не найден в папке {path.parent.name}. "
+            "Проверьте имя файла в профиле заказчика.") from None
     except (OSError, ValueError) as exc:
         raise LayoutError(
             f"Не удалось прочитать раскладку {path.name}: {exc}") from exc

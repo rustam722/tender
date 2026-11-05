@@ -22,6 +22,14 @@ ASSET = Asset(
 )
 
 
+def test_missing_layout_file_raises_layout_error_in_russian(tmp_path):
+    with pytest.raises(LayoutError) as caught:
+        load_layout(tmp_path / "net_takogo.json")
+    text = str(caught.value)
+    assert "net_takogo.json" in text and "не найден" in text
+    assert "No such file" not in text and "Errno" not in text
+
+
 def test_same_asset_renders_differently_under_both_layouts():
     kor = build_rows(load_layout(KOR), [ASSET])[0]
     rnpk = build_rows(load_layout(RNPK), [ASSET])[0]

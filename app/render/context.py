@@ -4,7 +4,17 @@
 Правил, кроме цепочки НДС и форматирования денег, здесь нет.
 
 Ключи (значения отдаются как есть, Decimal остаётся Decimal -- форматирует
-шаблон через `money`, кроме клеток таблиц, см. ниже):
+шаблон через `money`, кроме клеток таблиц, см. ниже).
+
+Единый контракт денег в списках items, materials, subcontract и labor:
+текст через money под естественным именем (price, amount, rate) и Decimal
+под именем с суффиксом _value (price_value, amount_value, rate_value).
+Исключение -- количества: quantity у материалов и hours у ФОТ остаются
+сырым Decimal, это не деньги, и разряды с запятой им не положены.
+Построчные суммы (amount) округляются до копеек один раз, и в калькуляцию
+идёт сумма именно этих округлённых значений: каждая напечатанная строка
+воспроизводится от напечатанных соседей, подтаблица сходится со своим итогом.
+
     org, customer      поля организации (пустые строки, если организации нет)
     tender             поля тендера; vat_rate -- итоговая ставка по цепочке,
                        vat_percent -- она же текстом: «5», «5,5»
@@ -15,7 +25,9 @@
     subcontract        quantity (Decimal), price и amount (текст через money),
                        price_value и amount_value (Decimal), note; их суммы
                        идут в estimate
-    labor              строки ФОТ: number, post, headcount, hours, rate
+    labor              строки ФОТ: number, post, headcount, hours (Decimal),
+                       rate и amount (headcount * hours * rate) -- текст,
+                       rate_value и amount_value -- Decimal
     employees, assets, experience
                        {"headers": [...], "rows": [[...]]} под раскладку
     declaration_text   текст декларации из профиля заказчика
@@ -24,11 +36,16 @@
     money              функция: Decimal -> «5 985 000,00»
     date_ru, date_long функции: ISO-строка -> «24.10.2025» и «24» октября 2025 г.;
                        пустая строка -> пустая строка
-    warnings           list[str]: что пропущено при сборке (пропавший опыт)
+    warnings           list[str]: что пропущено или подставлено по умолчанию
+                       (пропавший опыт, документ без назначенной раскладки)
 
 Деньги в клетках таблиц. Раскладки (задача 7) ничего не форматируют, поэтому
 перед build_rows каждое Decimal-поле записи заменяется своим текстом через
-money -- в копии записи, справочник не трогается. Так формат не зависит от
+money -- в копии записи, справочник не трогается. Внимание: форматируется
+КАЖДОЕ Decimal-поле как деньги. Сегодня это верно (у Employee и ExperienceRecord
+Decimal -- только деньги, у Asset Decimal нет), но Decimal-поле часов или
+количества, добавленное в справочник, молча получило бы разряды и округление
+до копеек во всех документах -- такое поле придётся исключить здесь. Так формат не зависит от
 того, какую колонку выбрала раскладка: форматируется любое денежное поле
 (сумма контракта, часовая ставка), а не список имён, который пришлось бы
 держать в согласии с правкой раскладок.
@@ -42,7 +59,7 @@ from app.calc import LaborLine, estimate
 from app.config import BASE_DIR
 from app.models import (
     COST_MATERIALS, COST_SUBCONTRACT, ROLE_CUSTOMER, ROLE_PARTICIPANT,
-    CustomerProfile, Organization, TenderCostItem,
+    CustomerProfile, Organization, TenderCostItem, TenderLaborRow,
 )
 from app.render.layouts import TableLayout, build_rows, load_layout
 from app.repo import Repo
@@ -52,6 +69,11 @@ LAYOUTS_DIR = BASE_DIR / "layouts"
 NBSP = " "
 _KOPECK = Decimal("0.01")
 _ZERO = Decimal("0")
+
+
+def _round(value: Decimal) -> Decimal:
+    """До копеек, ROUND_HALF_UP -- как статьи калькулятора."""
+    return value.quantize(_KOPECK, rounding=ROUND_HALF_UP)
 
 # Раскладка по умолчанию -- для заказчика без профиля или с профилем, где
 # нет документа, который выбирает другую раскладку.
@@ -71,7 +93,7 @@ def money(value: Decimal) -> str:
     Округление до копеек ROUND_HALF_UP, как в калькуляторе."""
     if not isinstance(value, (Decimal, int)) or isinstance(value, bool):
         raise TypeError(f"money принимает Decimal, а не {type(value).__name__}")
-    rounded = Decimal(value).quantize(_KOPECK, rounding=ROUND_HALF_UP)
+    rounded = _round(Decimal(value))
     if not rounded:
         rounded = Decimal("0.00")        # без «-0,00»
     return f"{rounded:,.2f}".translate({ord(","): NBSP, ord("."): ","})
@@ -155,11 +177,26 @@ def _organization(repo: Repo, org_id: int | None, role: str):
 
 
 def _cost_rows(items: list[TenderCostItem]) -> list[dict]:
-    return [{"number": n, "name": i.name, "unit": i.unit, "quantity": i.quantity,
-             "price": money(i.price), "price_value": i.price,
-             "amount": money(i.quantity * i.price),
-             "amount_value": i.quantity * i.price, "note": i.note}
-            for n, i in enumerate(items, start=1)]
+    rows = []
+    for n, i in enumerate(items, start=1):
+        amount = _round(i.quantity * i.price)      # один раз, на строке
+        rows.append({"number": n, "name": i.name, "unit": i.unit,
+                     "quantity": i.quantity,
+                     "price": money(i.price), "price_value": i.price,
+                     "amount": money(amount), "amount_value": amount,
+                     "note": i.note})
+    return rows
+
+
+def _labor_rows(rows: list[TenderLaborRow]) -> list[dict]:
+    result = []
+    for n, r in enumerate(rows, start=1):
+        amount = _round(r.headcount * r.hours * r.rate)   # один раз, на строке
+        result.append({"number": n, "post": r.post, "headcount": r.headcount,
+                       "hours": r.hours,
+                       "rate": money(r.rate), "rate_value": r.rate,
+                       "amount": money(amount), "amount_value": amount})
+    return result
 
 
 def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
@@ -189,10 +226,16 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
     labor_rows = repo.list_tender_labor(tender_id)
     materials = repo.list_tender_cost_items(tender_id, COST_MATERIALS)
     subcontract = repo.list_tender_cost_items(tender_id, COST_SUBCONTRACT)
+    labor = _labor_rows(labor_rows)
+    materials_table, subcontract_table = _cost_rows(materials), _cost_rows(subcontract)
+    # В калькуляцию уходят суммы напечатанных (округлённых) строк. ФОТ идёт
+    # строками «1 чел. * сумма строки * 1 руб.»: estimate округляет ФОТ сам, и
+    # от сырых произведений сумма расходилась бы с напечатанными строками.
     calc = estimate(
-        [LaborLine(r.post, r.headcount, r.hours, r.rate) for r in labor_rows],
-        sum((i.quantity * i.price for i in materials), _ZERO),
-        sum((i.quantity * i.price for i in subcontract), _ZERO),
+        [LaborLine(row["post"], 1, row["amount_value"], Decimal("1"))
+         for row in labor],
+        sum((row["amount_value"] for row in materials_table), _ZERO),
+        sum((row["amount_value"] for row in subcontract_table), _ZERO),
         replace(settings, vat_rate=rate))
 
     tender_fields = asdict(tender)
@@ -200,9 +243,16 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
     tender_fields["vat_percent"] = _percent(rate)
 
     layouts = _layouts(profile, document)
+    warnings = []
+    if (profile and document in profile.documents
+            and document not in profile.layouts):
+        warnings.append(
+            f"Для документа «{document}» в профиле заказчика не назначена "
+            "раскладка таблиц: колонки взяты по умолчанию. Если у заказчика "
+            "своя форма таблицы, добавьте раскладку в профиль.")
     if experience_ids is None:
         experience_ids = tender.experience_ids
-    selected, warnings = [], []
+    selected = []
     for exp_id in experience_ids:
         try:
             selected.append(repo.get_experience(exp_id))
@@ -221,11 +271,9 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
                    "price": money(i.price), "price_value": i.price}
                   for n, i in enumerate(repo.list_lot_items(tender_id), start=1)],
         "estimate": asdict(calc),
-        "materials": _cost_rows(materials),
-        "subcontract": _cost_rows(subcontract),
-        "labor": [{"number": n, "post": r.post, "headcount": r.headcount,
-                   "hours": r.hours, "rate": r.rate}
-                  for n, r in enumerate(labor_rows, start=1)],
+        "materials": materials_table,
+        "subcontract": subcontract_table,
+        "labor": labor,
         "employees": _table(layouts["employees"], repo.list_employees()),
         "assets": _table(layouts["assets"], repo.list_assets()),
         "experience": _table(layouts["experience"], selected),

@@ -386,8 +386,19 @@ def test_version_2_database_upgrades_to_3_keeping_data(tmp_path):
 def test_migration_3_is_one_transaction(tmp_path):
     # обрыв посередине не должен оставить половину ALTER: следующий запуск
     # упал бы на «duplicate column». Скрипт сам открывает и закрывает транзакцию.
-    script = db._MIGRATIONS[2].strip().upper()
-    assert script.startswith("BEGIN") and script.rstrip().endswith("COMMIT;")
+    script = db._MIGRATIONS[2].upper()
+    begin, pragma, commit = (script.index("BEGIN;"), script.index("PRAGMA USER_VERSION"),
+                             script.rindex("COMMIT;"))
+    # версия пишется внутри транзакции, вместе с ALTER TABLE
+    assert begin < script.index("ALTER TABLE") < pragma < commit
+
+
+def test_version_pragma_inside_a_migration_matches_its_position():
+    # автор следующей миграции, скопировавший строку, получит красный тест
+    import re
+    for number, script in enumerate(db._MIGRATIONS, start=1):
+        for found in re.findall(r"PRAGMA\s+user_version\s*=\s*(\d+)", script, re.I):
+            assert int(found) == number
 
 
 # ---- профиль: раскладки, тендер: отбор опыта ----------------------------------

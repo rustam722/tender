@@ -179,7 +179,27 @@ def test_labor_rows_keep_position_order_and_decimals(repo_with_koryazhma):
     assert [r["post"] for r in labor] == [a[0] for a in ARKTIK]
     assert [r["number"] for r in labor] == [1, 2]
     assert labor[0]["headcount"] == 4
-    assert labor[0]["hours"] == Decimal("1200") and labor[0]["rate"] == Decimal("270")
+    # часы -- количество, а не деньги: сырой Decimal; деньги -- пара текст + _value
+    assert labor[0]["hours"] == Decimal("1200")
+    assert labor[0]["rate"] == f"270,00" and labor[0]["rate_value"] == Decimal("270")
+    assert labor[0]["amount"] == f"1{NBSP}296{NBSP}000,00"        # 4 * 1200 * 270
+    assert labor[0]["amount_value"] == Decimal("1296000")
+    assert labor[1]["amount"] == f"151{NBSP}200,00"               # 1 * 360 * 420
+
+
+def test_labor_lines_add_up_to_the_estimate_labor_article(repo_with_koryazhma):
+    ctx = ctx_of(repo_with_koryazhma)
+    assert sum(r["amount_value"] for r in ctx["labor"]) == ctx["estimate"]["labor"]
+
+
+def test_labor_amounts_are_rounded_per_line_and_sum_to_the_article(repo):
+    # 0.5 ч * 0.01 руб = 0.005 -> 0.01 на строке; две строки печатают 0.02,
+    # хотя округление сырой суммы дало бы 0.01
+    tid = add_tender(repo, None, None)
+    add_labor(repo, tid, [("А", 1, "0.5", "0.01"), ("Б", 1, "0.5", "0.01")])
+    ctx = build_context(tid, repo)
+    assert [r["amount_value"] for r in ctx["labor"]] == [Decimal("0.01")] * 2
+    assert ctx["estimate"]["labor"] == Decimal("0.02")
 
 
 def test_estimate_is_built_from_stored_labor_rows(repo_with_koryazhma):
@@ -211,14 +231,21 @@ def test_vat_rate_falls_back_tender_then_org_then_settings(repo):
                                    Decimal("0.05"), Decimal("0.10"),
                                    Decimal("0.05")))
 
+    # ставка заказчика в цепочке не участвует и никогда не должна выигрывать
+    customer = repo.save_organization(Organization(role=ROLE_CUSTOMER,
+                                                   vat_rate=Decimal("0.99")))
+
     def vat_of(participant, tender_vat):
-        tid = add_tender(repo, None, participant, vat_rate=tender_vat)
+        tid = add_tender(repo, customer, participant, vat_rate=tender_vat)
         add_labor(repo, tid)
         ctx = build_context(tid, repo)
-        # ставка в калькуляции -- та же, что показана в тендере
-        net = ctx["estimate"]["total_wo_vat"]
-        assert ctx["estimate"]["vat"] == (net * ctx["tender"]["vat_rate"]).quantize(
-            Decimal("0.01"))
+        # ставка в калькуляции -- та же, что показана в тендере; сумму НДС
+        # считает калькулятор, тест её не пересчитывает своим округлением
+        lines = [LaborLine(p, n, Decimal(h), Decimal(r)) for p, n, h, r in ARKTIK]
+        expected = estimate(lines, Decimal("0"), Decimal("0"), OrgSettings(
+            Decimal("0.30"), Decimal("0.002"), Decimal("0.05"), Decimal("0.10"),
+            ctx["tender"]["vat_rate"]))
+        assert ctx["estimate"]["vat"] == expected.vat
         return ctx["tender"]["vat_rate"]
 
     assert vat_of(me, Decimal("0.07")) == Decimal("0.07")     # тендер побеждает
@@ -280,7 +307,25 @@ def test_cost_item_quantity_multiplies_price(repo_with_koryazhma):
         quantity=Decimal("2.5"), price=Decimal("100.00")))
     ctx = ctx_of(repo)
     assert ctx["estimate"]["materials"] == Decimal("250.00")
-    assert ctx["materials"][0]["amount_value"] == Decimal("250.000")
+    assert ctx["materials"][0]["amount_value"] == Decimal("250.00")
+
+
+def test_cost_subtable_adds_up_to_its_estimate_article(repo):
+    # 1.5 * 0.01 = 0.015 -> 0.02 на строке. Две строки печатают 0.04, а
+    # округление сырой суммы (0.030) дало бы 0.03: подтаблица не сошлась бы
+    # со строкой итога под ней
+    tid = add_tender(repo, None, None)
+    for kind in ("materials", "subcontract"):
+        for name in ("а", "б"):
+            repo.save_tender_cost_item(TenderCostItem(
+                tender_id=tid, kind=kind, name=name,
+                quantity=Decimal("1.5"), price=Decimal("0.01")))
+    ctx = build_context(tid, repo)
+    for kind in ("materials", "subcontract"):
+        assert [r["amount_value"] for r in ctx[kind]] == [Decimal("0.02")] * 2
+        assert [r["amount"] for r in ctx[kind]] == ["0,02"] * 2
+        assert ctx["estimate"][kind] == sum(r["amount_value"] for r in ctx[kind])
+        assert ctx["estimate"][kind] == Decimal("0.04")
 
 
 def test_cost_items_are_exposed_as_two_tables(repo_with_koryazhma):
@@ -361,6 +406,22 @@ def test_document_without_layout_in_profile_uses_defaults(repo_with_koryazhma):
     ctx = ctx_of(repo_with_koryazhma, document="Декларация")
     assert ctx["assets"]["headers"][0] == "Наименование"
     assert ctx["declaration_text"] == "Декларация Коряжмы"
+
+
+def test_document_listed_without_a_layout_warns_about_default_columns(repo):
+    customer = repo.save_organization(Organization(role=ROLE_CUSTOMER))
+    repo.save_customer_profile(CustomerProfile(
+        customer_id=customer, documents=[DOC_EQUIPMENT, DOC_MTR],
+        layouts={DOC_MTR: "assets_rnpk.json"}))
+    tid = add_tender(repo, customer, None)
+    ctx = build_context(tid, repo, document=DOC_EQUIPMENT)
+    assert ctx["assets"]["headers"][0] == "Наименование"      # умолчания остаются
+    (warning,) = ctx["warnings"]
+    assert DOC_EQUIPMENT in warning and "по умолчанию" in warning
+    # с раскладкой, с неупомянутым документом и без имени -- без предупреждения
+    assert build_context(tid, repo, document=DOC_MTR)["warnings"] == []
+    assert build_context(tid, repo, document="Декларация")["warnings"] == []
+    assert build_context(tid, repo)["warnings"] == []
 
 
 def test_document_layout_replaces_only_its_own_source(repo_with_koryazhma):

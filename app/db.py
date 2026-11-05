@@ -187,7 +187,7 @@ _MIGRATIONS = [
     );
     CREATE INDEX IF NOT EXISTS idx_tender_cost_item_tender
         ON tender_cost_item (tender_id, kind, position, id);
-    PRAGMA user_version = 3;
+    PRAGMA user_version = 3;  -- номер этой миграции: при копировании сменить
     COMMIT;
     """,
 ]
