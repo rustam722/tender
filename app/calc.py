@@ -35,7 +35,7 @@ class Estimate:
     total_with_vat: Decimal
 
 
-def money(value: Decimal) -> Decimal:
+def _money(value: Decimal) -> Decimal:
     """Округление до копеек, ROUND_HALF_UP."""
     return value.quantize(KOPECK, rounding=ROUND_HALF_UP)
 
@@ -44,16 +44,22 @@ def estimate(labor: list[LaborLine], materials: Decimal, subcontract: Decimal,
              settings: OrgSettings) -> Estimate:
     """Считает все статьи. Накладные -- от ФОТ; прибыль -- от ФОТ, страховых,
     субподряда и накладных (материалы в базу прибыли не входят)."""
-    fot = money(sum((Decimal(x.headcount) * x.hours * x.rate for x in labor),
-                    Decimal("0")))
-    materials = money(materials)
-    subcontract = money(subcontract)
-    insurance = money(fot * (settings.insurance_rate + settings.injury_rate))
-    overhead = money(fot * settings.overhead_rate)
-    profit = money((fot + insurance + subcontract + overhead)
-                   * settings.profit_rate)
+    fot = _money(sum((Decimal(x.headcount) * x.hours * x.rate for x in labor),
+                     Decimal("0")))
+    materials = _money(materials)
+    subcontract = _money(subcontract)
+    # Базы берём из уже округлённых статей (fot, insurance, ...), а не из
+    # сырых произведений: каждая строка формы должна пересчитываться вручную
+    # от соседних напечатанных строк. Тест test_rounding_base_is_printed_articles
+    # закрепляет это числами, на которых оба подхода расходятся.
+    insurance = _money(fot * (settings.insurance_rate + settings.injury_rate))
+    overhead = _money(fot * settings.overhead_rate)
+    profit = _money((fot + insurance + subcontract + overhead)
+                    * settings.profit_rate)
+    # Итог намеренно СУММА напечатанных округлённых статей. Не заменять на
+    # _money(сырой итог): итог перестанет сходиться со своими строками.
     total = materials + fot + insurance + subcontract + overhead + profit
-    vat = money(total * settings.vat_rate)
+    vat = _money(total * settings.vat_rate)
     return Estimate(materials=materials, labor=fot, insurance=insurance,
                     subcontract=subcontract, overhead=overhead, profit=profit,
                     total_wo_vat=total, vat=vat, total_with_vat=total + vat)

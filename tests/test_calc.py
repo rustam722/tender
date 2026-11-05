@@ -1,3 +1,4 @@
+from dataclasses import replace
 from decimal import Decimal
 
 from app.calc import Estimate, LaborLine, estimate
@@ -53,7 +54,7 @@ def test_vat_uses_settings_rate():
     assert e5.vat == Decimal("285000.00")
     assert e5.total_with_vat == Decimal("5985000.00")
 
-    s20 = OrgSettings(**{**DEFAULTS.__dict__, "vat_rate": Decimal("0.20")})
+    s20 = replace(DEFAULTS, vat_rate=Decimal("0.20"))
     e20 = estimate([], net, Decimal("0"), s20)
     assert e20.vat == Decimal("1140000.00")
     assert e20.total_with_vat == Decimal("6840000.00")
@@ -81,15 +82,31 @@ def test_money_is_rounded_to_kopecks():
     assert str(arktik().overhead) == "72360.00"
 
 
+# Сырой ФОТ 2,695 округляется до 2,70. Если считать страховые, накладные и
+# прибыль от сырой суммы, а не от напечатанного ФОТ, каждая статья уйдёт
+# на копейку (0,81 / 0,13 / 0,36 вместо 0,82 / 0,14 / 0,37), а итог -- на три.
+# Выбрана база «напечатанные округлённые статьи»: форма заказчика проверяется
+# вручную по строкам, и каждая строка должна пересчитываться от соседних.
+DIVERGING = [LaborLine("Эколог", 1, Decimal("2.695"), Decimal("1"))]
+
+
+def test_rounding_base_is_printed_articles():
+    e = estimate(DIVERGING, Decimal("0"), Decimal("0"), DEFAULTS)
+    assert e.labor == Decimal("2.70")
+    assert e.insurance == Decimal("0.82")      # 2,70 * 0,302 = 0,8154; от сырого 0,81
+    assert e.overhead == Decimal("0.14")       # 2,70 * 0,05 = 0,135;  от сырого 0,13
+    assert e.profit == Decimal("0.37")         # 3,66 * 0,10 = 0,366;  от сырого 0,36
+    assert e.total_wo_vat == Decimal("4.03")   # от сырого было бы 4,01 или 4,00
+    assert e.vat == Decimal("0.20")            # 4,03 * 0,05 = 0,2015
+    assert e.total_with_vat == Decimal("4.23")
+
+
 def test_total_equals_sum_of_rounded_articles():
-    # дробные ставки: каждая статья округлена отдельно, итог — сумма статей
-    s = OrgSettings(insurance_rate=Decimal("0.302"), injury_rate=Decimal("0"),
-                    overhead_rate=Decimal("0.0333"), profit_rate=Decimal("0.0777"),
-                    vat_rate=Decimal("0.05"))
-    e = estimate([LaborLine("Эколог", 3, Decimal("7.7"), Decimal("123.45"))],
-                 Decimal("10.10"), Decimal("20.20"), s)
-    assert e.total_wo_vat == (e.materials + e.labor + e.insurance
-                              + e.subcontract + e.overhead + e.profit)
+    # итог -- сумма напечатанных статей, а не округление неокруглённой суммы
+    e = estimate(DIVERGING, Decimal("0"), Decimal("0"), DEFAULTS)
+    printed = (e.materials + e.labor + e.insurance
+               + e.subcontract + e.overhead + e.profit)
+    assert e.total_wo_vat == printed == Decimal("4.03")
     assert e.total_with_vat == e.total_wo_vat + e.vat
 
 

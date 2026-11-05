@@ -98,12 +98,14 @@ class Service:
 
 @dataclass
 class OrgSettings:
-    """Проценты калькуляции. Значения по умолчанию задаёт репозиторий."""
-    insurance_rate: Decimal = ZERO
-    injury_rate: Decimal = ZERO
-    overhead_rate: Decimal = ZERO
-    profit_rate: Decimal = ZERO
-    vat_rate: Decimal = ZERO
+    """Проценты калькуляции. Значений по умолчанию нет намеренно: нулевые
+    ставки дали бы правдоподобное КП без взносов, накладных, прибыли и НДС.
+    Умолчания живут в repo.DEFAULT_SETTINGS."""
+    insurance_rate: Decimal
+    injury_rate: Decimal
+    overhead_rate: Decimal
+    profit_rate: Decimal
+    vat_rate: Decimal
 
 
 @dataclass
