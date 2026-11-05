@@ -1,4 +1,4 @@
-"""Контекст шаблонов: один словарь, из которого читают все документы.
+"""Контекст шаблонов: словарь, из которого читает один документ пакета.
 
 Читает данные через Repo и раскладывает их по ключам; документы не пишет.
 Правил, кроме цепочки НДС и форматирования денег, здесь нет.
@@ -24,6 +24,7 @@
     money              функция: Decimal -> «5 985 000,00»
     date_ru, date_long функции: ISO-строка -> «24.10.2025» и «24» октября 2025 г.;
                        пустая строка -> пустая строка
+    warnings           list[str]: что пропущено при сборке (пропавший опыт)
 
 Деньги в клетках таблиц. Раскладки (задача 7) ничего не форматируют, поэтому
 перед build_rows каждое Decimal-поле записи заменяется своим текстом через
@@ -120,17 +121,19 @@ def _vat_rate(tender, participant: Organization | None, settings) -> Decimal:
     return settings.vat_rate
 
 
-def _layouts(profile: CustomerProfile | None) -> dict[str, TableLayout]:
-    """Раскладка на каждый источник. Профиль называет файлы явно (документ ->
-    файл), а какому источнику файл служит, говорит он сам. Первая раскладка
-    источника в профиле побеждает; остальное -- умолчания."""
-    layouts = {}
-    for name in (profile.layouts.values() if profile else ()):
-        layout = load_layout(Path(LAYOUTS_DIR) / name)
-        layouts.setdefault(layout.source, layout)
-    for source, name in _DEFAULT_LAYOUTS.items():
-        if source not in layouts:
-            layouts[source] = load_layout(Path(LAYOUTS_DIR) / name)
+def _layouts(profile: CustomerProfile | None,
+             document: str | None) -> dict[str, TableLayout]:
+    """Раскладка на каждый источник таблиц. Умолчания; поверх них -- раскладка,
+    которую профиль назначает именно этому документу (документ -> файл).
+    Какому справочнику служит файл, говорит он сам (поле source): один контекст
+    собирается под один документ, поэтому двух раскладок на один источник
+    не бывает. Документ без раскладки в профиле остаётся на умолчаниях."""
+    layouts = {source: load_layout(Path(LAYOUTS_DIR) / name)
+               for source, name in _DEFAULT_LAYOUTS.items()}
+    name = profile.layouts.get(document) if profile and document else None
+    if name:
+        chosen = load_layout(Path(LAYOUTS_DIR) / name)
+        layouts[chosen.source] = chosen
     return layouts
 
 
@@ -159,9 +162,15 @@ def _cost_rows(items: list[TenderCostItem]) -> list[dict]:
             for n, i in enumerate(items, start=1)]
 
 
-def build_context(tender_id: int, repo: Repo, *,
+def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
                   experience_ids: list[int] | tuple[int, ...] | None = None) -> dict:
     """Собирает контекст тендера. Неизвестный id -- LookupError по-русски.
+
+    document -- имя документа пакета, под который собирается контекст: таблицы
+    строятся по раскладке, которую профиль заказчика назначает этому документу.
+    Без имени -- по раскладкам по умолчанию. Пакет вызывает сборку на каждый
+    документ: «Справка об оборудовании» и «Справка о МТР» берут один справочник
+    МТР, но с разными колонками.
 
     experience_ids -- записи опыта для справки, в нужном порядке. None --
     взять отбор, сохранённый при тендере (повторная сборка даёт тот же
@@ -190,10 +199,19 @@ def build_context(tender_id: int, repo: Repo, *,
     tender_fields["vat_rate"] = rate
     tender_fields["vat_percent"] = _percent(rate)
 
-    layouts = _layouts(profile)
+    layouts = _layouts(profile, document)
     if experience_ids is None:
         experience_ids = tender.experience_ids
-    selected = [repo.get_experience(i) for i in experience_ids]
+    selected, warnings = [], []
+    for exp_id in experience_ids:
+        try:
+            selected.append(repo.get_experience(exp_id))
+        except LookupError:
+            # Сборку не роняем, но и молча терять опыт нельзя: он влияет
+            # на оценку заявки.
+            warnings.append(
+                f"Запись опыта с id={exp_id} не найдена в справочнике, "
+                "в справку об опыте не попала. Проверьте отбор опыта.")
 
     return {
         "org": org,
@@ -217,4 +235,5 @@ def build_context(tender_id: int, repo: Repo, *,
         "money": money,
         "date_ru": date_ru,
         "date_long": date_long,
+        "warnings": warnings,
     }

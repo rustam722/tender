@@ -24,7 +24,7 @@ DOC_MTR = "Справка о МТР"
 TOP_LEVEL_KEYS = {
     "org", "customer", "tender", "items", "estimate", "labor", "employees",
     "assets", "experience", "declaration_text", "conditions", "today", "money",
-    "materials", "subcontract", "date_ru", "date_long",
+    "materials", "subcontract", "date_ru", "date_long", "warnings",
 }
 
 # КП Арктикгаза: «Эколог-проектировщик, 4 чел.» при одном экологе в штате
@@ -63,7 +63,9 @@ def repo_with_koryazhma(repo):
         role=ROLE_CUSTOMER, inn="2904016130", short_name="МУП «Полигон»"))
     repo.save_customer_profile(CustomerProfile(
         customer_id=customer, documents=[DOC_EQUIPMENT, "Справка об опыте"],
-        layouts={DOC_EQUIPMENT: "assets_koryazhma.json"},
+        # обе справки берут один справочник МТР, но с разными колонками
+        layouts={DOC_EQUIPMENT: "assets_koryazhma.json",
+                 DOC_MTR: "assets_rnpk.json"},
         declaration_text="Декларация Коряжмы"))
     tid = add_tender(
         repo, customer, me, subject="Разработка КЭР",
@@ -126,6 +128,7 @@ def test_sparse_tender_still_has_every_key(repo):
     assert ctx["conditions"] == {} and ctx["declaration_text"] == ""
     assert ctx["estimate"]["labor"] == Decimal("0.00")
     assert ctx["date_ru"]("") == "" and ctx["date_long"]("") == ""
+    assert ctx["warnings"] == []
     for table in ("employees", "assets", "experience"):
         assert ctx[table]["rows"] == []
         assert ctx[table]["headers"]        # шапка есть и без данных
@@ -324,20 +327,48 @@ def test_items_are_ordered_numbered_and_priced_through_money(repo_with_koryazhma
 
 def test_assets_table_follows_customer_profile_layout(repo_with_koryazhma):
     repo = repo_with_koryazhma
-    kor = ctx_of(repo)["assets"]
+    kor = ctx_of(repo, document=DOC_EQUIPMENT)["assets"]
     # Коряжма: без нумерации, наименование и марка в разных колонках
     assert len(kor["headers"]) == 7 and kor["headers"][0] == "Наименование"
     assert kor["rows"][0][0:3] == ["Компьютер", "Intel i3", "3"]
 
-    rnpk_customer = repo.save_organization(Organization(
-        role=ROLE_CUSTOMER, inn="7708000000", short_name="АО «РНПК»"))
-    repo.save_customer_profile(CustomerProfile(
-        customer_id=rnpk_customer, documents=[DOC_MTR],
-        layouts={DOC_MTR: "assets_rnpk.json"}))
-    tid = add_tender(repo, rnpk_customer, None)
-    rnpk = build_context(tid, repo)["assets"]
+    rnpk = ctx_of(repo, document=DOC_MTR)["assets"]
     assert rnpk["headers"][0] == "№ п/п"
     assert rnpk["rows"][0][0:2] == ["1", "Компьютер Intel i3"]
+
+
+def test_two_documents_over_the_same_assets_get_their_own_columns(repo_with_koryazhma):
+    # реальный случай: в пакете обе справки, справочник один, шапки разные;
+    # контекст на весь пакет отдал бы одной из них чужие колонки
+    repo = repo_with_koryazhma
+    kor = ctx_of(repo, document=DOC_EQUIPMENT)["assets"]
+    rnpk = ctx_of(repo, document=DOC_MTR)["assets"]
+    assert kor["headers"] != rnpk["headers"]
+    assert len(repo.list_assets()) == len(kor["rows"]) == len(rnpk["rows"])
+    # порядок вызовов не влияет
+    assert ctx_of(repo, document=DOC_EQUIPMENT)["assets"] == kor
+
+
+def test_without_document_tables_use_default_layouts(repo_with_koryazhma):
+    # в профиле есть раскладка РНПК, но документ не назван: умолчания
+    ctx = ctx_of(repo_with_koryazhma)
+    assert ctx["assets"]["headers"][0] == "Наименование"
+    assert ctx["employees"]["headers"][1] == "Должность"
+    assert ctx["experience"]["headers"][0] == "№ п/п"
+
+
+def test_document_without_layout_in_profile_uses_defaults(repo_with_koryazhma):
+    ctx = ctx_of(repo_with_koryazhma, document="Декларация")
+    assert ctx["assets"]["headers"][0] == "Наименование"
+    assert ctx["declaration_text"] == "Декларация Коряжмы"
+
+
+def test_document_layout_replaces_only_its_own_source(repo_with_koryazhma):
+    repo = repo_with_koryazhma
+    ctx = ctx_of(repo, document=DOC_MTR)          # раскладка источника assets
+    assert ctx["assets"]["headers"][0] == "№ п/п"
+    assert ctx["employees"]["headers"][1] == "Должность"   # остальное -- умолчания
+    assert ctx["experience"]["headers"][0] == "№ п/п"
 
 
 def test_employees_table_uses_layout_headers_and_all_employees(repo_with_koryazhma):
@@ -384,16 +415,27 @@ def test_tender_without_selection_has_empty_experience(repo):
     assert build_context(tid, repo)["experience"]["rows"] == []
 
 
-def test_unknown_experience_id_raises_with_russian_message(repo_with_koryazhma):
+def test_missing_experience_is_skipped_with_a_russian_warning(repo_with_koryazhma):
     repo = repo_with_koryazhma
-    with pytest.raises(LookupError, match="не найден"):
-        ctx_of(repo, experience_ids=[999])
-    # то же для устаревшего отбора, сохранённого при тендере
+    ids = [e.id for e in repo.list_experience()]
     tender = repo.get_tender(repo.tender_id)
-    tender.experience_ids = [999]
+    tender.experience_ids = [ids[0], 999, ids[1]]      # 999 удалена из справочника
     repo.save_tender(tender)
-    with pytest.raises(LookupError, match="не найден"):
-        ctx_of(repo)
+    ctx = ctx_of(repo)
+    assert [r[2] for r in ctx["experience"]["rows"]] == ["1", "2"]   # сборка не упала
+    (warning,) = ctx["warnings"]
+    assert "999" in warning and "не найдена" in warning
+
+
+def test_missing_experience_in_passed_ids_warns_too(repo_with_koryazhma):
+    ctx = ctx_of(repo_with_koryazhma, experience_ids=[998, 999])
+    assert ctx["experience"]["rows"] == []
+    assert len(ctx["warnings"]) == 2
+    assert "998" in ctx["warnings"][0] and "999" in ctx["warnings"][1]
+
+
+def test_no_warnings_when_every_selected_record_exists(repo_with_koryazhma):
+    assert ctx_of(repo_with_koryazhma)["warnings"] == []
 
 
 def test_experience_amount_is_formatted_by_money(repo_with_koryazhma):
@@ -441,19 +483,6 @@ def test_profile_with_empty_layouts_uses_default_layouts(repo):
     assert build_context(tid, repo)["assets"]["headers"][0] == "Наименование"
 
 
-def test_profile_layout_source_is_read_from_the_layout_file(repo):
-    # источник (assets/employees/...) определяет сам файл раскладки, поэтому
-    # документ в профиле может называться как угодно
-    customer = repo.save_organization(Organization(role=ROLE_CUSTOMER))
-    repo.save_customer_profile(CustomerProfile(
-        customer_id=customer,
-        layouts={"Любое название": "assets_rnpk.json",
-                 "Другое название": "assets_koryazhma.json"}))
-    ctx = build_context(add_tender(repo, customer, None), repo)
-    assert ctx["assets"]["headers"][0] == "№ п/п"      # первая в профиле побеждает
-    assert ctx["employees"]["headers"][1] == "Должность"   # остальное -- умолчания
-
-
 def test_new_customer_layout_needs_only_a_layout_file(repo, tmp_path, monkeypatch):
     # обещание проекта: новый заказчик -- описание колонок, без правки кода
     (tmp_path / "assets_novyj.json").write_text(
@@ -470,7 +499,8 @@ def test_new_customer_layout_needs_only_a_layout_file(repo, tmp_path, monkeypatc
         (tmp_path / name).write_text(
             (ctx_module.BASE_DIR / "layouts" / name).read_text(encoding="utf-8"),
             encoding="utf-8")
-    ctx = build_context(add_tender(repo, customer, None), repo)
+    tid = add_tender(repo, customer, None)
+    ctx = build_context(tid, repo, document="Перечень техники")
     assert ctx["assets"] == {"headers": ["Что", "Где"], "rows": [["Принтер", "Пермь"]]}
 
 
