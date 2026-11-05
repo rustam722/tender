@@ -512,7 +512,7 @@ def test_solve_does_not_mutate_input_lines()
 - Тесты: `tests/test_layouts.py`
 
 **Интерфейсы:**
-- Отдаёт: `@dataclass Column(header: str, field: str)`;
+- Отдаёт: `@dataclass Column(header: str, parts: list[str], join: str = " ")`;
   `@dataclass TableLayout(source: str, columns: list[Column], numbered: bool)`
   где `source` — одно из `'employees' | 'assets' | 'experience'`;
   `load_layout(path: Path) -> TableLayout`;
@@ -521,29 +521,81 @@ def test_solve_does_not_mutate_input_lines()
 
 `build_rows` возвращает только строки данных — шапка берётся из `layout.columns`.
 При `numbered=True` первой колонкой подставляется порядковый номер.
-Неизвестное имя поля — `LayoutError` с указанием имени, не `KeyError`.
+Неизвестное имя поля — `LayoutError` с указанием имени и имени колонки, не `KeyError`.
 
-Это и есть то, что пользователь настраивает сам: колонки заказчика описываются
-в JSON, данные берутся из того же справочника. Колонки из описания —
-Коряжма: `Наименование · Изготовитель, марка · Количество · Год выпуска ·
-Мощность · Нынешнее состояние · Источник`; РНПК: `Наименование · Место нахождения ·
-Право собственности · Назначение в отношении предмета закупки ·
-Характеристика, состояние · Примечание`.
+Колонка описывается не одним полем, а списком полей: разбор поданных документов
+показал, что одной клетке формы соответствует несколько полей справочника.
+У Коряжмы колонка «Источник» содержит «Право собственности: Свидетельство
+№ 59-БД 081725 от 31.10.2013 г.» — это `ownership_basis` и `ownership_doc`
+через `": "`. У РНПК колонка «Наименование» содержит «Компьютер Intel Core
+i3 2130» — это `name` и `maker_model` через пробел, тогда как у Коряжмы те же
+данные разнесены по двум колонкам. Пустые части отбрасываются до соединения,
+поэтому отсутствующий документ не оставляет висящего разделителя.
+
+Колонка с `parts: []` рендерится пустой. Это нужно для колонок формы, под
+которые в справочнике нет данных: «Мощность (производительность)» у Коряжмы
+и «Примечание» у РНПК в поданных документах пусты во всех строках.
+
+Фактические поля моделей (проверено по `app/models.py`):
+`Asset` — `name, kind, maker_model, quantity, year, location, ownership_basis,
+ownership_doc, purpose, condition`; `Employee` — `full_name, position,
+education, graduation_year, specialty, qualification, experience_years,
+hourly_rate`; `ExperienceRecord` — `customer_name, contract_number,
+contract_date, subject, amount, term, status, service_id, contract_scan,
+act_scan`.
+
+Раскладки, которые нужно описать:
+
+| Файл | Колонки |
+|---|---|
+| `assets_koryazhma.json` | Наименование `[name]` · Изготовитель, марка `[maker_model]` · Количество `[quantity]` · Год выпуска `[year]` · Мощность `[]` · Нынешнее состояние `[location]` · Источник `[ownership_basis, ownership_doc]` через `": "` |
+| `assets_rnpk.json` | № п/п (нумерация) · Наименование `[name, maker_model]` · Место нахождения `[location]` · Право собственности `[ownership_basis, ownership_doc]` через `": "` · Назначение `[purpose]` · Характеристика, состояние `[condition]` · Примечание `[]` |
+| `employees_koryazhma.json` | № п/п (нумерация) · Должность `[position]` · ФИО `[full_name]` · Образование, квалификация `[education, qualification]` через `", "` · Стаж, лет `[experience_years]` |
+
+Колонка образования берёт `education` целиком, а не собирает фразу из
+`graduation_year` и `specialty`: в поданной справке стоит «Окончила Томский
+политехнический институт в 1974 г., Химик-технолог» — живая фраза, которую
+человек пишет сам. Сборка такой фразы из частей была бы форматированием,
+а оно в этой задаче запрещено. `graduation_year` и `specialty` остаются
+структурированными полями для форм, которые просят их отдельно.
 
 - [ ] **Шаг 1: Написать падающие тесты**
 
 ```python
-def test_same_assets_render_under_both_layouts():
-    assets = [make_asset(name="Компьютер", maker_model="Intel Core i3 2130", qty=3)]
-    kor = build_rows(load_layout("layouts/assets_koryazhma.json"), assets)
-    rnpk = build_rows(load_layout("layouts/assets_rnpk.json"), assets)
-    assert len(kor[0]) == 7 and len(rnpk[0]) == 6   # разные колонки
-    assert "Intel Core i3 2130" in " ".join(kor[0])
-    assert "Intel Core i3 2130" in " ".join(rnpk[0])
+ASSET = make_asset(name="Компьютер", maker_model="Intel Core i3 2130",
+                   quantity=3, location="г.Пермь, Куйбышева, 57а",
+                   ownership_basis="Право собственности",
+                   ownership_doc="Свидетельство № 59-БД 081725 от 31.10.2013 г.")
 
-def test_numbered_layout_adds_sequence()
-def test_unknown_field_raises_layout_error()
-def test_missing_value_renders_empty_string_not_none()
+def test_same_asset_renders_differently_under_both_layouts():
+    kor  = build_rows(load_layout("layouts/assets_koryazhma.json"), [ASSET])[0]
+    rnpk = build_rows(load_layout("layouts/assets_rnpk.json"), [ASSET])[0]
+    assert len(kor) == 7 and len(rnpk) == 7      # у РНПК первая — нумерация
+    # у Коряжмы наименование и марка разнесены, у РНПК — в одной клетке
+    assert kor[0] == "Компьютер" and kor[1] == "Intel Core i3 2130"
+    assert rnpk[1] == "Компьютер Intel Core i3 2130"
+
+def test_parts_are_joined_with_the_declared_separator():
+    kor = build_rows(load_layout("layouts/assets_koryazhma.json"), [ASSET])[0]
+    assert kor[6] == ("Право собственности: "
+                      "Свидетельство № 59-БД 081725 от 31.10.2013 г.")
+
+def test_empty_part_leaves_no_dangling_separator():
+    a = replace(ASSET, ownership_doc="")
+    kor = build_rows(load_layout("layouts/assets_koryazhma.json"), [a])[0]
+    assert kor[6] == "Право собственности"       # без ": " на конце
+
+def test_column_without_parts_renders_empty():
+    kor = build_rows(load_layout("layouts/assets_koryazhma.json"), [ASSET])[0]
+    assert kor[4] == ""                          # «Мощность» — нет данных
+
+def test_numbered_layout_adds_sequence():
+    rows = build_rows(load_layout("layouts/assets_rnpk.json"), [ASSET, ASSET])
+    assert rows[0][0] == "1" and rows[1][0] == "2"
+
+def test_unknown_field_raises_layout_error_naming_field_and_column()
+def test_none_renders_as_empty_string_not_the_word_none()
+def test_headers_come_from_the_layout_not_from_the_rows()
 def test_employees_layout_has_five_columns()
 ```
 
