@@ -27,7 +27,12 @@
 - Все данные локально. Сеть — только `egrul.nalog.ru` и `www.rusprofile.ru`.
 - Деньги и часы — только `decimal.Decimal`, никогда `float`.
 - Проценты по умолчанию: страховые 30 %, травматизм 0,2 %, накладные 5 % от ФОТ,
-  прибыль 10 % от (ФОТ + страховые + субподряд + накладные), НДС 20 %.
+  прибыль 10 % от (ФОТ + страховые + субподряд + накладные).
+- **НДС по умолчанию 5 %** — ставка УСН, действующая для «Техносферы» как
+  микропредприятия. В поданном КП Коряжмы НДС составил 285 000,00 на 5 700 000,00
+  без НДС, что даёт ровно 5 %. Ставка переопределяется в карточке тендера:
+  форма ТКП Роснефти прямо требует «указать размер ставки НДС или причину
+  освобождения от уплаты НДС».
 - Форма заказчика заполняется в его собственной книге: формулы, защита листа
   и оформление сохраняются. Своя копия не строится.
 - Подпись и печать картинкой не вставляются. На выходе пустые подписные блоки.
@@ -172,7 +177,7 @@ def test_settings_have_defaults_on_empty_db(repo):
     assert s.injury_rate    == Decimal("0.002")
     assert s.overhead_rate  == Decimal("0.05")
     assert s.profit_rate    == Decimal("0.10")
-    assert s.vat_rate       == Decimal("0.20")
+    assert s.vat_rate       == Decimal("0.05")
 ```
 
 - [ ] **Шаг 2: Запустить, убедиться что падает**
@@ -351,7 +356,11 @@ def test_arktikgaz_labor_matches_submitted():
 
 def test_profit_is_ten_percent_of_base()
 def test_total_sums_all_articles()
-def test_vat_twenty_percent_of_total()
+
+def test_vat_uses_settings_rate():
+    # при vat_rate = 0.05 и итоге 5 700 000,00 без НДС
+    # vat == 285 000,00 и total_with_vat == 5 985 000,00 — как в КП Коряжмы
+    # при vat_rate = 0.20 на тех же данных vat == 1 140 000,00
 def test_empty_labor_gives_zero_fot_but_keeps_materials()
 def test_money_is_rounded_to_kopecks()             # ни одного float в Estimate
 ```
