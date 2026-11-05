@@ -613,30 +613,92 @@ def test_employees_layout_has_five_columns()
 
 **Файлы:**
 - Создать: `app/render/context.py`
-- Тесты: `tests/test_context.py`
+- Изменить: `app/models.py` (добавить `TenderLaborRow`), `app/db.py` (миграция 2),
+  `app/repo.py` (методы новой таблицы)
+- Тесты: `tests/test_context.py`, дополнить `tests/test_repo.py`
 
 **Интерфейсы:**
-- Использует: `Repo` (задача 2), `estimate` (задача 5),
+- Использует: `Repo` (задача 2), `estimate` и `LaborLine` (задача 5),
   `load_layout` / `build_rows` (задача 7).
-- Отдаёт: `build_context(tender_id: int, repo: Repo) -> dict`.
+- Отдаёт: `build_context(tender_id: int, repo: Repo) -> dict`;
+  `@dataclass TenderLaborRow(tender_id, position: int, post: str,
+  headcount: int, hours: Decimal, rate: Decimal, id)`;
+  `Repo.list_tender_labor(tender_id) -> list[TenderLaborRow]`,
+  `Repo.save_tender_labor(row) -> int`, `Repo.delete_tender_labor(id) -> None`.
 
-Ключи контекста — тот словарь, на который опираются все шаблоны:
-`org` и `customer` (словари полей организации), `tender`, `items` (позиции лота),
-`estimate`, `labor` (строки ФОТ), `employees` и `assets` и `experience`
-(`{"headers": [...], "rows": [[...]]}` под раскладку профиля заказчика),
-`declaration_text`, `conditions` (ответы «подтверждаю / не подтверждаю»),
-`today` и `money` — функция форматирования `Decimal` в `5 985 000,00`.
+### Недостающий кусок: строки ФОТ тендера
+
+В схеме задачи 1 нет ни таблицы, ни связи, которая держала бы трудозатраты
+тендера: `service_id` есть только у записи опыта, для отбора. Значит
+`build_context` не может построить `Estimate` — калькулятору нужны строки
+`LaborLine`, а взять их негде. Добавляется таблица `tender_labor`
+(`tender_id` с `ON DELETE CASCADE`, `position` для порядка, `post`,
+`headcount`, `hours`, `rate`) миграцией 2; `hours` и `rate` объявляются
+`DECIMAL TEXT`, как все денежные колонки.
+
+Почему строки хранятся, а не выводятся из норм каталога: в КП Арктикгаза
+стоит «Эколог-проектировщик, 4 чел.», тогда как в фирме один эколог-проектировщик.
+Численность в КП — плановая величина, которую подбирают под конкретный тендер,
+а не состав штата. Нормы каталога служат заготовкой: задача 13 заполняет ими
+строки при создании тендера, дальше пользователь правит. Обратный счёт задачи 6
+детерминирован, поэтому часы можно не хранить отдельно — при том же целевом
+итоге, тех же нормах и ставках он даст те же часы.
+
+### Ставка НДС: цепочка подстановки
+
+`Tender.vat_rate` → `Organization.vat_rate` участника → `OrgSettings.vat_rate`.
+Первое ненулевое значение в этой цепочке и есть ставка тендера. `None` означает
+«брать из следующего звена», что и записано в комментариях модели задачи 1.
+Форма ТКП Роснефти требует указывать ставку или причину освобождения, поэтому
+переопределение на уровне тендера обязательно работает.
+
+### Ключи контекста
+
+Тот словарь, на который опираются все шаблоны: `org` и `customer` (словари полей
+организации), `tender`, `items` (позиции лота), `estimate`, `labor` (строки ФОТ),
+`employees`, `assets` и `experience` (`{"headers": [...], "rows": [[...]]}` под
+раскладку профиля заказчика), `declaration_text`, `conditions` (ответы
+«подтверждаю / не подтверждаю»), `today` и `money`.
+
+`money` форматирует `Decimal` в `5 985 000,00`: запятая как десятичный
+разделитель, разряды через **неразрывный пробел** `U+00A0`. Неразрывный — чтобы
+Word не разорвал число переносом строки посередине. Денежные значения в таблицах
+(`experience` — сумма контракта, `items` — цена позиции) проходят через `money`,
+потому что задача 7 форматирование запрещает и отдаёт в клетке сырое
+`str(Decimal)` вида `5700000.00`.
 
 - [ ] **Шаг 1: Написать падающие тесты**
 
 ```python
+NBSP = " "
+
 def test_context_has_all_documented_keys(repo_with_koryazhma)
+
 def test_money_formats_russian():
-    assert ctx["money"](Decimal("5985000")) == "5 985 000,00"
+    assert ctx["money"](Decimal("5985000")) == f"5{NBSP}985{NBSP}000,00"
+    assert ctx["money"](Decimal("285000.00")) == f"285{NBSP}000,00"
+    assert ctx["money"](Decimal("0")) == "0,00"
+
+def test_money_uses_non_breaking_space_not_plain_space():
+    assert " " not in ctx["money"](Decimal("5985000"))
+
+def test_tender_labor_round_trips(repo)          # в tests/test_repo.py
+def test_tender_labor_cascades_with_tender(repo) # в tests/test_repo.py
+def test_tender_labor_keeps_position_order(repo) # в tests/test_repo.py
+
+def test_estimate_is_built_from_stored_labor_rows():
+    # строки tender_labor Арктикгаза дают ФОТ 1 447 200,00
+
+def test_vat_rate_falls_back_tender_then_org_then_settings():
+    # 0.07 у тендера побеждает; при None у тендера берётся 0.06 организации;
+    # при None у обоих — 0.05 из настроек
+
 def test_assets_table_follows_customer_profile_layout()
 def test_declaration_text_comes_from_customer_profile()
 def test_experience_includes_only_selected_records()
+def test_experience_amount_is_formatted_by_money()
 def test_missing_customer_profile_falls_back_to_default_layouts()
+def test_unknown_tender_id_raises_with_russian_message()
 ```
 
 - [ ] **Шаг 2: Запустить, убедиться что падает**
