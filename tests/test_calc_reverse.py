@@ -9,9 +9,12 @@ from tests.test_calc import ARKTIK, DEFAULTS
 MATERIALS = Decimal("41686")
 SUBCONTRACT = Decimal("1620000")
 TARGET = Decimal("4000000")
-# Множитель надбавок на ФОТ: 1 + страховые 30 % + травматизм 0,2 % + накладные 5 %,
-# затем прибыль 10 % -- 1,352 * 1,10 в формулировке задачи.
-MARKUP = Decimal("1.352") * Decimal("1.10")
+# Надбавки выводим из настроек, а не числами: ставки меняются по требованию
+# заказчика, и инвариант обязан идти за ними вместе с estimate.
+LABOR_MARKUP = (1 + DEFAULTS.insurance_rate + DEFAULTS.injury_rate
+                + DEFAULTS.overhead_rate)       # ФОТ -> статьи до прибыли
+PROFIT_MARKUP = 1 + DEFAULTS.profit_rate
+MARKUP = LABOR_MARKUP * PROFIT_MARKUP           # рубль ФОТ -> рубли итога
 
 
 def solve(target=TARGET, labor=ARKTIK, materials=MATERIALS, subcontract=SUBCONTRACT):
@@ -23,15 +26,22 @@ def total_of(lines, materials=MATERIALS, subcontract=SUBCONTRACT):
 
 
 def one_hour_step(labor):
-    """Стоимость одного часа самой дешёвой строки с наценками: шаг сетки итогов."""
-    return min(x.headcount * x.rate for x in labor) * MARKUP
+    """Стоимость одного часа самой дешёвой строки с наценками: шаг сетки итогов.
+
+    Граница расхождения относится к строкам, которые солвер может двигать:
+    с ненулевыми часами и ненулевой стоимостью часа (численность * ставка).
+    Строка с нулевыми часами пропускается солвером, строка с нулевой ставкой
+    или численностью не меняет итог -- шаг по ним не определён."""
+    costs = [x.headcount * x.rate for x in labor
+             if x.hours > 0 and x.headcount * x.rate > 0]
+    return min(costs) * MARKUP
 
 
-def exact_multiplier(target=TARGET, labor=ARKTIK):
+def exact_multiplier(target=TARGET, labor=ARKTIK, materials=MATERIALS,
+                     subcontract=SUBCONTRACT):
     """Замкнутая форма из задачи, посчитанная независимо от реализации."""
     fot0 = sum(x.headcount * x.hours * x.rate for x in labor)
-    a = fot0 * Decimal("1.352")
-    return ((target - MATERIALS) / Decimal("1.10") - SUBCONTRACT) / a
+    return ((target - materials) / PROFIT_MARKUP - subcontract) / (fot0 * LABOR_MARKUP)
 
 
 def test_solved_hours_reproduce_target():
@@ -84,7 +94,7 @@ def test_target_below_fixed_costs_raises():
 
 def test_target_exactly_at_fixed_costs_raises():
     # материалы + субподряд с прибылью: на работу не остаётся ни копейки
-    at_fixed = MATERIALS + SUBCONTRACT * Decimal("1.10")
+    at_fixed = MATERIALS + SUBCONTRACT * PROFIT_MARKUP
     with pytest.raises(TargetTooLow):
         solve(at_fixed)
 
@@ -132,7 +142,7 @@ def test_far_above_target_terminates_within_bound():
 
 
 def test_just_above_fixed_costs_terminates_within_bound():
-    just_above = MATERIALS + SUBCONTRACT * Decimal("1.10") + Decimal("1")
+    just_above = MATERIALS + SUBCONTRACT * PROFIT_MARKUP + Decimal("1")
     solved = solve(just_above)
     assert all(x.hours >= 0 for x in solved)
     # на час работы денег не хватает: часы остаются крошечными, а не уходят в минус
@@ -167,8 +177,21 @@ def test_three_unequal_lines_stay_in_bound_and_in_proportion():
     solved = solve(target, lines, Decimal("5000"), Decimal("100000"))
     got = total_of(solved, Decimal("5000"), Decimal("100000"))
     assert abs(got - target) <= one_hour_step(lines)
-    fot0 = sum(x.headcount * x.hours * x.rate for x in lines)
-    k = ((target - Decimal("5000")) / Decimal("1.10") - Decimal("100000")) \
-        / (fot0 * Decimal("1.352"))
+    k = exact_multiplier(target, lines, Decimal("5000"), Decimal("100000"))
     for original, new in zip(lines, solved):
         assert abs(new.hours - k * original.hours) <= 2
+
+
+def test_bound_covers_only_lines_the_solver_can_move():
+    # Мёртвые строки (нулевые часы, нулевая ставка, нулевая численность) шаг не
+    # задают: граница считается по живым строкам, и солвер её выдерживает.
+    lines = [LaborLine("Эколог", 4, Decimal("1200"), Decimal("270")),
+             LaborLine("Начальник", 1, Decimal("360"), Decimal("420")),
+             LaborLine("Без часов", 1, Decimal("0"), Decimal("50")),
+             LaborLine("Без ставки", 2, Decimal("100"), Decimal("0")),
+             LaborLine("Без людей", 0, Decimal("100"), Decimal("500"))]
+    assert one_hour_step(lines) == one_hour_step(ARKTIK)
+    solved = solve(labor=lines)
+    assert solved[2].hours == 0          # строку без часов солвер не трогает
+    got = total_of(solved)
+    assert abs(got - TARGET) <= one_hour_step(lines)

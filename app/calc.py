@@ -94,7 +94,7 @@ def solve_hours(target_wo_vat: Decimal, labor: list[LaborLine], materials: Decim
         fixed = materials + subcontract * (1 + settings.profit_rate)
         raise TargetTooLow(
             f"Цена {_rub(target_wo_vat)} руб. без НДС не больше неизбежных расходов "
-            f"(материалы и субподряд с прибылью -- {_rub(fixed)} руб.): на работу "
+            f"(материалы и субподряд с прибылью — {_rub(fixed)} руб.): на работу "
             "ничего не остаётся. Увеличьте цену или уменьшите материалы и субподряд.")
 
     hours = [(k * x.hours).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
