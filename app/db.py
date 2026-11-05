@@ -199,6 +199,33 @@ _MIGRATIONS = [
     PRAGMA user_version = 4;  -- номер этой миграции: при копировании сменить
     COMMIT;
     """,
+    # 5: описание документа у заказчика -- один JSON-объект на документ вместо
+    # двух словарей с одними ключами (layouts, file_prefixes). Данные переносятся:
+    # ключ документа берётся из обоих старых словарей, недостающее поле пусто;
+    # шаблон и карта ячеек у перенесённого описания тоже пусты (умолчания).
+    # Всё в одной транзакции вместе с номером версии, как миграции 3 и 4.
+    # DROP COLUMN требует SQLite 3.35+.
+    """
+    BEGIN;
+    ALTER TABLE customer_profile
+        ADD COLUMN docs TEXT NOT NULL DEFAULT '{}';  -- JSON: документ -> описание
+    UPDATE customer_profile SET docs = COALESCE((
+        SELECT json_group_object(k.name, json_object(
+                   'template', '',
+                   'cellmap', '',
+                   'layout', COALESCE(l.value, ''),
+                   'prefix', COALESCE(p.value, '')))
+        FROM (SELECT key AS name FROM json_each(customer_profile.layouts)
+              UNION
+              SELECT key FROM json_each(customer_profile.file_prefixes)) AS k
+        LEFT JOIN json_each(customer_profile.layouts) AS l ON l.key = k.name
+        LEFT JOIN json_each(customer_profile.file_prefixes) AS p ON p.key = k.name
+    ), '{}');
+    ALTER TABLE customer_profile DROP COLUMN layouts;
+    ALTER TABLE customer_profile DROP COLUMN file_prefixes;
+    PRAGMA user_version = 5;  -- номер этой миграции: при копировании сменить
+    COMMIT;
+    """,
 ]
 
 SCHEMA_VERSION = len(_MIGRATIONS)

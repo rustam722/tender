@@ -28,6 +28,15 @@ def test_migrate_is_idempotent(conn):
     assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
 
 
+def test_fresh_database_has_docs_and_no_old_profile_columns(conn):
+    # описание документа -- одна колонка docs; layouts и file_prefixes сняты
+    db.migrate(conn)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(customer_profile)")}
+    assert "docs" in cols
+    assert not {"layouts", "file_prefixes"} & cols
+    assert db.SCHEMA_VERSION == 5
+
+
 def test_foreign_keys_are_enforced(conn):
     db.migrate(conn)
     with pytest.raises(sqlite3.IntegrityError):

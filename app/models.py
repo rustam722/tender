@@ -113,13 +113,43 @@ class OrgSettings:
     total_rounding_digits: int = 0
 
 
+@dataclass(frozen=True)
+class DocSpec:
+    """Как у конкретного заказчика оформляется один документ пакета.
+
+    Любое поле может быть пустым:
+      template -- файл шаблона в templates_docs/; пусто -- `<имя документа>.docx`;
+      cellmap  -- файл карты ячеек в cellmaps/; нужен книге .xlsx, Word-шаблону
+                  не нужен;
+      layout   -- файл раскладки таблицы в layouts/; пусто -- раскладка
+                  по умолчанию для справочника документа;
+      prefix   -- префикс имени файла; пусто -- имя без префикса.
+
+    Неизменяем: проверка выполняется при создании, и присвоением поля её
+    нельзя обойти."""
+    template: str = ""
+    cellmap: str = ""
+    layout: str = ""
+    prefix: str = ""
+
+    def __post_init__(self):
+        # Книгу заполняют по карте ячеек: без неё заполнять нечем.
+        if self.template.lower().endswith(".xlsx") and not self.cellmap.strip():
+            raise ValueError(
+                f"Для шаблона «{self.template}» не указана карта ячеек: "
+                "без неё книгу Excel заполнить нечем. Укажите файл карты "
+                "в описании документа.")
+
+
 @dataclass
 class CustomerProfile:
-    """Состав пакета и правила оформления у конкретного заказчика."""
+    """Состав пакета и правила оформления у конкретного заказчика.
+
+    docs -- по одному описанию на документ; ключ -- каноническое имя документа,
+    то же, что в documents. Документа нет в docs -- для него всё по умолчанию."""
     customer_id: int | None = None    # organization.id заказчика
     documents: list[str] = field(default_factory=list)            # состав пакета
-    file_prefixes: dict[str, str] = field(default_factory=dict)   # документ -> префикс
-    layouts: dict[str, str] = field(default_factory=dict)         # документ -> файл раскладки
+    docs: dict[str, DocSpec] = field(default_factory=dict)        # документ -> описание
     declaration_text: str = ""
     id: int | None = None
 

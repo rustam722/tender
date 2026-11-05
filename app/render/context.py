@@ -61,7 +61,7 @@ from app.calc import LaborLine, estimate
 from app.config import BASE_DIR
 from app.models import (
     COST_MATERIALS, COST_SUBCONTRACT, ROLE_CUSTOMER, ROLE_PARTICIPANT,
-    CustomerProfile, LotItem, Organization, TenderCostItem, TenderLaborRow,
+    CustomerProfile, DocSpec, LotItem, Organization, TenderCostItem, TenderLaborRow,
 )
 from app.render.layouts import TableLayout, build_rows, load_layout
 from app.repo import Repo
@@ -78,7 +78,7 @@ def _round(value: Decimal) -> Decimal:
     return value.quantize(_KOPECK, rounding=ROUND_HALF_UP)
 
 # Документы, несущие табличную справку, -- имена из списка документов
-# раздела 8 описания; они же ключи CustomerProfile.documents и .layouts.
+# раздела 8 описания; они же ключи CustomerProfile.documents и .docs.
 # Только для них отсутствие раскладки в профиле -- повод предупредить: у
 # декларации или письма о крупности сделки таблицы нет, и предупреждение
 # о них было бы шумом, который приучает пролистывать настоящие.
@@ -160,16 +160,23 @@ def _vat_rate(tender, participant: Organization | None, settings) -> Decimal:
     return settings.vat_rate
 
 
+def _doc_spec(profile: CustomerProfile | None,
+              document: str | None) -> DocSpec | None:
+    """Описание документа в профиле; None, если профиля, имени или записи нет."""
+    return profile.docs.get(document) if profile and document else None
+
+
 def _layouts(profile: CustomerProfile | None,
              document: str | None) -> dict[str, TableLayout]:
     """Раскладка на каждый источник таблиц. Умолчания; поверх них -- раскладка,
-    которую профиль назначает именно этому документу (документ -> файл).
+    которую профиль назначает именно этому документу (docs[документ].layout).
     Какому справочнику служит файл, говорит он сам (поле source): один контекст
     собирается под один документ, поэтому двух раскладок на один источник
     не бывает. Документ без раскладки в профиле остаётся на умолчаниях."""
     layouts = {source: load_layout(Path(LAYOUTS_DIR) / name)
                for source, name in _DEFAULT_LAYOUTS.items()}
-    name = profile.layouts.get(document) if profile and document else None
+    spec = _doc_spec(profile, document)
+    name = spec.layout if spec else ""
     if name:
         chosen = load_layout(Path(LAYOUTS_DIR) / name)
         layouts[chosen.source] = chosen
@@ -272,10 +279,11 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
     tender_fields["vat_percent"] = _percent(rate)
 
     layouts = _layouts(profile, document)
+    spec = _doc_spec(profile, document)
     warnings = []
     if (profile and document in TABLE_DOCUMENTS
             and document in profile.documents
-            and document not in profile.layouts):
+            and not (spec and spec.layout)):
         warnings.append(
             f"Для документа «{document}» в профиле заказчика не назначена "
             "раскладка таблиц: колонки взяты по умолчанию. Если у заказчика "

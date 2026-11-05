@@ -7,11 +7,12 @@
 """
 import json
 import sqlite3
-from dataclasses import dataclass, fields, replace
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field, fields, is_dataclass, replace
 from decimal import Decimal
 
 from app.models import (
-    Asset, CustomerProfile, Employee, ExperienceRecord, LotItem, Organization,
+    Asset, CustomerProfile, DocSpec, Employee, ExperienceRecord, LotItem, Organization,
     OrgSettings, Service, Tender, TenderCostItem, TenderLaborRow,
 )
 
@@ -29,6 +30,13 @@ DEFAULT_SETTINGS = OrgSettings(
 _SETTINGS_ID = 1  # в org_settings ровно одна строка
 
 
+def _dataclass_to_json(obj):
+    """json.dumps(default=...): датакласс внутри JSON-поля -- объект с полями."""
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return asdict(obj)
+    raise TypeError(f"Нельзя сохранить в JSON: {type(obj).__name__}")
+
+
 @dataclass(frozen=True)
 class _Entity:
     """Как датакласс ложится в таблицу."""
@@ -36,6 +44,9 @@ class _Entity:
     cls: type
     label: str                       # для сообщения об отсутствующей записи
     json_fields: tuple[str, ...] = ()  # колонки с JSON
+    # JSON-колонка -> как собрать значение поля из разобранного JSON; для полей,
+    # где внутри лежат не голые строки и числа, а датаклассы
+    decoders: dict[str, Callable] = field(default_factory=dict)
     extra_fields: tuple[str, ...] = ()  # поля без колонки (хранятся отдельно)
 
     @property
@@ -50,7 +61,9 @@ _ASSET = _Entity("asset", Asset, "Ресурс")
 _EXPERIENCE = _Entity("experience", ExperienceRecord, "Опыт")
 _SERVICE = _Entity("service", Service, "Услуга", extra_fields=("norms",))
 _PROFILE = _Entity("customer_profile", CustomerProfile, "Профиль заказчика",
-                   json_fields=("documents", "file_prefixes", "layouts"))
+                   json_fields=("documents", "docs"),
+                   decoders={"docs": lambda raw: {
+                       name: DocSpec(**spec) for name, spec in raw.items()}})
 _TENDER = _Entity("tender", Tender, "Тендер",
                   json_fields=("deal_answers", "experience_ids"))
 _LOT_ITEM = _Entity("lot_item", LotItem, "Позиция лота")
@@ -73,7 +86,8 @@ class Repo:
         for name in cols:
             value = getattr(obj, name)
             if name in ent.json_fields:
-                value = json.dumps(value, ensure_ascii=False)
+                value = json.dumps(value, ensure_ascii=False,
+                                   default=_dataclass_to_json)
             values.append(value)
         names = ", ".join(["id"] + cols)
         marks = ", ".join("?" * (len(cols) + 1))
@@ -94,6 +108,8 @@ class Repo:
             value = row[name]
             if name in ent.json_fields:
                 value = json.loads(value)
+                if name in ent.decoders:
+                    value = ent.decoders[name](value)
             kwargs[name] = value
         return ent.cls(id=row["id"], **kwargs)
 

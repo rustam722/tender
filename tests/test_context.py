@@ -6,7 +6,7 @@ import pytest
 from app import db
 from app.calc import LaborLine, estimate
 from app.models import (
-    ROLE_CUSTOMER, ROLE_PARTICIPANT, Asset, CustomerProfile, Employee,
+    ROLE_CUSTOMER, ROLE_PARTICIPANT, Asset, CustomerProfile, DocSpec, Employee,
     ExperienceRecord, LotItem, Organization, OrgSettings, Tender, TenderCostItem,
     TenderLaborRow,
 )
@@ -17,7 +17,7 @@ from app.repo import Repo
 
 NBSP = " "
 
-# Документы профиля; файл раскладки профиль назначает им явно (CustomerProfile.layouts).
+# Документы профиля; файл раскладки профиль назначает им явно (CustomerProfile.docs[...].layout).
 DOC_EQUIPMENT = "Справка о наличии оборудования"
 DOC_MTR = "Справка о МТР"
 
@@ -64,8 +64,8 @@ def repo_with_koryazhma(repo):
     repo.save_customer_profile(CustomerProfile(
         customer_id=customer, documents=[DOC_EQUIPMENT, "Справка об опыте"],
         # обе справки берут один справочник МТР, но с разными колонками
-        layouts={DOC_EQUIPMENT: "assets_koryazhma.json",
-                 DOC_MTR: "assets_rnpk.json"},
+        docs={DOC_EQUIPMENT: DocSpec(layout="assets_koryazhma.json"),
+              DOC_MTR: DocSpec(layout="assets_rnpk.json")},
         declaration_text="Декларация Коряжмы"))
     tid = add_tender(
         repo, customer, me, subject="Разработка КЭР",
@@ -441,7 +441,7 @@ def test_document_listed_without_a_layout_warns_about_default_columns(repo):
     customer = repo.save_organization(Organization(role=ROLE_CUSTOMER))
     repo.save_customer_profile(CustomerProfile(
         customer_id=customer, documents=[DOC_EQUIPMENT, DOC_MTR],
-        layouts={DOC_MTR: "assets_rnpk.json"}))
+        docs={DOC_MTR: DocSpec(layout="assets_rnpk.json")}))
     tid = add_tender(repo, customer, None)
     ctx = build_context(tid, repo, document=DOC_EQUIPMENT)
     assert ctx["assets"]["headers"][0] == "Наименование"      # умолчания остаются
@@ -596,6 +596,56 @@ def test_profile_with_empty_layouts_uses_default_layouts(repo):
     assert build_context(tid, repo)["assets"]["headers"][0] == "Наименование"
 
 
+def test_context_takes_layout_from_docs(repo):
+    customer = repo.save_organization(Organization(role=ROLE_CUSTOMER))
+    repo.save_customer_profile(CustomerProfile(
+        customer_id=customer, documents=[DOC_EQUIPMENT, DOC_MTR],
+        docs={DOC_EQUIPMENT: DocSpec(layout="assets_koryazhma.json", prefix="04"),
+              # шаблон, карта и префикс на раскладку не влияют, и наоборот
+              DOC_MTR: DocSpec(template="mtr.docx", layout="assets_rnpk.json",
+                               prefix="05")}))
+    repo.save_asset(Asset(name="Компьютер", maker_model="Intel i3", quantity=3))
+    tid = add_tender(repo, customer, None)
+    kor = build_context(tid, repo, document=DOC_EQUIPMENT)
+    rnpk = build_context(tid, repo, document=DOC_MTR)
+    assert kor["assets"]["headers"][0] == "Наименование"       # без нумерации
+    assert rnpk["assets"]["headers"][0] == "№ п/п"             # файл из docs
+    assert rnpk["assets"]["rows"][0][0:2] == ["1", "Компьютер Intel i3"]
+    assert kor["warnings"] == rnpk["warnings"] == []
+
+
+def test_missing_document_in_docs_falls_back_to_defaults(repo):
+    customer = repo.save_organization(Organization(role=ROLE_CUSTOMER))
+    repo.save_customer_profile(CustomerProfile(
+        customer_id=customer, documents=[DOC_EQUIPMENT, DOC_MTR],
+        docs={DOC_MTR: DocSpec(layout="assets_rnpk.json")}))
+    repo.save_asset(Asset(name="Принтер"))
+    tid = add_tender(repo, customer, None)
+    # документа нет в docs вовсе: умолчания (и предупреждение, это справка с таблицей)
+    ctx = build_context(tid, repo, document=DOC_EQUIPMENT)
+    assert ctx["assets"]["headers"][0] == "Наименование"
+    (warning,) = ctx["warnings"]
+    assert DOC_EQUIPMENT in warning
+    # документ без таблицы и документ, которого нет в профиле, -- тоже умолчания
+    for other in ("Декларация соответствия", "Нет такого документа"):
+        got = build_context(tid, repo, document=other)
+        assert got["assets"]["headers"][0] == "Наименование"
+        assert got["warnings"] == []
+
+
+def test_document_with_empty_layout_in_docs_is_the_same_as_absent(repo):
+    # пустая раскладка -- «по умолчанию»; остальные поля описания её не назначают
+    customer = repo.save_organization(Organization(role=ROLE_CUSTOMER))
+    repo.save_customer_profile(CustomerProfile(
+        customer_id=customer, documents=[DOC_EQUIPMENT],
+        docs={DOC_EQUIPMENT: DocSpec(prefix="04")}))
+    tid = add_tender(repo, customer, None)
+    ctx = build_context(tid, repo, document=DOC_EQUIPMENT)
+    assert ctx["assets"]["headers"][0] == "Наименование"
+    (warning,) = ctx["warnings"]
+    assert DOC_EQUIPMENT in warning and "по умолчанию" in warning
+
+
 def test_new_customer_layout_needs_only_a_layout_file(repo, tmp_path, monkeypatch):
     # обещание проекта: новый заказчик -- описание колонок, без правки кода
     (tmp_path / "assets_novyj.json").write_text(
@@ -605,7 +655,8 @@ def test_new_customer_layout_needs_only_a_layout_file(repo, tmp_path, monkeypatc
     monkeypatch.setattr(ctx_module, "LAYOUTS_DIR", tmp_path)
     customer = repo.save_organization(Organization(role=ROLE_CUSTOMER))
     repo.save_customer_profile(CustomerProfile(
-        customer_id=customer, layouts={"Перечень техники": "assets_novyj.json"}))
+        customer_id=customer,
+        docs={"Перечень техники": DocSpec(layout="assets_novyj.json")}))
     repo.save_asset(Asset(name="Принтер", location="Пермь"))
     # остальные источники берут умолчания из той же папки: кладём и их
     for name in ctx_module._DEFAULT_LAYOUTS.values():
