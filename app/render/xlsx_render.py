@@ -272,8 +272,10 @@ def fill_workbook(template: Path, cell_map: CellMap, context: dict,
             cell.value = value
             if isinstance(value, str) and cell.data_type == "f":
                 cell.data_type = "s"                  # «=1+1» -- текст, не формула
-        # openpyxl не хранит результаты формул; пусть Excel пересчитает книгу
-        # при открытии, а не покажет пустые итоги
+        # openpyxl не хранит результаты формул (старый кэш -- «0» в E9 -- не
+        # переживает сохранение), и Excel должен пересчитать итоги при открытии.
+        # openpyxl и так ставит этот флаг по умолчанию; явно -- чтобы корректность
+        # файла не зависела от умолчания (тест читает флаг из готового файла)
         wb.calculation.fullCalcOnLoad = True
         try:
             wb.save(out)
