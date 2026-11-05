@@ -6,6 +6,7 @@ from app import db
 from app.models import (
     ROLE_CUSTOMER, ROLE_PARTICIPANT, Asset, CustomerProfile, Employee,
     ExperienceRecord, LotItem, Organization, OrgSettings, Service, Tender,
+    TenderLaborRow,
 )
 from app.repo import Repo
 
@@ -242,3 +243,101 @@ def test_saves_are_committed(tmp_path):
     conn2 = db.connect(path)
     assert Repo(conn2).find_organization_by_inn("42") is not None
     conn2.close()
+
+
+# ---- строки ФОТ тендера (миграция 2) ------------------------------------------
+
+def test_tender_labor_round_trips(repo):
+    tid = make_tender(repo)
+    rid = repo.save_tender_labor(TenderLaborRow(
+        tender_id=tid, position=1, post="Эколог-проектировщик", headcount=4,
+        hours=Decimal("1200.00"), rate=Decimal("270.50")))
+    (got,) = repo.list_tender_labor(tid)
+    assert got.id == rid
+    assert (got.tender_id, got.position, got.post, got.headcount) == (
+        tid, 1, "Эколог-проектировщик", 4)
+    assert isinstance(got.hours, Decimal) and isinstance(got.rate, Decimal)
+    # масштаб Decimal не теряется: «1200.00» не становится 1200, «270.50» -- 270.5
+    assert str(got.hours) == "1200.00"
+    assert str(got.rate) == "270.50"
+
+
+def test_tender_labor_save_with_id_updates_in_place(repo):
+    tid = make_tender(repo)
+    rid = repo.save_tender_labor(TenderLaborRow(tender_id=tid, post="a"))
+    row = repo.list_tender_labor(tid)[0]
+    row.headcount = 3
+    assert repo.save_tender_labor(row) == rid
+    assert [r.headcount for r in repo.list_tender_labor(tid)] == [3]
+
+
+def test_tender_labor_cascades_with_tender(repo):
+    tid = make_tender(repo)
+    repo.save_tender_labor(TenderLaborRow(tender_id=tid, post="a"))
+    repo.delete_tender(tid)
+    assert repo.conn.execute("SELECT COUNT(*) FROM tender_labor").fetchone()[0] == 0
+
+
+def test_tender_labor_keeps_position_order(repo):
+    tid = make_tender(repo)
+    # вставляем не по порядку: порядок задаёт position, а не вставка
+    repo.save_tender_labor(TenderLaborRow(tender_id=tid, position=2, post="вторая"))
+    repo.save_tender_labor(TenderLaborRow(tender_id=tid, position=1, post="первая"))
+    repo.save_tender_labor(TenderLaborRow(tender_id=tid, position=3, post="третья"))
+    assert [r.post for r in repo.list_tender_labor(tid)] == [
+        "первая", "вторая", "третья"]
+
+
+def test_tender_labor_is_scoped_to_tender(repo):
+    first, second = make_tender(repo), make_tender(repo)
+    repo.save_tender_labor(TenderLaborRow(tender_id=first, post="a"))
+    repo.save_tender_labor(TenderLaborRow(tender_id=second, post="b"))
+    assert [r.post for r in repo.list_tender_labor(first)] == ["a"]
+
+
+def test_delete_tender_labor_removes_only_that_row(repo):
+    tid = make_tender(repo)
+    gone = repo.save_tender_labor(TenderLaborRow(tender_id=tid, position=1, post="a"))
+    repo.save_tender_labor(TenderLaborRow(tender_id=tid, position=2, post="b"))
+    repo.delete_tender_labor(gone)
+    assert [r.post for r in repo.list_tender_labor(tid)] == ["b"]
+
+
+def test_tender_labor_money_columns_are_declared_decimal_text(repo):
+    # голый DECIMAL даёт NUMERIC-аффинность и молча теряет масштаб
+    cols = {r[1]: r[2] for r in repo.conn.execute("PRAGMA table_info(tender_labor)")}
+    assert cols["hours"] == "DECIMAL TEXT"
+    assert cols["rate"] == "DECIMAL TEXT"
+
+
+def test_migrate_twice_keeps_version_and_data(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    db.migrate(conn)
+    repo = Repo(conn)
+    tid = make_tender(repo)
+    repo.save_tender_labor(TenderLaborRow(tender_id=tid, post="a"))
+    db.migrate(conn)  # повторный вызов ничего не меняет и не стирает
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 2
+    assert len(repo.list_tender_labor(tid)) == 1
+    conn.close()
+
+
+def test_version_1_database_upgrades_to_2_keeping_data(tmp_path):
+    conn = db.connect(tmp_path / "old.db")
+    # база, созданная до появления миграции 2: применяем только первую
+    conn.executescript(db._MIGRATIONS[0])
+    conn.execute("PRAGMA user_version = 1")
+    repo = Repo(conn)
+    tid = make_tender(repo, purchase_number="42", price_wo_vat=Decimal("5700000.00"))
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE name = 'tender_labor'").fetchone() is None
+
+    db.migrate(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert repo.get_tender(tid).purchase_number == "42"
+    assert str(repo.get_tender(tid).price_wo_vat) == "5700000.00"
+    assert repo.list_tender_labor(tid) == []
+    repo.save_tender_labor(TenderLaborRow(tender_id=tid, post="a"))
+    assert len(repo.list_tender_labor(tid)) == 1
+    conn.close()

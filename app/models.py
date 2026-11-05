@@ -146,3 +146,16 @@ class LotItem:
     name: str = ""
     price: Decimal = ZERO
     id: int | None = None
+
+
+@dataclass
+class TenderLaborRow:
+    """Строка трудозатрат КП тендера. Численность и часы -- плановые величины
+    под конкретный тендер, а не состав штата, поэтому хранятся при тендере."""
+    tender_id: int | None = None
+    position: int = 0                 # порядок в списке
+    post: str = ""                    # должность
+    headcount: int = 1                # человек
+    hours: Decimal = ZERO             # часов на человека
+    rate: Decimal = ZERO              # руб/ч
+    id: int | None = None

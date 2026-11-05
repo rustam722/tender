@@ -1,0 +1,14 @@
+{
+  "source": "experience",
+  "numbered": true,
+  "columns": [
+    {"header": "№ п/п"},
+    {"header": "Заказчик", "parts": ["customer_name"]},
+    {"header": "Номер контракта", "parts": ["contract_number"]},
+    {"header": "Дата контракта", "parts": ["contract_date"]},
+    {"header": "Предмет контракта", "parts": ["subject"]},
+    {"header": "Сумма контракта, руб.", "parts": ["amount"]},
+    {"header": "Срок исполнения", "parts": ["term"]},
+    {"header": "Статус исполнения", "parts": ["status"]}
+  ]
+}

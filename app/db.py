@@ -148,6 +148,21 @@ _MIGRATIONS = [
     );
     CREATE INDEX IF NOT EXISTS idx_lot_item_tender ON lot_item (tender_id, position, id);
     """,
+    # 2: трудозатраты тендера. Хранятся, а не выводятся из норм каталога:
+    # численность в КП -- плановая величина под тендер, а не состав штата.
+    """
+    CREATE TABLE IF NOT EXISTS tender_labor (
+        id INTEGER PRIMARY KEY,
+        tender_id INTEGER NOT NULL REFERENCES tender (id) ON DELETE CASCADE,
+        position INTEGER NOT NULL DEFAULT 0,
+        post TEXT NOT NULL DEFAULT '',
+        headcount INTEGER NOT NULL DEFAULT 1,
+        hours DECIMAL TEXT NOT NULL DEFAULT '0',
+        rate DECIMAL TEXT NOT NULL DEFAULT '0'
+    );
+    CREATE INDEX IF NOT EXISTS idx_tender_labor_tender
+        ON tender_labor (tender_id, position, id);
+    """,
 ]
 
 SCHEMA_VERSION = len(_MIGRATIONS)
