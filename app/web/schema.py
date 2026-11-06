@@ -29,6 +29,12 @@ from app.web.errors import ApiError
 
 MAX_DECIMAL = Decimal(10) ** 12      # триллион: правдоподобный предел для денег и часов
 MAX_INT = 2 ** 63 - 1                # больше SQLite не хранит
+# Пределы поменьше там, где значения перемножаются (численность * часы * ставка,
+# количество * цена): контекст Decimal держит 28 значащих цифр, и произведение трёх
+# чисел по 10^12 уже не округлить до копеек (InvalidOperation). С этими пределами
+# любое произведение укладывается, и сохранённая строка не ломает расчёт и список.
+_LIMITS = {"hours": Decimal(10) ** 6, "rate": Decimal(10) ** 6, "quantity": Decimal(10) ** 9}
+_INT_LIMITS = {"headcount": 10 ** 6}
 MAX_NUMBER_TEXT = 40
 
 _DOC_FIELDS = {"template": "Шаблон", "cellmap": "Карта ячеек", "layout": "Раскладка",
@@ -58,6 +64,9 @@ class Entity:
     choices: dict = field(default_factory=dict)
     dates: tuple = ()
     dirs: tuple = ()
+    money: tuple = ()        # денежные поля: в ответе рядом <поле>_text
+    numbers: tuple = ()      # часы и количества: <поле>_text с запятой
+    percents: tuple = ()     # ставки-доли: <поле>_percent
     in_use: str = ""
     parent: str = ""
     check: typing.Callable | None = None     # (obj, repo) -> None или ApiError
@@ -91,7 +100,7 @@ ORGANIZATIONS = Entity(
             "msp_status": "Статус МСП"},
     save="save_organization", get="get_organization", list_="list_organizations",
     delete="delete_organization",
-    choices={"role": _ROLES, "msp_status": _MSP},
+    choices={"role": _ROLES, "msp_status": _MSP}, percents=("vat_rate",),
     in_use="Эту организацию нельзя удалить: она указана в тендерах как заказчик или "
            "участник. Сначала удалите эти тендеры или выберите в них другую организацию.")
 
@@ -101,7 +110,8 @@ EMPLOYEES = Entity(
             "graduation_year": "Год окончания", "specialty": "Специальность",
             "qualification": "Квалификация", "experience_years": "Стаж, лет",
             "hourly_rate": "Ставка, руб/ч"},
-    save="save_employee", get="get_employee", list_="list_employees", delete="delete_employee")
+    save="save_employee", get="get_employee", list_="list_employees", delete="delete_employee",
+    money=("hourly_rate",))
 
 ASSETS = Entity(
     "assets", Asset, "Ресурс",
@@ -119,7 +129,7 @@ EXPERIENCE = Entity(
             "contract_scan": "Скан контракта", "act_scan": "Скан акта"},
     save="save_experience", get="get_experience", list_="list_experience",
     delete="delete_experience",
-    refs={"service_id": ("Услуга", "get_service")})
+    refs={"service_id": ("Услуга", "get_service")}, money=("amount",))
 
 SERVICES = Entity(
     "services", Service, "Услуга",
@@ -149,33 +159,36 @@ TENDERS = Entity(
     save="save_tender", get="get_tender", list_="list_tenders", delete="delete_tender",
     refs={"customer_id": ("Заказчик", "get_organization"),
           "participant_id": ("Участник", "get_organization")},
-    dates=("purchase_date", "doc_date"), dirs=("output_dir",))
+    dates=("purchase_date", "doc_date"), dirs=("output_dir",),
+    money=("price_wo_vat",), percents=("vat_rate",))
 
 LOT_ITEMS = Entity(
     "items", LotItem, "Позиция лота",
     labels={"position": "Порядок", "name": "Наименование", "price": "Цена"},
     save="save_lot_item", get="get_lot_item", list_="list_lot_items", delete="delete_lot_item",
-    parent="tender_id")
+    parent="tender_id", money=("price",))
 
 LABOR = Entity(
     "labor", TenderLaborRow, "Строка трудозатрат",
     labels={"position": "Порядок", "post": "Должность", "headcount": "Численность",
             "hours": "Часы", "rate": "Ставка, руб/ч"},
     save="save_tender_labor", list_="list_tender_labor", delete="delete_tender_labor",
-    parent="tender_id")
+    parent="tender_id", money=("rate",), numbers=("hours",))
 
 COSTS = Entity(
     "costs", TenderCostItem, "Строка материалов или субподряда",
     labels={"kind": "Статья", "position": "Порядок", "name": "Наименование",
             "unit": "Единица", "quantity": "Количество", "price": "Цена", "note": "Примечание"},
     save="save_tender_cost_item", list_="list_tender_cost_items",
-    delete="delete_tender_cost_item", choices={"kind": _COST_KINDS}, parent="tender_id")
+    delete="delete_tender_cost_item", choices={"kind": _COST_KINDS}, parent="tender_id",
+    money=("price",), numbers=("quantity",))
 
 SETTINGS = Entity(
     "settings", OrgSettings, "Настройки",
     labels={"insurance_rate": "Страховые взносы", "injury_rate": "Травматизм",
             "overhead_rate": "Накладные", "profit_rate": "Прибыль", "vat_rate": "НДС",
-            "total_rounding_digits": "Округление итога"})
+            "total_rounding_digits": "Округление итога"},
+    percents=("insurance_rate", "injury_rate", "overhead_rate", "profit_rate", "vat_rate"))
 
 # Не справочник: подписи полей запроса подбора часов, чтобы отказ назвал поле.
 SOLVE = Entity("solve", Tender, "Подбор часов",
@@ -234,7 +247,7 @@ def decimal_value(value, entity, path):
         fail(entity, path, "введите обычное число.")
     if number < 0:
         fail(entity, path, "число не может быть отрицательным.")
-    if number > MAX_DECIMAL:
+    if number > _LIMITS.get(path[-1], MAX_DECIMAL):
         fail(entity, path, "число слишком велико.")
     number = abs(number)                                  # «-0» -> «0»
     if number.as_tuple().exponent > 0:                    # 1E+5 -> 100000
@@ -259,7 +272,7 @@ def _int(value, entity, path):
         number = int(value)
     else:
         fail(entity, path, problem)
-    if abs(number) > MAX_INT:
+    if abs(number) > _INT_LIMITS.get(path[-1], MAX_INT):
         fail(entity, path, "число слишком велико.")
     if number < 0 and path[-1] not in _SIGNED:
         fail(entity, path, "число не может быть отрицательным.")
@@ -375,6 +388,19 @@ def _check_field(entity: Entity, name: str, value, path: list):
     return value
 
 
+def output_only_keys(entity: Entity) -> set[str]:
+    """Ключи, которые ответ добавляет к записи сам (готовые строки и суммы строк).
+    Экран может отправить запись обратно целиком, как получил: эти ключи при
+    разборе игнорируются. Любые другие неизвестные ключи -- по-прежнему отказ."""
+    keys = {name + "_text" for name in entity.money + entity.numbers}
+    keys |= {name + "_percent" for name in entity.percents}
+    if entity.cls is Service:
+        keys.add("norms_text")
+    if entity in (LABOR, COSTS):
+        keys |= {"amount", "amount_text"}
+    return keys
+
+
 def parse_object(entity: Entity, data: dict, existing=None, fixed: dict | None = None):
     """Тело запроса -> датакласс. Присланные поля заменяют поля existing, не
     присланные остаются как были: частичная правка не стирает остальное.
@@ -382,7 +408,10 @@ def parse_object(entity: Entity, data: dict, existing=None, fixed: dict | None =
     hints = typing.get_type_hints(entity.cls)
     names = {f.name for f in fields(entity.cls)} - {"id"} - ({entity.parent} if entity.parent else set())
     values = {}
+    skip = output_only_keys(entity)
     for name, raw in data.items():
+        if name in skip:
+            continue
         if name not in names:
             raise ApiError(f"Неизвестное поле «{name}»: такого поля у записи "
                            f"«{entity.title}» нет. Проверьте имя.", path=[name])

@@ -330,22 +330,22 @@ def test_tender_children_round_trip(client):
                   price="5 700 000,00")
     assert item["tender_id"] == tid and item["price"] == "5700000.00"
     ok(client.post(f"/api/tenders/{tid}/items", json={"id": item["id"], "name": "КЭР"}))
-    assert [i["name"] for i in ok(client.get(f"/api/tenders/{tid}/items"))] == ["КЭР"]
+    assert [i["name"] for i in ok(client.get(f"/api/tenders/{tid}/items"))["rows"]] == ["КЭР"]
 
     labor = add_labor(client, tid)
     assert labor["hours"] == "100"
     cost = create(client, f"tenders/{tid}/costs", kind="subcontract", name="Замеры",
                   unit="усл.ед.", quantity="1", price="20000")
     create(client, f"tenders/{tid}/costs", kind="materials", name="Бумага", price="10")
-    assert len(ok(client.get(f"/api/tenders/{tid}/costs"))) == 2
-    assert [c["id"] for c in ok(client.get(f"/api/tenders/{tid}/costs?kind=subcontract"))] \
+    assert len(ok(client.get(f"/api/tenders/{tid}/costs"))["rows"]) == 2
+    assert [c["id"] for c in ok(client.get(f"/api/tenders/{tid}/costs?kind=subcontract"))["rows"]] \
         == [cost["id"]]
     refused(client.get(f"/api/tenders/{tid}/costs?kind=drova"))
 
     ok(client.delete(f"/api/tenders/{tid}/items/{item['id']}"))
     ok(client.delete(f"/api/tenders/{tid}/labor/{labor['id']}"))
-    assert ok(client.get(f"/api/tenders/{tid}/items")) == []
-    assert ok(client.get(f"/api/tenders/{tid}/labor")) == []
+    assert ok(client.get(f"/api/tenders/{tid}/items"))["rows"] == []
+    assert ok(client.get(f"/api/tenders/{tid}/labor"))["rows"] == []
 
     # удаление тендера уносит дочерние строки; на чужой тендер ручки отвечают 404
     ok(client.delete(f"/api/tenders/{tid}"))
@@ -358,7 +358,7 @@ def test_child_row_of_another_tender_is_not_reachable(client):
     row = add_labor(client, a["id"])
     refused(client.delete(f"/api/tenders/{b['id']}/labor/{row['id']}"), 404)
     refused(client.post(f"/api/tenders/{b['id']}/labor", json={"id": row["id"], "hours": "1"}), 404)
-    assert ok(client.get(f"/api/tenders/{a['id']}/labor"))[0]["hours"] == "100"
+    assert ok(client.get(f"/api/tenders/{a['id']}/labor"))["rows"][0]["hours"] == "100"
     body = refused(client.post(f"/api/tenders/{a['id']}/labor",
                                json={"tender_id": b["id"], "post": "х"}))
     assert body["field"] == "tender_id"
@@ -673,10 +673,31 @@ def test_estimate_for_unknown_tender_is_404(client):
     refused(client.post("/api/tenders/404/estimate", json={}), 404)
 
 
-def test_estimate_with_absurd_numbers_is_400(client):
+def test_numbers_that_would_overflow_the_calculator_are_refused_on_save(client):
+    """Строку, чьё произведение не округлить до копеек, нельзя было бы ни
+    показать, ни удалить через список: отказ -- при сохранении, поле названо."""
     tender = make_tender(client)
-    add_labor(client, tender["id"], headcount=10 ** 9, hours="999999999999", rate="999999999999")
-    refused(client.post(f"/api/tenders/{tender['id']}/estimate", json={}))
+    url = f"/api/tenders/{tender['id']}/labor"
+    for field, value in (("headcount", 10 ** 7), ("hours", "1000001"), ("rate", "1000001")):
+        body = refused(client.post(url, json={field: value}))
+        assert body["field"] == field and "слишком велико" in body["error"]
+    refused(client.post(f"/api/tenders/{tender['id']}/costs", json={"quantity": "1000000001"}))
+    # предельные значения проходят, и расчёт с ними не падает
+    add_labor(client, tender["id"], headcount=10 ** 6, hours="1000000", rate="1000000")
+    ok(client.get(url))
+    ok(client.post(f"/api/tenders/{tender['id']}/estimate", json={}))
+
+
+def test_decimal_overflow_in_the_calculator_is_a_russian_400(client, monkeypatch):
+    import decimal
+    tender = make_tender(client)
+
+    def broken(*args, **kwargs):
+        raise decimal.InvalidOperation("[<class 'decimal.InvalidOperation'>]")
+
+    monkeypatch.setattr(routes_module, "build_context", broken)
+    body = refused(client.post(f"/api/tenders/{tender['id']}/estimate", json={}))
+    assert "слишком велики" in body["error"]
 
 
 def test_solve_returns_proposal_and_does_not_save_it(client):
@@ -688,7 +709,7 @@ def test_solve_returns_proposal_and_does_not_save_it(client):
     assert body["labor"][0]["hours"] == "200"                # вдвое больше -- вдвое дороже
     assert body["estimate"]["total_wo_vat"] == "300762.00"
     assert body["target"] == "300762" and body["target_includes_vat"] is False
-    assert ok(client.get(f"/api/tenders/{tid}/labor"))[0]["hours"] == "100"   # не сохранено
+    assert ok(client.get(f"/api/tenders/{tid}/labor"))["rows"][0]["hours"] == "100"   # не сохранено
 
 
 def test_solve_refusals(client):
@@ -1049,18 +1070,18 @@ def test_put_items_replaces_the_whole_lot_in_one_go(client):
     tid = tender["id"]
     create(client, f"tenders/{tid}/items", position=1, name="старая", price="1")
     pasted = [{"position": n, "name": f"Позиция {n}", "price": f"{n}00,50"} for n in range(1, 12)]
-    saved = ok(client.put(f"/api/tenders/{tid}/items", json={"items": pasted}))
+    saved = ok(client.put(f"/api/tenders/{tid}/items", json={"items": pasted}))["rows"]
     assert [i["name"] for i in saved] == [f"Позиция {n}" for n in range(1, 12)]
     assert saved[0]["price"] == "100.50" and saved[0]["tender_id"] == tid
     assert "старая" not in [i["name"] for i in saved]                       # прежняя заменена
-    assert ok(client.get(f"/api/tenders/{tid}/items")) == saved
+    assert ok(client.get(f"/api/tenders/{tid}/items"))["rows"] == saved
 
     # отправленные обратно как есть (с id и tender_id) позиции -- тоже годятся
-    again = ok(client.put(f"/api/tenders/{tid}/items", json={"items": saved}))
+    again = ok(client.put(f"/api/tenders/{tid}/items", json={"items": saved}))["rows"]
     assert [i["name"] for i in again] == [i["name"] for i in saved]
 
-    assert ok(client.put(f"/api/tenders/{tid}/items", json={"items": []})) == []
-    assert ok(client.get(f"/api/tenders/{tid}/items")) == []
+    assert ok(client.put(f"/api/tenders/{tid}/items", json={"items": []}))["rows"] == []
+    assert ok(client.get(f"/api/tenders/{tid}/items"))["rows"] == []
 
 
 def test_put_items_failing_on_the_seventh_changes_nothing(client):
@@ -1072,7 +1093,7 @@ def test_put_items_failing_on_the_seventh_changes_nothing(client):
     body = refused(client.put(f"/api/tenders/{tid}/items", json={"items": pasted}))
     assert body["path"] == ["items", 6, "price"] and body["field"] == "items"
     assert "Позиция №7" in body["error"] and "Цена" in body["error"]
-    assert [i["name"] for i in ok(client.get(f"/api/tenders/{tid}/items"))] == ["прежняя"]
+    assert [i["name"] for i in ok(client.get(f"/api/tenders/{tid}/items"))["rows"]] == ["прежняя"]
 
 
 def test_put_items_refusals(client):
@@ -1090,7 +1111,7 @@ def test_put_items_refusals(client):
     assert body["path"] == ["items", 0, "tender_id"]
     refused(client.put(url, json={"items": [{"name": "x"}] * 2001}))
     refused(client.put(url, data='{"items": []}', content_type="text/plain"), 415)
-    assert ok(client.get(url)) == []
+    assert ok(client.get(url))["rows"] == []
 
 
 def test_put_is_guarded_like_post(client):
@@ -1098,3 +1119,234 @@ def test_put_is_guarded_like_post(client):
     url = f"/api/tenders/{tender['id']}/items"
     refused(client.put(url, json={"items": []}, headers={"Origin": "http://evil.example"}), 403)
     refused(client.put(url, json={"items": []}, headers={"Host": "evil.example"}), 403)
+
+
+# ---- у каждого числа на экране -- готовая строка от сервера ---------------------
+# Экран не считает и не форматирует ничего: в JavaScript нет Decimal. Рядом с
+# сырым значением (его экран отправляет обратно) лежит <поле>_text (через money),
+# у ставки -- <поле>_percent, у списка под итогом -- итог.
+
+def decimal_field_names() -> set[str]:
+    """Имена всех Decimal-полей моделей: по ним проверяется, что у каждого есть пара."""
+    import dataclasses
+    import typing
+    from app import models
+
+    names = set()
+    for obj in vars(models).values():
+        if dataclasses.is_dataclass(obj):
+            for name, hint in typing.get_type_hints(obj).items():
+                if "Decimal" in str(hint):
+                    names.add(name)
+    return names
+
+
+DECIMAL_FIELDS = decimal_field_names() | {"difference", "target", "total"}
+NUMERIC = re.compile(r"-?\d+(\.\d+)?")
+TWINNED_DICTS = {"estimate", "lines", "totals", "norms"}
+
+
+def bare_numbers(value, path=""):
+    """Пути денежных/дробных значений без готовой пары рядом: то, что экрану
+    пришлось бы форматировать самому."""
+    found = []
+    if isinstance(value, list):
+        for i, item in enumerate(value):
+            found += bare_numbers(item, f"{path}[{i}]")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if key.endswith(("_text", "_percent")):
+                continue
+            where = f"{path}.{key}"
+            if isinstance(item, str) and key in DECIMAL_FIELDS and NUMERIC.fullmatch(item):
+                if not ({key + "_text", key + "_percent"} & set(value)
+                        or (key == "vat_rate" and "vat_percent" in value)):
+                    found.append(where)
+            elif key in TWINNED_DICTS and isinstance(item, dict):
+                twin = value.get(key + "_text")
+                if not isinstance(twin, dict) or set(twin) != set(item):
+                    found.append(where + " (нет пары " + key + "_text)")
+            elif key in TWINNED_DICTS and isinstance(item, list):
+                twin = value.get(key + "_text")
+                if not isinstance(twin, list) or len(twin) != len(item):
+                    found.append(where + " (нет пары " + key + "_text)")
+            else:
+                found += bare_numbers(item, where)
+    return found
+
+
+def test_scalar_money_and_percent_fields_have_ready_strings(client):
+    emp = create(client, "employees", full_name="Рабичко", hourly_rate="1250.5")
+    assert emp["hourly_rate"] == "1250.5"                       # сырое -- для отправки обратно
+    assert emp["hourly_rate_text"] == f"1{NBSP}250,50"
+
+    exp = create(client, "experience", customer_name="МУП", amount="5985000")
+    assert exp["amount_text"] == f"5{NBSP}985{NBSP}000,00"
+
+    org = create(client, "organizations", role="customer", vat_rate="0.055")
+    assert org["vat_rate_percent"] == "5,5"
+    assert create(client, "organizations", role="customer", vat_rate="0.05")["vat_rate_percent"] == "5"
+    assert create(client, "organizations", role="customer")["vat_rate_percent"] is None
+
+    tender = create(client, "tenders", price_wo_vat="5700000", vat_rate="0.2")
+    assert tender["price_wo_vat_text"] == f"5{NBSP}700{NBSP}000,00"
+    assert tender["vat_rate_percent"] == "20"
+    assert create(client, "tenders")["vat_rate_percent"] is None
+    assert create(client, "tenders")["price_wo_vat_text"] == "0,00"
+
+    service = create(client, "services", code="КЭР", norms={"Инженер": "12.50", "Директор": "30"})
+    assert service["norms_text"] == {"Инженер": "12,5", "Директор": "30"}
+
+    # то же в списках и в одной записи
+    assert ok(client.get("/api/employees"))[0]["hourly_rate_text"] == f"1{NBSP}250,50"
+    assert ok(client.get(f"/api/experience/{exp['id']}"))["amount_text"] == exp["amount_text"]
+
+
+def test_settings_have_percent_strings(client):
+    settings = ok(client.get("/api/settings"))
+    assert settings["insurance_rate_percent"] == "30"
+    assert settings["injury_rate_percent"] == "0,2"
+    assert settings["overhead_rate_percent"] == "5"
+    assert settings["profit_rate_percent"] == "10"
+    assert settings["vat_rate_percent"] == "5"
+    assert settings["total_rounding_digits"] == 0
+    changed = ok(client.post("/api/settings", json={"vat_rate": "0.205"}))
+    assert changed["vat_rate_percent"] == "20,5"
+
+
+def test_lot_items_come_with_texts_and_a_server_side_total(client):
+    tender = make_tender(client)
+    tid = tender["id"]
+    # одиннадцать позиций, как у Роснефти; копейки, чтобы сложение было видно
+    prices = [f"{n}00{n}.{n % 10}5" for n in range(1, 12)]
+    pasted = [{"position": n, "name": f"П{n}", "price": p} for n, p in enumerate(prices, 1)]
+    body = ok(client.put(f"/api/tenders/{tid}/items", json={"items": pasted}))
+    from decimal import Decimal as D
+    expected = sum((D(p) for p in prices), D("0.00"))
+    assert body["total"] == format(expected, "f")
+    assert body["total_text"] == f"{expected:,.2f}".translate({ord(","): NBSP, ord("."): ","})
+    assert [r["price_text"] for r in body["rows"]][0] == f"1{NBSP}001,15"
+    assert [r["price"] for r in body["rows"]][0] == "1001.15"
+
+    again = ok(client.get(f"/api/tenders/{tid}/items"))
+    assert again == body
+    assert ok(client.get(f"/api/tenders/{create(client, 'tenders')['id']}/items")) == {
+        "rows": [], "total": "0.00", "total_text": "0,00"}
+
+
+def test_lot_total_is_the_sum_of_printed_prices_not_of_raw_ones(client):
+    # три цены по 0,005: напечатаны будут по 0,01, итог напечатанных -- 0,03.
+    # Сумма сырых (0,015 -> «0,02») разошлась бы со строками над ней.
+    tender = make_tender(client)
+    body = ok(client.put(f"/api/tenders/{tender['id']}/items", json={
+        "items": [{"name": str(n), "price": "0.005"} for n in range(3)]}))
+    assert [r["price_text"] for r in body["rows"]] == ["0,01"] * 3
+    assert body["total"] == "0.03" and body["total_text"] == "0,03"
+
+
+def test_single_lot_item_save_has_its_text(client):
+    tender = make_tender(client)
+    item = create(client, f"tenders/{tender['id']}/items", name="x", price="1234.5")
+    assert item["price_text"] == f"1{NBSP}234,50" and item["price"] == "1234.5"
+
+
+def test_labor_rows_have_texts_and_a_server_side_fot(client):
+    tender = make_tender(client)
+    tid = tender["id"]
+    first = add_labor(client, tid, headcount=2, hours="12.5", rate="270")       # 6 750,00
+    assert first["rate_text"] == f"270,00" and first["hours_text"] == "12,5"
+    assert first["amount"] == "6750.00" and first["amount_text"] == f"6{NBSP}750,00"
+    add_labor(client, tid, post="Начальник", headcount=1, hours="360", rate="420")  # 151 200,00
+    body = ok(client.get(f"/api/tenders/{tid}/labor"))
+    assert [r["amount"] for r in body["rows"]] == ["6750.00", "151200.00"]
+    assert body["total"] == "157950.00" and body["total_text"] == f"157{NBSP}950,00"
+    # ФОТ тот же, что в расчёте: экран не складывает строки сам
+    assert ok(client.post(f"/api/tenders/{tid}/estimate", json={}))["estimate"]["labor"] \
+        == body["total"]
+
+
+def test_cost_rows_have_texts_and_totals_per_kind(client):
+    tender = make_tender(client)
+    tid = tender["id"]
+    mat = create(client, f"tenders/{tid}/costs", kind="materials", name="Бумага",
+                 unit="пач.", quantity="2.5", price="199.99")          # 499,975 -> 499,98
+    assert mat["quantity_text"] == "2,5" and mat["price_text"] == "199,99"
+    assert mat["amount"] == "499.98" and mat["amount_text"] == "499,98"
+    create(client, f"tenders/{tid}/costs", kind="materials", name="Тонер", quantity="1",
+           price="1000")
+    create(client, f"tenders/{tid}/costs", kind="subcontract", name="Замеры", quantity="1",
+           price="20000")
+    body = ok(client.get(f"/api/tenders/{tid}/costs"))
+    assert [r["amount_text"] for r in body["rows"]] == [
+        "499,98", f"1{NBSP}000,00", f"20{NBSP}000,00"]
+    assert body["totals"] == {"materials": "1499.98", "subcontract": "20000.00"}
+    assert body["totals_text"] == {"materials": f"1{NBSP}499,98",
+                                   "subcontract": f"20{NBSP}000,00"}
+    only = ok(client.get(f"/api/tenders/{tid}/costs?kind=subcontract"))
+    assert [r["name"] for r in only["rows"]] == ["Замеры"]
+    assert only["totals"] == body["totals"]
+    estimate = ok(client.post(f"/api/tenders/{tid}/estimate", json={}))["estimate"]
+    assert estimate["materials"] == body["totals"]["materials"]           # те же числа
+    assert estimate["subcontract"] == body["totals"]["subcontract"]
+
+
+def test_solved_hours_have_texts(client):
+    tender = make_tender(client)
+    add_labor(client, tender["id"])
+    body = ok(client.post(f"/api/tenders/{tender['id']}/solve", json={"target": "300762"}))
+    assert body["labor"][0]["hours_text"] == "200"
+    assert body["labor"][0]["rate_text"] == f"1{NBSP}000,00"
+
+
+def test_no_screen_ever_has_to_format_a_number(client, monkeypatch):
+    """Приёмка координатора: число на экране, которого нет в ответе готовой
+    строкой, значит посчитал и отформатировал браузер. Обход всех ответов,
+    несущих деньги, ставки и часы."""
+    from decimal import Decimal
+
+    from app.models import Organization as Org
+    tender = make_tender(client, price_wo_vat="5700000", vat_rate="0.05")
+    tid = tender["id"]
+    create(client, "employees", full_name="А", hourly_rate="100")
+    create(client, "experience", customer_name="Б", amount="10")
+    create(client, "services", code="КЭР", norms={"И": "1"})
+    create(client, f"tenders/{tid}/items", name="п", price="10")
+    add_labor(client, tid)
+    create(client, f"tenders/{tid}/costs", kind="materials", name="м", quantity="1", price="5")
+    monkeypatch.setattr(routes_module, "build_draft",
+                        lambda inn, **kw: (Org(vat_rate=Decimal("0.05")), []))
+    responses = [
+        client.get("/api/employees"), client.get("/api/experience"),
+        client.get("/api/services"), client.get("/api/organizations"),
+        client.get("/api/tenders"), client.get(f"/api/tenders/{tid}"),
+        client.get("/api/settings"),
+        client.get(f"/api/tenders/{tid}/items"), client.get(f"/api/tenders/{tid}/labor"),
+        client.get(f"/api/tenders/{tid}/costs"),
+        client.post(f"/api/tenders/{tid}/estimate", json={"target": "100000"}),
+        client.post(f"/api/tenders/{tid}/solve", json={"target": "300762"}),
+        client.put(f"/api/tenders/{tid}/items", json={"items": [{"name": "x", "price": "1"}]}),
+        client.get("/api/inn/2904016130"),
+        client.post("/api/settings", json={"vat_rate": "0.06"}),
+    ]
+    for response in responses:
+        bare = bare_numbers(ok(response))
+        assert bare == [], (response.request.path, bare)
+
+
+def test_a_record_can_be_sent_back_exactly_as_received(client):
+    """Экран отправляет записи обратно: готовые строки и суммы -- только для показа,
+    сервер их игнорирует, а неизвестные ключи по-прежнему отказ."""
+    tender = make_tender(client, price_wo_vat="5700000", vat_rate="0.05")
+    tid = tender["id"]
+    labor = add_labor(client, tid)
+    cost = create(client, f"tenders/{tid}/costs", kind="materials", name="м", quantity="2",
+                  price="5")
+    service = create(client, "services", code="КЭР", norms={"И": "1.5"})
+    employee = create(client, "employees", full_name="А", hourly_rate="100")
+    for path, record in ((f"tenders/{tid}/labor", labor), (f"tenders/{tid}/costs", cost),
+                         ("services", service), ("employees", employee),
+                         ("tenders", ok(client.get(f"/api/tenders/{tid}"))),
+                         ("settings", ok(client.get("/api/settings")))):
+        back = ok(client.post(f"/api/{path}", json=record))
+        assert back == record, path
+    refused(client.post("/api/employees", json={**employee, "hourly_rate_texts": "1"}))

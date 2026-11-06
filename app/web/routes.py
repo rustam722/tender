@@ -48,8 +48,9 @@ from app.render.package import build_package, planned_files
 from app.repo import Repo
 from app.web import errors, schema
 from app.web.errors import ApiError
+from app.web.texts import money_total, number_text, present, texts_of
 from app.web.schema import (
-    CHILDREN, COSTS, EXPERIENCE, LOT_ITEMS, ORGANIZATIONS, PROFILES, SETTINGS, SOLVE, TENDERS, TOP_LEVEL,
+    CHILDREN, COSTS, EXPERIENCE, LABOR, LOT_ITEMS, ORGANIZATIONS, PROFILES, SETTINGS, SOLVE, TENDERS, TOP_LEVEL,
     Entity, plain,
 )
 
@@ -181,15 +182,47 @@ def _find(entity: Entity, repo: Repo, row_id: int, tender_id: int | None = None)
     raise _not_found(entity, row_id)
 
 
-def _list(entity: Entity, repo: Repo, tender_id: int | None = None):
-    if tender_id is not None:
-        if entity is COSTS:
-            kind = request.args.get("kind")
-            if kind is not None and kind not in COSTS.choices["kind"]:
-                raise ApiError("Параметр «kind»: допустимо materials или subcontract.",
-                               path=["kind"])
-            return repo.list_tender_cost_items(tender_id, kind)
-        return getattr(repo, entity.list_)(tender_id)
+def _child_view(entity: Entity, repo: Repo, tender_id: int) -> dict:
+    """Строки тендера (позиции лота, ФОТ, материалы и субподряд) и итог под ними.
+
+    Суммы строк и итоги -- не наши: суммы ФОТ и материалов берутся из контекста
+    документов (округление и порядок те же, что в печатной форме, итоги ФОТ,
+    материалов и субподряда -- статьи расчёта), итог позиций лота --
+    money_total. Экран только показывает."""
+    if entity is LOT_ITEMS:
+        items = repo.list_lot_items(tender_id)
+        total = money_total(i.price for i in items)
+        return {"rows": [present(entity, i) for i in items],
+                "total": plain(total), "total_text": money(total)}
+    ctx = build_context(tender_id, repo)
+    if entity is LABOR:
+        stored = repo.list_tender_labor(tender_id)
+        rows = []
+        for row, printed in zip(stored, ctx["labor"]):
+            body = present(entity, row)
+            body["amount"], body["amount_text"] = plain(printed["amount_value"]), printed["amount"]
+            rows.append(body)
+        total = ctx["estimate"]["labor"]
+        return {"rows": rows, "total": plain(total), "total_text": money(total)}
+    # материалы и субподряд: строки обеих статей, итоги каждой
+    kind = request.args.get("kind")
+    if kind is not None and kind not in COSTS.choices["kind"]:
+        raise ApiError("Параметр «kind»: допустимо materials или subcontract.", path=["kind"])
+    printed = {}
+    for name in COSTS.choices["kind"]:
+        for row, line in zip(repo.list_tender_cost_items(tender_id, name), ctx[name]):
+            printed[row.id] = line
+    rows = []
+    for row in repo.list_tender_cost_items(tender_id, kind):
+        body = present(entity, row)
+        line = printed[row.id]
+        body["amount"], body["amount_text"] = plain(line["amount_value"]), line["amount"]
+        rows.append(body)
+    totals = {name: ctx["estimate"][name] for name in COSTS.choices["kind"]}
+    return {"rows": rows, "totals": plain(totals), "totals_text": texts_of(totals)}
+
+
+def _list(entity: Entity, repo: Repo):
     if entity is ORGANIZATIONS:
         role = request.args.get("role")
         if role is not None and role not in ORGANIZATIONS.choices["role"]:
@@ -227,7 +260,15 @@ def _save(entity: Entity, tender_id: int | None = None):
         saved_id = getattr(repo, entity.save)(obj)
     except sqlite3.IntegrityError as exc:
         raise errors.translate_integrity(exc, entity, "save", obj, repo) from exc
-    response = jsonify(plain(_find(entity, repo, saved_id, tender_id)))
+    saved = _find(entity, repo, saved_id, tender_id)
+    if tender_id is None:
+        body = present(entity, saved)
+    elif entity is LOT_ITEMS:
+        body = present(entity, saved)
+    else:       # у строки ФОТ и материалов есть сумма: её знает только расчёт
+        body = next(row for row in _child_view(entity, repo, tender_id)["rows"]
+                    if row["id"] == saved.id)
+    response = jsonify(body)
     response.status_code = 200 if existing is not None else 201
     return response
 
@@ -345,13 +386,6 @@ def _target(data: dict, required: bool):
     return target, includes_vat
 
 
-def _texts(result) -> dict:
-    """Статьи расчёта готовыми строками «5 985 000,00»: экран ничего не
-    форматирует и не считает (в JavaScript нет Decimal)."""
-    values = result if isinstance(result, dict) else vars(result)
-    return {name: money(value) for name, value in values.items()}
-
-
 def _gap_fields(target: Decimal, includes_vat: bool, result: Estimate) -> dict:
     """Цель и расхождение итога с ней -- числом (строкой Decimal) и готовой
     строкой. Разницу считает calc.price_gap по итогу расчёта, не по статьям."""
@@ -377,7 +411,7 @@ def _estimate(tender_id: int):
         "vat_rate": plain(ctx["tender"]["vat_rate"]),
         "vat_percent": ctx["tender"]["vat_percent"],
         "estimate": plain(ctx["estimate"]),
-        "estimate_text": _texts(ctx["estimate"]),
+        "estimate_text": texts_of(ctx["estimate"]),
         "lines": plain(lines),
         "lines_text": {name: [money(v) for v in values] for name, values in lines.items()}}
     if target is not None:
@@ -403,11 +437,11 @@ def _solve(tender_id: int):
     result = estimate(solved, materials, subcontract, settings)
     body = {
         "labor": [{"id": row.id, "post": line.post, "headcount": line.headcount,
-                   "hours": plain(line.hours), "rate": plain(line.rate),
-                   "rate_text": money(line.rate)}
+                   "hours": plain(line.hours), "hours_text": number_text(line.hours),
+                   "rate": plain(line.rate), "rate_text": money(line.rate)}
                   for row, line in zip(rows, solved)],
         "estimate": plain(result),
-        "estimate_text": _texts(result)}
+        "estimate_text": texts_of(result)}
     body.update(_gap_fields(target, includes_vat, result))
     return jsonify(body)
 
@@ -452,7 +486,7 @@ def _replace_items(tender_id: int):
         repo.replace_lot_items(tender_id, items)
     except sqlite3.IntegrityError as exc:
         raise errors.translate_integrity(exc, LOT_ITEMS, "save") from exc
-    return jsonify(plain(repo.list_lot_items(tender_id)))
+    return jsonify(_child_view(LOT_ITEMS, repo, tender_id))
 
 
 def _inn(inn: str):
@@ -463,7 +497,8 @@ def _inn(inn: str):
     if url is not None and len(url) > 500:
         raise ApiError("Ссылка на rusprofile слишком длинная.", path=["rusprofile_url"])
     organization, warnings = build_draft(inn, rusprofile_url=url)
-    return jsonify({"organization": plain(organization), "warnings": warnings})
+    return jsonify({"organization": present(ORGANIZATIONS, organization),
+                    "warnings": warnings})
 
 
 # ---- настройки ----------------------------------------------------------------
@@ -472,7 +507,7 @@ def _settings_save():
     repo = get_repo()
     settings = schema.parse_object(SETTINGS, json_body(), repo.get_settings())
     repo.save_settings(settings)
-    return jsonify(plain(repo.get_settings()))
+    return jsonify(present(SETTINGS, repo.get_settings()))
 
 
 # ---- регистрация --------------------------------------------------------------
@@ -491,18 +526,19 @@ def register(app) -> None:
     app.add_url_rule("/api/tenders/<int:tender_id>/items", "items_replace", _replace_items,
                      methods=["PUT"])
     app.add_url_rule("/api/settings", "settings_get",
-                     lambda: jsonify(plain(get_repo().get_settings())), methods=["GET"])
+                     lambda: jsonify(present(SETTINGS, get_repo().get_settings())),
+                     methods=["GET"])
     app.add_url_rule("/api/settings", "settings_save", _settings_save, methods=["POST"])
 
     for ent in TOP_LEVEL:
         base = f"/api/{ent.path}"
         app.add_url_rule(base, f"{ent.path}_list",
-                         lambda ent=ent: jsonify(plain(_list(ent, get_repo()))),
+                         lambda ent=ent: jsonify([present(ent, o) for o in _list(ent, get_repo())]),
                          methods=["GET"])
         app.add_url_rule(base, f"{ent.path}_save", lambda ent=ent: _save(ent),
                          methods=["POST"])
         app.add_url_rule(f"{base}/<int:row_id>", f"{ent.path}_get",
-                         lambda row_id, ent=ent: jsonify(plain(_find(ent, get_repo(), row_id))),
+                         lambda row_id, ent=ent: jsonify(present(ent, _find(ent, get_repo(), row_id))),
                          methods=["GET"])
         app.add_url_rule(f"{base}/<int:row_id>", f"{ent.path}_delete",
                          lambda row_id, ent=ent: _delete(ent, row_id), methods=["DELETE"])
@@ -512,7 +548,7 @@ def register(app) -> None:
 
         def listing(tender_id, ent=ent):
             _tender(tender_id)
-            return jsonify(plain(_list(ent, get_repo(), tender_id)))
+            return jsonify(_child_view(ent, get_repo(), tender_id))
 
         def saving(tender_id, ent=ent):
             _tender(tender_id)
