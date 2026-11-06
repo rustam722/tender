@@ -267,11 +267,17 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
     # replace -- только при разрешённой замене.
     work = _temp_path(target)
     try:
-        if template.suffix.lower() == ".xlsx":
-            fill_workbook(template, load_cellmap(CELLMAPS_DIR / spec.cellmap),
-                          context, work)
-        else:
-            render_docx(template, context, work)
+        try:
+            if template.suffix.lower() == ".xlsx":
+                fill_workbook(template, load_cellmap(CELLMAPS_DIR / spec.cellmap),
+                              context, work)
+            else:
+                render_docx(template, context, work)
+        except (TemplateError, CellMapError) as exc:
+            # Модули рендера честно называют тот путь, который им дали, то есть
+            # временный. Пользователь такого файла не видел: подменяется только
+            # имя файла, а причина отказа остаётся как есть.
+            raise _Refusal(str(exc).replace(work.name, target.name)) from exc
         try:
             (os.replace if replacing else os.rename)(work, target)
         except OSError as exc:

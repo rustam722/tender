@@ -1290,3 +1290,66 @@ def test_a_folder_named_like_a_temp_file_survives_the_sweep(repo, dirs, tmp_path
     result = build_package(tid, [DECLARATION], out, repo)
     assert result.skipped == []
     assert (lookalike / "внутри.txt").read_text(encoding="utf-8") == "мои данные"
+
+
+# ---- причина отказа называет итоговое имя, а не временное ---------------------
+
+def test_save_failure_of_a_word_document_names_the_final_file_not_the_temp_one(
+        repo, dirs, tmp_path, monkeypatch):
+    import docxtpl
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION],
+                      docs={DECLARATION: DocSpec(prefix="1.")})
+
+    def cannot_save(self, *args, **kwargs):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(docxtpl.DocxTemplate, "save", cannot_save)
+    out = tmp_path / "out"
+    result = build_package(tid, [DECLARATION], out, repo)
+    assert result.written == []
+    document, reason = result.skipped[0]
+    assert document == DECLARATION
+    assert f"1.{DECLARATION}.docx" in reason
+    assert "~pkg-" not in reason
+    # причина из задачи 9 осталась: меняется только имя файла
+    assert "не удалось сохранить" in reason.lower() and "Word" in reason
+    assert names(out) == []
+
+
+def test_save_failure_of_an_excel_form_names_the_final_file_not_the_temp_one(
+        repo, dirs, tmp_path, monkeypatch):
+    import openpyxl.workbook.workbook as workbook_module
+    templates, cellmaps = dirs
+    shutil.copy(REAL_FORM, templates / "forma_tkp_rosneft_murmansk.xlsx")
+    shutil.copy(ROOT / "cellmaps" / "tkp_rosneft_murmansk.json", cellmaps)
+    tid = rosneft_tender(repo)
+
+    def cannot_save(self, filename):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(workbook_module.Workbook, "save", cannot_save)
+    result = build_package(tid, [TKP], tmp_path / "out", repo)
+    document, reason = result.skipped[0]
+    assert f"3.{TKP}.xlsx" in reason
+    assert "~pkg-" not in reason
+    assert "другой программе" in reason                  # причина из задачи 10
+
+
+def test_only_the_file_name_is_replaced_in_a_refusal_not_the_whole_text(
+        repo, dirs, tmp_path, monkeypatch):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION])
+
+    def fails(template, context, target):
+        raise package_module.TemplateError(
+            f"Не удалось сохранить «{Path(target).name}»: причина как есть. "
+            "Другой текст не трогать.")
+
+    monkeypatch.setattr(package_module, "render_docx", fails)
+    result = build_package(tid, [DECLARATION], tmp_path / "out", repo)
+    assert result.skipped[0][1] == (
+        f"Не удалось сохранить «{DECLARATION}.docx»: причина как есть. "
+        "Другой текст не трогать.")
