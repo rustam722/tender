@@ -741,3 +741,63 @@ def test_docspec_trims_template_and_cellmap():
     spec = DocSpec(template=" form.xlsx ", cellmap=" form.json ")
     assert (spec.template, spec.cellmap) == ("form.xlsx", "form.json")
     assert DocSpec(template="  ").template == ""
+
+
+# ---- замена позиций лота одной транзакцией -------------------------------------
+
+def lot_names(repo, tender_id):
+    return [(i.position, i.name, i.price) for i in repo.list_lot_items(tender_id)]
+
+
+def test_replace_lot_items_replaces_everything_in_order(repo):
+    tid = make_tender(repo)
+    repo.save_lot_item(LotItem(tender_id=tid, position=1, name="старая"))
+    ids = repo.replace_lot_items(tid, [
+        LotItem(position=1, name="первая", price=Decimal("10.50")),
+        LotItem(position=2, name="вторая", price=Decimal("20"))])
+    assert lot_names(repo, tid) == [(1, "первая", Decimal("10.50")),
+                                    (2, "вторая", Decimal("20"))]
+    assert ids == [i.id for i in repo.list_lot_items(tid)]
+
+
+def test_replace_lot_items_with_empty_list_clears_the_lot(repo):
+    tid = make_tender(repo)
+    repo.save_lot_item(LotItem(tender_id=tid, name="a"))
+    assert repo.replace_lot_items(tid, []) == []
+    assert repo.list_lot_items(tid) == []
+
+
+def test_replace_lot_items_leaves_other_tenders_alone(repo):
+    first, second = make_tender(repo), make_tender(repo)
+    repo.save_lot_item(LotItem(tender_id=second, name="чужая"))
+    repo.replace_lot_items(first, [LotItem(name="своя")])
+    assert [i.name for i in repo.list_lot_items(second)] == ["чужая"]
+
+
+def test_replace_lot_items_ignores_tender_and_id_inside_the_items(repo):
+    first, second = make_tender(repo), make_tender(repo)
+    other = repo.save_lot_item(LotItem(tender_id=second, name="чужая"))
+    repo.replace_lot_items(first, [LotItem(tender_id=second, id=other, name="своя")])
+    assert [i.name for i in repo.list_lot_items(first)] == ["своя"]
+    assert [i.name for i in repo.list_lot_items(second)] == ["чужая"]
+
+
+def test_replace_lot_items_is_all_or_nothing_when_the_seventh_fails(repo):
+    """Обрыв на седьмой позиции не должен оставить шесть: старый список цел."""
+    tid = make_tender(repo)
+    repo.save_lot_item(LotItem(tender_id=tid, position=1, name="прежняя"))
+    items = [LotItem(position=n, name=f"п{n}", price=Decimal(n)) for n in range(1, 11)]
+    items[6] = LotItem(position=7, name="сломанная", price=object())   # не сохранится
+    with pytest.raises(Exception):
+        repo.replace_lot_items(tid, items)
+    assert lot_names(repo, tid) == [(1, "прежняя", Decimal("0"))]
+    assert repo.conn.in_transaction is False
+
+
+def test_replace_lot_items_for_missing_tender_changes_nothing(repo):
+    tid = make_tender(repo)
+    repo.save_lot_item(LotItem(tender_id=tid, name="a"))
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.replace_lot_items(tid + 100, [LotItem(name="x")])
+    assert [i.name for i in repo.list_lot_items(tid)] == ["a"]
+    assert repo.conn.execute("SELECT COUNT(*) FROM lot_item").fetchone()[0] == 1

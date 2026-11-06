@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from app.calc import LaborLine, TargetTooLow, estimate, solve_hours
+from app.calc import LaborLine, TargetTooLow, estimate, price_gap, solve_hours
 from tests.test_calc import ARKTIK, DEFAULTS
 
 MATERIALS = Decimal("41686")
@@ -221,3 +221,95 @@ def test_bound_covers_only_lines_the_solver_can_move():
     assert solved[2].hours == 0          # строку без часов солвер не трогает
     got = total_of(solved)
     assert abs(got - TARGET) <= one_hour_step(lines)
+
+
+# ---- цель «с НДС» и расхождение ------------------------------------------------
+# Экран не считает денег: в JavaScript нет Decimal, любая арифметика на экране --
+# float. Поэтому приведение цели с НДС к цене без НДС и разница «итог - цель»
+# живут здесь, а не на экране.
+
+def solve_vat(target, labor=ARKTIK, materials=MATERIALS, subcontract=SUBCONTRACT,
+              settings=DEFAULTS):
+    return solve_hours(target, labor, materials, subcontract, settings,
+                       target_includes_vat=True)
+
+
+def with_vat(lines, materials=MATERIALS, subcontract=SUBCONTRACT, settings=DEFAULTS):
+    return estimate(lines, materials, subcontract, settings).total_with_vat
+
+
+def test_target_with_vat_reproduces_the_same_hours_as_its_price_without_vat():
+    # 4 000 000 без НДС при 5 % -- ровно 4 200 000 с НДС
+    solved = solve_vat(Decimal("4200000"))
+    assert [x.hours for x in solved] == [Decimal("1200"), Decimal("360")]
+    assert with_vat(solved) == Decimal("4200000.00")
+
+
+def test_flag_defaults_to_without_vat_and_keeps_the_old_signature():
+    assert solve_hours(TARGET, ARKTIK, MATERIALS, SUBCONTRACT, DEFAULTS) == solve()
+    assert solve_hours(TARGET, ARKTIK, MATERIALS, SUBCONTRACT, DEFAULTS,
+                       target_includes_vat=False) == solve()
+
+
+def test_with_vat_target_is_never_worse_than_dividing_the_target_by_one_plus_vat():
+    # Доводка меряет расхождение там, где его видит заказчик, -- по итогу с НДС.
+    # Деление цели на 1,05 и решение «без НДС» -- нижняя планка: на целых рублях
+    # и пяти процентах оба выбора совпадают, но не должны быть лучше.
+    for target in range(2_100_000, 6_000_000, 9_973):
+        target = Decimal(target)
+        by_vat = abs(with_vat(solve_vat(target)) - target)
+        by_division = abs(with_vat(solve(target / Decimal("1.05"))) - target)
+        assert by_vat <= by_division, target
+
+
+def test_with_vat_residual_stays_within_one_hour_with_vat():
+    step = one_hour_step(ARKTIK) * Decimal("1.05")
+    for target in range(2_100_000, 6_000_000, 9_973):
+        target = Decimal(target)
+        assert abs(with_vat(solve_vat(target)) - target) <= step, target
+
+
+def test_with_vat_uses_the_vat_rate_from_settings():
+    from dataclasses import replace
+    twenty = replace(DEFAULTS, vat_rate=Decimal("0.20"))
+    solved = solve_vat(Decimal("4800000"), settings=twenty)     # 4 000 000 * 1,20
+    assert [x.hours for x in solved] == [Decimal("1200"), Decimal("360")]
+    zero = replace(DEFAULTS, vat_rate=Decimal("0"))
+    assert solve_vat(TARGET, settings=zero) == solve(TARGET)    # без НДС цели совпадают
+
+
+def test_with_vat_target_below_fixed_costs_says_so_in_terms_of_vat():
+    with pytest.raises(TargetTooLow) as caught:
+        solve_vat(Decimal("1050000"))
+    text = str(caught.value)
+    assert "неизбежных расходов" in text and "с НДС" in text and "без НДС" in text
+
+
+def test_without_vat_message_is_unchanged():
+    with pytest.raises(TargetTooLow) as caught:
+        solve(Decimal("1000000"))
+    assert "с НДС" not in str(caught.value).replace("без НДС", "")
+
+
+def test_price_gap_is_total_minus_target_signed():
+    solved = solve(GREEDY_TARGET)
+    result = estimate(solved, MATERIALS, SUBCONTRACT, DEFAULTS)
+    assert result.total_wo_vat == Decimal("3912207.00")
+    assert price_gap(GREEDY_TARGET, result) == Decimal("243.00")          # выше цели
+    assert price_gap(Decimal("3912500"), result) == Decimal("-293.00")    # ниже цели
+
+
+def test_price_gap_with_vat_compares_with_vat_total():
+    result = estimate(solve(), MATERIALS, SUBCONTRACT, DEFAULTS)
+    assert result.total_with_vat == Decimal("4200000.00")
+    assert price_gap(Decimal("4200000"), result, target_includes_vat=True) == 0
+    assert price_gap(Decimal("4199999.50"), result, target_includes_vat=True) \
+        == Decimal("0.50")
+    # без признака та же цель сравнивается с итогом без НДС
+    assert price_gap(Decimal("4200000"), result) == Decimal("-200000.00")
+
+
+def test_price_gap_shows_kopecks_even_when_total_is_rounded_to_rubles():
+    # итог без НДС округлён до рублей, цель -- с копейками: разница видна до копейки
+    result = estimate(solve(), MATERIALS, SUBCONTRACT, DEFAULTS)
+    assert price_gap(Decimal("3999999.83"), result) == Decimal("0.17")

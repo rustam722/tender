@@ -304,6 +304,20 @@ class Repo:
     def delete_lot_item(self, id: int) -> None:
         self._delete(_LOT_ITEM, id)
 
+    def replace_lot_items(self, tender_id: int, items: list[LotItem]) -> list[int]:
+        """Заменяет все позиции тендера списком items -- одной транзакцией.
+
+        Либо старый список остаётся целым, либо на его месте стоит весь новый:
+        обрыв на седьмой позиции из одиннадцати не оставит шесть. Порядок и
+        номера -- как в items (position); id и tender_id внутри позиций
+        игнорируются: id назначаются заново (SQLite может выдать прежние номера), тендер -- тот, что в аргументе.
+        Нет такого тендера -- sqlite3.IntegrityError (внешний ключ), ничего
+        не изменено. Возвращает id новых позиций в порядке items."""
+        with self.conn:
+            self.conn.execute("DELETE FROM lot_item WHERE tender_id = ?", (tender_id,))
+            return [self._upsert(_LOT_ITEM, replace(item, tender_id=tender_id, id=None), None)
+                    for item in items]
+
     # ---- трудозатраты тендера --------------------------------------------
 
     def save_tender_labor(self, row: TenderLaborRow) -> int:

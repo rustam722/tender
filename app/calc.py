@@ -84,13 +84,39 @@ def _rub(value: Decimal) -> str:
     return f"{_money(value):,.2f}".replace(",", " ")
 
 
-def solve_hours(target_wo_vat: Decimal, labor: list[LaborLine], materials: Decimal,
-                subcontract: Decimal, settings: OrgSettings) -> list[LaborLine]:
-    """Подбирает часы так, чтобы цена без НДС была как можно ближе к цели.
+def price_gap(target: Decimal, result: Estimate, target_includes_vat: bool = False) -> Decimal:
+    """Расхождение итога с целевой ценой: итог минус цель, в рублях с копейками.
+
+    Положительное -- итог выше цели, отрицательное -- ниже. Сравнивается тот итог,
+    к которому относится цель: с НДС при target_includes_vat, иначе без НДС.
+    Итог берётся из расчёта, а не из сложения статей: итог без НДС округлён до
+    рублей и может отличаться от суммы напечатанных статей (на данных Арктикгаза --
+    на 17 копеек).
+
+    Живёт здесь, а не на экране: в JavaScript нет Decimal, и вычитание денег
+    там -- это float."""
+    total = result.total_with_vat if target_includes_vat else result.total_wo_vat
+    return _money(total - target)
+
+
+def solve_hours(target: Decimal, labor: list[LaborLine], materials: Decimal,
+                subcontract: Decimal, settings: OrgSettings, *,
+                target_includes_vat: bool = False) -> list[LaborLine]:
+    """Подбирает часы так, чтобы итог был как можно ближе к цели.
+
+    target_includes_vat=False (по умолчанию) -- цель есть цена без НДС;
+    True -- цель есть цена с НДС по ставке settings.vat_rate. Приведение цели
+    с НДС к цене без НДС делается здесь, а не на экране (там нет Decimal).
+    Стартовые часы берутся из цены без НДС = цель / (1 + ставка), а доводка
+    меряет расхождение там, где цель задана, то есть по итогу с НДС. При
+    целых рублях итога и ставке в целых процентах обе меры дают тот же выбор
+    (итог с НДС пропорционален итогу без НДС); различия возможны лишь на
+    границе копейки при дробных ставках или округлении итога до копеек.
 
     Ставки, проценты, материалы и субподряд не трогаются. Один множитель k
     на все строки (замкнутая форма), часы -- целые; затем жадная доводка.
     Исходные строки не меняются, возвращаются новые."""
+    target_wo_vat = target / (1 + settings.vat_rate) if target_includes_vat else target
     fot0 = sum((Decimal(x.headcount) * x.hours * x.rate for x in labor),
                Decimal("0"))
     # a: сколько рублей итога до прибыли дают ФОТ со всеми надбавками.
@@ -104,8 +130,10 @@ def solve_hours(target_wo_vat: Decimal, labor: list[LaborLine], materials: Decim
     k = ((target_wo_vat - materials) / (1 + settings.profit_rate) - subcontract) / a
     if k <= 0:
         fixed = materials + subcontract * (1 + settings.profit_rate)
+        price = (f"{_rub(target)} руб. с НДС ({_rub(target_wo_vat)} руб. без НДС)"
+                 if target_includes_vat else f"{_rub(target_wo_vat)} руб. без НДС")
         raise TargetTooLow(
-            f"Цена {_rub(target_wo_vat)} руб. без НДС не больше неизбежных расходов "
+            f"Цена {price} не больше неизбежных расходов "
             f"(материалы и субподряд с прибылью — {_rub(fixed)} руб.): на работу "
             "ничего не остаётся. Увеличьте цену или уменьшите материалы и субподряд.")
 
@@ -114,8 +142,8 @@ def solve_hours(target_wo_vat: Decimal, labor: list[LaborLine], materials: Decim
 
     def gap(current: list[Decimal]) -> Decimal:
         lines = [replace(x, hours=h) for x, h in zip(labor, current)]
-        return abs(target_wo_vat - estimate(lines, materials, subcontract,
-                                            settings).total_wo_vat)
+        return abs(price_gap(target, estimate(lines, materials, subcontract, settings),
+                             target_includes_vat))
 
     # Жадная доводка: часы округлены, и шаг сетки итогов -- стоимость часа самой
     # дешёвой строки. Каждый проход берёт ровно один сдвиг на час (строка, знак),

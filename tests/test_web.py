@@ -172,7 +172,7 @@ def test_solve_below_target_gives_400_not_500(client):
     create(client, f"tenders/{tender['id']}/costs", kind="materials", name="Бумага",
            unit="шт.", quantity="1", price="500000")
     body = refused(client.post(f"/api/tenders/{tender['id']}/solve",
-                               json={"target_wo_vat": "100000"}))
+                               json={"target": "100000"}))
     assert "не больше неизбежных расходов" in body["error"]
 
 
@@ -213,7 +213,7 @@ def test_no_traceback_in_any_error_body(client, monkeypatch, caplog):
         client.post("/api/tenders", json={"customer_id": 999}),               # внешний ключ
         client.delete(f"/api/organizations/{tender['customer_id']}"),         # внешний ключ
         client.post(f"/api/tenders/{tid}/solve", json={}),                    # нет цели
-        client.post(f"/api/tenders/{tid}/solve", json={"target_wo_vat": "1"}),  # нет работ
+        client.post(f"/api/tenders/{tid}/solve", json={"target": "1"}),  # нет работ
         client.post(f"/api/tenders/{tid}/build", json={}),                    # нет документов
         client.get("/api/inn/abc"),                                           # плохой ИНН
         client.get("/api/organizations", headers={"Host": "evil.example"}),   # чужой Host
@@ -683,11 +683,11 @@ def test_solve_returns_proposal_and_does_not_save_it(client):
     tender = make_tender(client)
     tid = tender["id"]
     row = add_labor(client, tid)
-    body = ok(client.post(f"/api/tenders/{tid}/solve", json={"target_wo_vat": "300762"}))
+    body = ok(client.post(f"/api/tenders/{tid}/solve", json={"target": "300762"}))
     assert body["labor"][0]["id"] == row["id"]
     assert body["labor"][0]["hours"] == "200"                # вдвое больше -- вдвое дороже
     assert body["estimate"]["total_wo_vat"] == "300762.00"
-    assert body["target_wo_vat"] == "300762"
+    assert body["target"] == "300762" and body["target_includes_vat"] is False
     assert ok(client.get(f"/api/tenders/{tid}/labor"))[0]["hours"] == "100"   # не сохранено
 
 
@@ -695,13 +695,13 @@ def test_solve_refusals(client):
     tender = make_tender(client)
     tid = tender["id"]
     assert "нет трудозатрат" in refused(client.post(
-        f"/api/tenders/{tid}/solve", json={"target_wo_vat": "1000"}))["error"]
+        f"/api/tenders/{tid}/solve", json={"target": "1000"}))["error"]
     body = refused(client.post(f"/api/tenders/{tid}/solve", json={}))
-    assert body["field"] == "target_wo_vat"
-    refused(client.post(f"/api/tenders/{tid}/solve", json={"target_wo_vat": "-5"}))
-    refused(client.post(f"/api/tenders/{tid}/solve", json={"target_wo_vat": "много"}))
-    refused(client.post(f"/api/tenders/{tid}/solve", json={"target_wo_vat": "0"}))
-    refused(client.post(f"/api/tenders/{tid}/solve", json={"target": "1"}))
+    assert body["field"] == "target"
+    refused(client.post(f"/api/tenders/{tid}/solve", json={"target": "-5"}))
+    refused(client.post(f"/api/tenders/{tid}/solve", json={"target": "много"}))
+    refused(client.post(f"/api/tenders/{tid}/solve", json={"target": "0"}))
+    refused(client.post(f"/api/tenders/{tid}/solve", json={"target_wo_vat": "1"}))      # прежнего имени поля больше нет
 
 
 # ---- сборка -------------------------------------------------------------------
@@ -956,3 +956,145 @@ def test_server_binds_to_loopback_only(app):
         assert server.server_address[0] == "127.0.0.1"
     finally:
         server.server_close()
+
+
+# ---- деньги не считаются на экране: цель «с НДС», расхождение, готовые строки ---
+
+NBSP = " "
+
+
+def test_estimate_also_carries_ready_to_show_money_strings(client):
+    tender = make_tender(client)
+    add_labor(client, tender["id"])
+    body = ok(client.post(f"/api/tenders/{tender['id']}/estimate", json={}))
+    assert body["estimate_text"]["total_wo_vat"] == f"150{NBSP}381,00"
+    assert body["estimate_text"]["total_with_vat"] == f"157{NBSP}900,05"
+    assert set(body["estimate_text"]) == set(body["estimate"])
+    assert body["lines_text"]["labor"] == [f"100{NBSP}000,00"]
+    assert "difference" not in body                      # цели нет -- сравнивать не с чем
+
+
+def test_estimate_with_a_target_returns_the_gap_from_the_calculator(client):
+    tender = make_tender(client)
+    add_labor(client, tender["id"])                      # итог без НДС 150 381
+    body = ok(client.post(f"/api/tenders/{tender['id']}/estimate",
+                          json={"target": "150 000,50"}))
+    assert body["difference"] == "380.50"                # итог выше цели
+    assert body["difference_text"] == "380,50"
+    assert body["target_text"] == f"150{NBSP}000,50"
+    assert body["target_includes_vat"] is False
+
+    with_vat = ok(client.post(f"/api/tenders/{tender['id']}/estimate",
+                              json={"target": "158000", "target_includes_vat": True}))
+    assert with_vat["difference"] == "-99.95"            # 157 900,05 - 158 000
+    assert with_vat["difference_text"] == "-99,95"
+    assert with_vat["target_includes_vat"] is True
+
+    refused(client.post(f"/api/tenders/{tender['id']}/estimate", json={"target": "0"}))
+    refused(client.post(f"/api/tenders/{tender['id']}/estimate",
+                        json={"target": "1", "target_includes_vat": "да"}))
+    refused(client.post(f"/api/tenders/{tender['id']}/estimate", json={"target_includes_vat": True}))
+
+
+def test_solve_target_with_vat_and_gap(client):
+    tender = make_tender(client)
+    add_labor(client, tender["id"])
+    url = f"/api/tenders/{tender['id']}/solve"
+    # 200 часов -> итог без НДС 300 762, с НДС 315 800,10
+    exact = ok(client.post(url, json={"target": "315800.10", "target_includes_vat": True}))
+    assert exact["labor"][0]["hours"] == "200"
+    assert exact["estimate"]["total_with_vat"] == "315800.10"
+    assert exact["difference"] == "0.00" and exact["difference_text"] == "0,00"
+    assert exact["target_includes_vat"] is True
+    assert exact["estimate_text"]["total_with_vat"] == f"315{NBSP}800,10"
+    assert exact["labor"][0]["rate_text"] == f"1{NBSP}000,00"
+
+    plain = ok(client.post(url, json={"target": "300762"}))             # без НДС (по умолчанию)
+    assert plain["labor"][0]["hours"] == "200"
+    assert plain["difference"] == "0.00" and plain["target_includes_vat"] is False
+
+    # расхождение приходит из расчёта, а не из сложения статей: итог округлён до рублей
+    off = ok(client.post(url, json={"target": "300761.83"}))
+    est = off["estimate"]
+    from decimal import Decimal as D
+    assert D(off["difference"]) == D(est["total_wo_vat"]) - D("300761.83")
+    assert off["difference"] == "0.17"
+    assert off["difference_text"] == "0,17"
+
+
+def test_solve_takes_target_and_flag_not_the_old_target_wo_vat_field(client):
+    tender = make_tender(client)
+    add_labor(client, tender["id"])
+    body = refused(client.post(f"/api/tenders/{tender['id']}/solve",
+                               json={"target_wo_vat": "300762"}))
+    assert body["field"] == "target_wo_vat"
+    refused(client.post(f"/api/tenders/{tender['id']}/solve",
+                        json={"target": "1", "target_includes_vat": 1}))
+
+
+def test_solve_below_target_with_vat_is_400_in_terms_of_vat(client):
+    tender = make_tender(client)
+    add_labor(client, tender["id"])
+    create(client, f"tenders/{tender['id']}/costs", kind="materials", name="Бумага",
+           unit="шт.", quantity="1", price="500000")
+    body = refused(client.post(f"/api/tenders/{tender['id']}/solve",
+                               json={"target": "100000", "target_includes_vat": True}))
+    assert "с НДС" in body["error"]
+
+
+# ---- замена позиций лота ------------------------------------------------------
+
+def test_put_items_replaces_the_whole_lot_in_one_go(client):
+    tender = make_tender(client)
+    tid = tender["id"]
+    create(client, f"tenders/{tid}/items", position=1, name="старая", price="1")
+    pasted = [{"position": n, "name": f"Позиция {n}", "price": f"{n}00,50"} for n in range(1, 12)]
+    saved = ok(client.put(f"/api/tenders/{tid}/items", json={"items": pasted}))
+    assert [i["name"] for i in saved] == [f"Позиция {n}" for n in range(1, 12)]
+    assert saved[0]["price"] == "100.50" and saved[0]["tender_id"] == tid
+    assert "старая" not in [i["name"] for i in saved]                       # прежняя заменена
+    assert ok(client.get(f"/api/tenders/{tid}/items")) == saved
+
+    # отправленные обратно как есть (с id и tender_id) позиции -- тоже годятся
+    again = ok(client.put(f"/api/tenders/{tid}/items", json={"items": saved}))
+    assert [i["name"] for i in again] == [i["name"] for i in saved]
+
+    assert ok(client.put(f"/api/tenders/{tid}/items", json={"items": []})) == []
+    assert ok(client.get(f"/api/tenders/{tid}/items")) == []
+
+
+def test_put_items_failing_on_the_seventh_changes_nothing(client):
+    tender = make_tender(client)
+    tid = tender["id"]
+    create(client, f"tenders/{tid}/items", position=1, name="прежняя", price="5")
+    pasted = [{"position": n, "name": f"П{n}", "price": "10"} for n in range(1, 12)]
+    pasted[6]["price"] = "много"
+    body = refused(client.put(f"/api/tenders/{tid}/items", json={"items": pasted}))
+    assert body["path"] == ["items", 6, "price"] and body["field"] == "items"
+    assert "Позиция №7" in body["error"] and "Цена" in body["error"]
+    assert [i["name"] for i in ok(client.get(f"/api/tenders/{tid}/items"))] == ["прежняя"]
+
+
+def test_put_items_refusals(client):
+    tender = make_tender(client)
+    other = make_tender(client)
+    url = f"/api/tenders/{tender['id']}/items"
+    refused(client.put("/api/tenders/999/items", json={"items": []}), 404)
+    assert refused(client.put(url, json={}))["field"] == "items"
+    refused(client.put(url, json={"items": "список"}))
+    refused(client.put(url, json={"items": ["строка"]}))
+    refused(client.put(url, json={"items": [{"name": "x"}], "extra": 1}))
+    body = refused(client.put(url, json={"items": [{"nme": "x"}]}))
+    assert body["path"] == ["items", 0, "nme"]
+    body = refused(client.put(url, json={"items": [{"name": "x", "tender_id": other["id"]}]}))
+    assert body["path"] == ["items", 0, "tender_id"]
+    refused(client.put(url, json={"items": [{"name": "x"}] * 2001}))
+    refused(client.put(url, data='{"items": []}', content_type="text/plain"), 415)
+    assert ok(client.get(url)) == []
+
+
+def test_put_is_guarded_like_post(client):
+    tender = make_tender(client)
+    url = f"/api/tenders/{tender['id']}/items"
+    refused(client.put(url, json={"items": []}, headers={"Origin": "http://evil.example"}), 403)
+    refused(client.put(url, json={"items": []}, headers={"Host": "evil.example"}), 403)

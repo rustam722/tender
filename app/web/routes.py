@@ -41,15 +41,15 @@ from urllib.parse import urlsplit
 from flask import current_app, g, jsonify, render_template, request
 
 from app import db
-from app.calc import LaborLine, estimate, solve_hours
+from app.calc import Estimate, LaborLine, estimate, price_gap, solve_hours
 from app.inn.lookup import build_draft
-from app.render.context import build_context
+from app.render.context import build_context, money
 from app.render.package import build_package, planned_files
 from app.repo import Repo
 from app.web import errors, schema
 from app.web.errors import ApiError
 from app.web.schema import (
-    CHILDREN, COSTS, EXPERIENCE, ORGANIZATIONS, PROFILES, SETTINGS, SOLVE, TENDERS, TOP_LEVEL,
+    CHILDREN, COSTS, EXPERIENCE, LOT_ITEMS, ORGANIZATIONS, PROFILES, SETTINGS, SOLVE, TENDERS, TOP_LEVEL,
     Entity, plain,
 )
 
@@ -102,7 +102,7 @@ def _guard():
             parts = urlsplit(origin)
             if parts.scheme != "http" or parts.netloc.lower() != request.host.lower():
                 raise ApiError("Запрос отклонён: он отправлен не со страницы программы.", 403)
-    if request.method == "POST" and not request.is_json:
+    if request.method in ("POST", "PUT", "PATCH") and not request.is_json:
         raise ApiError("Тело запроса должно быть в формате JSON.", 415)
 
 
@@ -328,34 +328,69 @@ def _build(tender_id: int):
 
 # ---- расчёт -------------------------------------------------------------------
 
+def _target(data: dict, required: bool):
+    """Целевая цена и признак «включает НДС» из тела. Приведение цены и разницу
+    считает app.calc; здесь только проверка ввода."""
+    includes_vat = data.get("target_includes_vat", False)
+    if not isinstance(includes_vat, bool):
+        raise ApiError("Поле «Цена включает НДС» должно быть true или false.",
+                       path=["target_includes_vat"])
+    if "target" not in data:
+        if required or includes_vat:
+            raise ApiError("Не указана целевая цена.", path=["target"])
+        return None, False
+    target = schema.decimal_value(data["target"], SOLVE, ["target"])
+    if target == 0:
+        raise ApiError("Поле «Цена»: цена должна быть больше нуля.", path=["target"])
+    return target, includes_vat
+
+
+def _texts(result) -> dict:
+    """Статьи расчёта готовыми строками «5 985 000,00»: экран ничего не
+    форматирует и не считает (в JavaScript нет Decimal)."""
+    values = result if isinstance(result, dict) else vars(result)
+    return {name: money(value) for name, value in values.items()}
+
+
+def _gap_fields(target: Decimal, includes_vat: bool, result: Estimate) -> dict:
+    """Цель и расхождение итога с ней -- числом (строкой Decimal) и готовой
+    строкой. Разницу считает calc.price_gap по итогу расчёта, не по статьям."""
+    gap = price_gap(target, result, includes_vat)
+    return {"target": plain(target), "target_text": money(target),
+            "target_includes_vat": includes_vat,
+            "difference": plain(gap), "difference_text": money(gap)}
+
+
 def _estimate(tender_id: int):
     """Прямой счёт. Берётся из контекста документов, а не считается заново:
     ставка НДС выбирается по цепочке тендер -> организация -> настройки, суммы
     строк округляются так же, как в документе, -- на экране те же цифры, что
     будут напечатаны."""
-    _only(json_body(), (), "прямой счёт")
+    data = json_body()
+    _only(data, ("target", "target_includes_vat"), "прямой счёт")
+    target, includes_vat = _target(data, required=False)
     _tender(tender_id)
     ctx = build_context(tender_id, get_repo())
-    return jsonify({
+    lines = {name: [row["amount_value"] for row in ctx[name]]
+             for name in ("labor", "materials", "subcontract")}
+    body = {
         "vat_rate": plain(ctx["tender"]["vat_rate"]),
         "vat_percent": ctx["tender"]["vat_percent"],
         "estimate": plain(ctx["estimate"]),
-        "lines": {name: [plain(row["amount_value"]) for row in ctx[name]]
-                  for name in ("labor", "materials", "subcontract")}})
+        "estimate_text": _texts(ctx["estimate"]),
+        "lines": plain(lines),
+        "lines_text": {name: [money(v) for v in values] for name, values in lines.items()}}
+    if target is not None:
+        body.update(_gap_fields(target, includes_vat, Estimate(**ctx["estimate"])))
+    return jsonify(body)
 
 
 def _solve(tender_id: int):
     """Подбор часов под цену без НДС. Результат -- предложение: в базе часы не
     меняются, пользователь применяет их сам (POST строк трудозатрат)."""
     data = json_body()
-    _only(data, ("target_wo_vat",), "подбор часов")
-    if "target_wo_vat" not in data:
-        raise ApiError("Не указана цена без НДС, под которую подбирать часы.",
-                       path=["target_wo_vat"])
-    target = schema.decimal_value(data["target_wo_vat"], SOLVE, ["target_wo_vat"])
-    if target == 0:
-        raise ApiError("Поле «Цена без НДС»: цена должна быть больше нуля.",
-                       path=["target_wo_vat"])
+    _only(data, ("target", "target_includes_vat"), "подбор часов")
+    target, includes_vat = _target(data, required=True)
     repo = get_repo()
     _tender(tender_id)
     ctx = build_context(tender_id, repo)
@@ -363,14 +398,61 @@ def _solve(tender_id: int):
     rows = repo.list_tender_labor(tender_id)
     lines = [LaborLine(r.post, r.headcount, r.hours, r.rate) for r in rows]
     materials, subcontract = ctx["estimate"]["materials"], ctx["estimate"]["subcontract"]
-    solved = solve_hours(target, lines, materials, subcontract, settings)
+    solved = solve_hours(target, lines, materials, subcontract, settings,
+                         target_includes_vat=includes_vat)
     result = estimate(solved, materials, subcontract, settings)
-    return jsonify({
-        "target_wo_vat": plain(target),
+    body = {
         "labor": [{"id": row.id, "post": line.post, "headcount": line.headcount,
-                   "hours": plain(line.hours), "rate": plain(line.rate)}
+                   "hours": plain(line.hours), "rate": plain(line.rate),
+                   "rate_text": money(line.rate)}
                   for row, line in zip(rows, solved)],
-        "estimate": plain(result)})
+        "estimate": plain(result),
+        "estimate_text": _texts(result)}
+    body.update(_gap_fields(target, includes_vat, result))
+    return jsonify(body)
+
+
+MAX_LOT_ITEMS = 2000
+
+
+def _replace_items(tender_id: int):
+    """Вставка списка из буфера: все позиции тендера заменяются присланными
+    одной транзакцией. Не прошла проверка хотя бы одной позиции -- ничего не
+    записано, а в ответе путь ["items", номер, поле]. id и tender_id внутри
+    позиций допускаются (список можно отправить обратно как получен) и
+    игнорируются: id назначаются заново, прежние номера строк недействительны."""
+    repo = get_repo()
+    _tender(tender_id)
+    data = json_body()
+    _only(data, ("items",), "замена позиций лота")
+    raw = data.get("items")
+    if not isinstance(raw, list):
+        raise ApiError("Поле «items»: должно быть списком позиций.", path=["items"])
+    if len(raw) > MAX_LOT_ITEMS:
+        raise ApiError(f"Слишком много позиций: не больше {MAX_LOT_ITEMS} за раз.",
+                       path=["items"])
+    items = []
+    for i, row in enumerate(raw):
+        where = ["items", i]
+        if not isinstance(row, dict):
+            raise ApiError(f"Позиция №{i + 1}: должна быть набором полей "
+                           "«наименование, цена, порядок».", path=where)
+        row = dict(row)
+        row.pop("id", None)
+        sent = row.pop("tender_id", None)
+        if sent is not None and sent != tender_id:
+            raise ApiError(f"Позиция №{i + 1}: поле «tender_id» не совпадает с тендером "
+                           "в адресе.", path=where + ["tender_id"])
+        try:
+            items.append(schema.parse_object(LOT_ITEMS, row, None, {"tender_id": tender_id}))
+        except ApiError as exc:
+            raise ApiError(f"Позиция №{i + 1}. {exc.message}", exc.status,
+                           where + list(exc.path or [])) from None
+    try:
+        repo.replace_lot_items(tender_id, items)
+    except sqlite3.IntegrityError as exc:
+        raise errors.translate_integrity(exc, LOT_ITEMS, "save") from exc
+    return jsonify(plain(repo.list_lot_items(tender_id)))
 
 
 def _inn(inn: str):
@@ -406,6 +488,8 @@ def register(app) -> None:
 
     app.add_url_rule("/", "index", lambda: render_template("index.html"))
     app.add_url_rule("/api/inn/<inn>", "inn", _inn, methods=["GET"])
+    app.add_url_rule("/api/tenders/<int:tender_id>/items", "items_replace", _replace_items,
+                     methods=["PUT"])
     app.add_url_rule("/api/settings", "settings_get",
                      lambda: jsonify(plain(get_repo().get_settings())), methods=["GET"])
     app.add_url_rule("/api/settings", "settings_save", _settings_save, methods=["POST"])

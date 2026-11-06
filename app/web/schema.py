@@ -178,7 +178,8 @@ SETTINGS = Entity(
             "total_rounding_digits": "Округление итога"})
 
 # Не справочник: подписи полей запроса подбора часов, чтобы отказ назвал поле.
-SOLVE = Entity("solve", Tender, "Подбор часов", labels={"target_wo_vat": "Цена без НДС"})
+SOLVE = Entity("solve", Tender, "Подбор часов",
+               labels={"target": "Цена", "target_includes_vat": "Цена включает НДС"})
 
 TOP_LEVEL = (ORGANIZATIONS, EMPLOYEES, ASSETS, EXPERIENCE, SERVICES, PROFILES, TENDERS)
 CHILDREN = (LOT_ITEMS, LABOR, COSTS)
