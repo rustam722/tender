@@ -4,6 +4,10 @@
 НДС и округлённые построчные суммы -- app.render.context (поэтому цифры экрана
 совпадают с цифрами в документах), имена файлов и запись -- app.render.package.
 
+Конвенция чисел в ответах -- как в контексте документов: голое имя -- готовая
+строка (money: «5 985 000,00»), <поле>_value -- сырой Decimal строкой; ставки --
+сырая доля под своим именем и <поле>_percent. См. app.web.texts.
+
 Соединение с SQLite -- своё на каждый запрос (см. get_repo). Все ответы --
 JSON, кроме главной страницы; все отказы -- {"error": "<по-русски>"}, см. errors.
 
@@ -189,7 +193,7 @@ def _labor_view(rows) -> list[dict]:
     view = []
     for row, printed in zip(rows, labor_rows(rows)):
         body = present(LABOR, row)
-        body["amount"], body["amount_text"] = plain(printed["amount_value"]), printed["amount"]
+        body["amount"], body["amount_value"] = printed["amount"], plain(printed["amount_value"])
         view.append(body)
     return view
 
@@ -209,17 +213,17 @@ def _child_view(entity: Entity, repo: Repo, tender_id: int) -> dict:
         rows = []
         for item, printed in zip(items, ctx["items"]):
             body = present(entity, item)
-            body["vat"], body["vat_text"] = plain(printed["vat_value"]), printed["vat"]
+            body["vat"], body["vat_value"] = printed["vat"], plain(printed["vat_value"])
             rows.append(body)
         total = money_total(i.price for i in items)
         vat_total = money_total(printed["vat_value"] for printed in ctx["items"])
-        return {"rows": rows, "total": plain(total), "total_text": money(total),
-                "vat_total": plain(vat_total), "vat_total_text": money(vat_total),
+        return {"rows": rows, "total": money(total), "total_value": plain(total),
+                "vat_total": money(vat_total), "vat_total_value": plain(vat_total),
                 "vat_percent": ctx["tender"]["vat_percent"]}
     if entity is LABOR:
         total = ctx["estimate"]["labor"]
         return {"rows": _labor_view(repo.list_tender_labor(tender_id)),
-                "total": plain(total), "total_text": money(total)}
+                "total": money(total), "total_value": plain(total)}
     # материалы и субподряд: строки обеих статей, итоги каждой
     kind = request.args.get("kind")
     if kind is not None and kind not in COSTS.choices["kind"]:
@@ -232,10 +236,10 @@ def _child_view(entity: Entity, repo: Repo, tender_id: int) -> dict:
     for row in repo.list_tender_cost_items(tender_id, kind):
         body = present(entity, row)
         line = printed[row.id]
-        body["amount"], body["amount_text"] = plain(line["amount_value"]), line["amount"]
+        body["amount"], body["amount_value"] = line["amount"], plain(line["amount_value"])
         rows.append(body)
     totals = {name: ctx["estimate"][name] for name in COSTS.choices["kind"]}
-    return {"rows": rows, "totals": plain(totals), "totals_text": texts_of(totals)}
+    return {"rows": rows, "totals": texts_of(totals), "totals_value": plain(totals)}
 
 
 def _list(entity: Entity, repo: Repo):
@@ -404,9 +408,9 @@ def _gap_fields(target: Decimal, includes_vat: bool, result: Estimate) -> dict:
     """Цель и расхождение итога с ней -- числом (строкой Decimal) и готовой
     строкой. Разницу считает calc.price_gap по итогу расчёта, не по статьям."""
     gap = price_gap(target, result, includes_vat)
-    return {"target": plain(target), "target_text": money(target),
+    return {"target": money(target), "target_value": plain(target),
             "target_includes_vat": includes_vat,
-            "difference": plain(gap), "difference_text": money(gap)}
+            "difference": money(gap), "difference_value": plain(gap)}
 
 
 def _estimate(tender_id: int):
@@ -424,10 +428,10 @@ def _estimate(tender_id: int):
     body = {
         "vat_rate": plain(ctx["tender"]["vat_rate"]),
         "vat_percent": ctx["tender"]["vat_percent"],
-        "estimate": plain(ctx["estimate"]),
-        "estimate_text": texts_of(ctx["estimate"]),
-        "lines": plain(lines),
-        "lines_text": {name: [money(v) for v in values] for name, values in lines.items()}}
+        "estimate": texts_of(ctx["estimate"]),
+        "estimate_value": plain(ctx["estimate"]),
+        "lines": {name: [money(v) for v in values] for name, values in lines.items()},
+        "lines_value": plain(lines)}
     if target is not None:
         body.update(_gap_fields(target, includes_vat, Estimate(**ctx["estimate"])))
     return jsonify(body)
@@ -453,8 +457,8 @@ def _solve(tender_id: int):
         # та же форма, что у сохранённых строк ФОТ: с суммой строки
         "labor": _labor_view([replace(row, hours=line.hours)
                               for row, line in zip(rows, solved)]),
-        "estimate": plain(result),
-        "estimate_text": texts_of(result)}
+        "estimate": texts_of(result),
+        "estimate_value": plain(result)}
     body.update(_gap_fields(target, includes_vat, result))
     return jsonify(body)
 

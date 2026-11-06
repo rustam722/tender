@@ -64,8 +64,8 @@ class Entity:
     choices: dict = field(default_factory=dict)
     dates: tuple = ()
     dirs: tuple = ()
-    money: tuple = ()        # денежные поля: в ответе рядом <поле>_text
-    numbers: tuple = ()      # часы и количества: <поле>_text с запятой
+    money: tuple = ()        # денежные поля: голое имя -- готовая строка, <поле>_value -- сырое
+    numbers: tuple = ()      # часы и количества: так же, но число с запятой без разрядов
     percents: tuple = ()     # ставки-доли: <поле>_percent
     in_use: str = ""
     parent: str = ""
@@ -392,15 +392,27 @@ def output_only_keys(entity: Entity) -> set[str]:
     """Ключи, которые ответ добавляет к записи сам (готовые строки и суммы строк).
     Экран может отправить запись обратно целиком, как получил: эти ключи при
     разборе игнорируются. Любые другие неизвестные ключи -- по-прежнему отказ."""
-    keys = {name + "_text" for name in entity.money + entity.numbers}
-    keys |= {name + "_percent" for name in entity.percents}
-    if entity.cls is Service:
-        keys.add("norms_text")
+    keys = {name + "_percent" for name in entity.percents}
     if entity in (LABOR, COSTS):
-        keys |= {"amount", "amount_text"}
+        keys |= {"amount", "amount_value"}
     if entity is LOT_ITEMS:
-        keys |= {"vat", "vat_text"}
+        keys |= {"vat", "vat_value"}
     return keys
+
+
+def prefer_raw_values(entity: Entity, data: dict) -> dict:
+    """Конвенция ответа: голое имя -- готовая строка («1 234,50», округлена до
+    копеек), <поле>_value -- сырое значение. Запись, отправленная обратно целиком,
+    не должна терять точность, поэтому <поле>_value, если оно есть, заменяет голое
+    имя. Без него голое имя читается как введённое руками (запятая и пробелы
+    разбираются)."""
+    data = dict(data)
+    names = entity.money + entity.numbers + (("norms",) if entity.cls is Service else ())
+    for name in names:
+        raw = name + "_value"
+        if raw in data:
+            data[name] = data.pop(raw)
+    return data
 
 
 def parse_object(entity: Entity, data: dict, existing=None, fixed: dict | None = None):
@@ -411,7 +423,7 @@ def parse_object(entity: Entity, data: dict, existing=None, fixed: dict | None =
     names = {f.name for f in fields(entity.cls)} - {"id"} - ({entity.parent} if entity.parent else set())
     values = {}
     skip = output_only_keys(entity)
-    for name, raw in data.items():
+    for name, raw in prefer_raw_values(entity, data).items():
         if name in skip:
             continue
         if name not in names:
