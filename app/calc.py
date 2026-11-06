@@ -91,7 +91,10 @@ class TargetTooLow(ValueError):
 
 
 def _rub(value: Decimal) -> str:
-    return f"{_money(value):,.2f}".replace(",", " ")
+    """«1 823 686,00»: так же, как context.money (неразрывный пробел между разрядами,
+    запятая десятичная). Контекст импортирует calc, поэтому формат повторён здесь;
+    тест test_target_too_low_prints_money_the_way_money_does держит их в согласии."""
+    return f"{_money(value):,.2f}".translate({ord(","): " ", ord("."): ","})
 
 
 def price_gap(target: Decimal, result: Estimate, target_includes_vat: bool = False) -> Decimal:

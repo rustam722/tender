@@ -1146,29 +1146,48 @@ def decimal_field_names() -> set[str]:
 
 
 RATE_FIELDS = {"vat_rate", "insurance_rate", "injury_rate", "overhead_rate", "profit_rate"}
+NUMBER_FIELDS = {"hours", "quantity"}          # не деньги: число с запятой без разрядов
 DECIMAL_FIELDS = (decimal_field_names() - RATE_FIELDS) | {
     "difference", "target", "total", "amount", "vat", "vat_total"}
-NUMERIC = re.compile(r"-?\d+(\.\d+)?")
-TWINNED = {"estimate", "lines", "totals", "norms"}       # словарь или список числовых строк
+TWINNED = {"estimate": "money", "lines": "money", "totals": "money", "norms": "number"}
+
+# Формы строк. Деньги -- всегда «1 234,56» (разряды U+00A0, запятая, две цифры): целая
+# сумма «100» -- нарушение, должно быть «100,00». Сырое -- Decimal через точку, без
+# запятых и пробелов.
+MONEY_FORM = re.compile(r"-?\d{1,3}( \d{3})*,\d{2}")
+NUMBER_FORM = re.compile(r"-?\d+(,\d+)?")
+PERCENT_FORM = re.compile(r"\d+(,\d+)?")
+RAW_FORM = re.compile(r"-?\d+(\.\d+)?")
+FORMS = {"money": MONEY_FORM, "number": NUMBER_FORM}
 
 
-def _looks_raw(text) -> bool:
-    """Сырой Decimal с дробной частью: с точкой. Готовая строка пишется с запятой."""
-    return isinstance(text, str) and NUMERIC.fullmatch(text) is not None and "." in text
-
-
-def _any_raw(value) -> bool:
+def _form_errors(value, kind, where):
+    """Все строки внутри value (словарь, список, строка) должны быть в форме kind."""
     if isinstance(value, dict):
-        return any(_any_raw(v) for v in value.values())
+        return [e for k, v in value.items() for e in _form_errors(v, kind, f"{where}.{k}")]
     if isinstance(value, list):
-        return any(_any_raw(v) for v in value)
-    return _looks_raw(value)
+        return [e for i, v in enumerate(value) for e in _form_errors(v, kind, f"{where}[{i}]")]
+    if not isinstance(value, str) or not FORMS[kind].fullmatch(value):
+        return [f"{where} ({value!r} не в форме {kind})"]
+    return []
+
+
+def _raw_errors(value, where):
+    if isinstance(value, dict):
+        return [e for k, v in value.items() for e in _raw_errors(v, f"{where}.{k}")]
+    if isinstance(value, list):
+        return [e for i, v in enumerate(value) for e in _raw_errors(v, f"{where}[{i}]")]
+    if not isinstance(value, str) or not RAW_FORM.fullmatch(value):
+        return [f"{where} (сырое {value!r} не Decimal через точку)"]
+    return []
 
 
 def convention_violations(value, path=""):
-    """Нарушения конвенции «голое имя -- готовая строка, <поле>_value -- сырое»:
-    денежное поле без пары, голое имя с сырым числом, `<поле>_value` без голого имени,
-    ставка без `_percent` -- всё, что экрану пришлось бы форматировать самому."""
+    """Нарушения конвенции «голое имя -- готовая строка в своей форме, <поле>_value --
+    сырое»: денежное поле без пары; голое имя не в форме «1 234,56» (в том числе
+    целое «100» и сырое «100.00»); `<поле>_value` без голого имени или не сырое;
+    словарь/список без парного `_value`; ставка без `_percent` или проценты не в форме.
+    Всё, что экрану пришлось бы форматировать самому."""
     found = []
     if isinstance(value, list):
         for i, item in enumerate(value):
@@ -1179,6 +1198,11 @@ def convention_violations(value, path=""):
             if key.endswith("_value"):
                 if key[:-len("_value")] not in value:
                     found.append(where + " (нет голого имени)")
+                else:
+                    found += _raw_errors(item, where)
+            elif key.endswith("_percent"):
+                if item is not None and not PERCENT_FORM.fullmatch(str(item)):
+                    found.append(f"{where} ({item!r} не в форме процентов)")
             elif key in RATE_FIELDS:
                 if item is not None and not ({key[:-len("_rate")] + "_percent",
                                               key + "_percent"} & set(value)):
@@ -1188,16 +1212,56 @@ def convention_violations(value, path=""):
                 if type(raw) is not type(item) or len(raw) != len(item) or (
                         isinstance(item, dict) and set(raw) != set(item)):
                     found.append(where + " (нет пары " + key + "_value)")
-                elif _any_raw(item):
-                    found.append(where + " (голое имя несёт сырые числа)")
+                else:
+                    found += _form_errors(item, TWINNED[key], where)
             elif key in DECIMAL_FIELDS and isinstance(item, str):
                 if key + "_value" not in value:
                     found.append(where + " (нет " + key + "_value)")
-                elif _looks_raw(item):
-                    found.append(where + " (голое имя несёт сырое число)")
+                else:
+                    kind = "number" if key in NUMBER_FIELDS else "money"
+                    found += _form_errors(item, kind, where)
             else:
                 found += convention_violations(item, where)
     return found
+
+
+GOOD_ROW = {"hourly_rate": f"1{NBSP}000,00", "hourly_rate_value": "1000",
+            "hours": "100", "hours_value": "100",
+            "vat_rate": "0.05", "vat_rate_percent": "5",
+            "estimate": {"labor": f"1{NBSP}000,00"}, "estimate_value": {"labor": "1000.00"},
+            "norms": {"И": "12,5"}, "norms_value": {"И": "12.5"}}
+
+BAD_ROWS = {
+    "денежное поле без пары _value": {"hourly_rate": f"1{NBSP}000,00"},
+    "голое имя несёт сырое с точкой": {"hourly_rate": "1000.00", "hourly_rate_value": "1000.00"},
+    "целая сумма без копеек": {"hourly_rate": "100", "hourly_rate_value": "100"},
+    "сумма без запятой и разрядов": {"hourly_rate": "1000,0", "hourly_rate_value": "1000"},
+    "_value без голого имени": {"hourly_rate_value": "1000.00"},
+    "_value не сырое (с запятой)": {"hourly_rate": f"1{NBSP}000,00", "hourly_rate_value": "1 000,00"},
+    "словарь без парного _value": {"estimate": {"labor": f"1{NBSP}000,00"}},
+    "словарь с сырым под голым именем": {"estimate": {"labor": "1000.00"},
+                                         "estimate_value": {"labor": "1000.00"}},
+    "словарь с целой суммой": {"estimate": {"labor": "1000"}, "estimate_value": {"labor": "1000"}},
+    "список сумм с сырым": {"lines": {"labor": ["1000.00"]}, "lines_value": {"labor": ["1000.00"]}},
+    "нормы с точкой": {"norms": {"И": "12.5"}, "norms_value": {"И": "12.5"}},
+    "часы с точкой": {"hours": "12.5", "hours_value": "12.5"},
+    "ставка без _percent": {"vat_rate": "0.05"},
+    "проценты с точкой": {"vat_rate": "0.05", "vat_rate_percent": "5.0"},
+    "нарушение внутри вложенного списка": {"rows": [GOOD_ROW, {"hourly_rate": "100",
+                                                                "hourly_rate_value": "100"}]},
+}
+
+
+def test_the_guard_accepts_a_correct_record():
+    assert convention_violations(GOOD_ROW) == []
+    assert convention_violations({"rows": [GOOD_ROW, GOOD_ROW]}) == []
+
+
+@pytest.mark.parametrize("name", list(BAD_ROWS))
+def test_the_guard_catches_every_form_of_violation(name):
+    """Отрицательный самотест: страж, не падающий на нарочно испорченной записи,
+    хуже отсутствующего."""
+    assert convention_violations(BAD_ROWS[name]), name
 
 
 def test_scalar_money_and_percent_fields_have_ready_strings(client):
@@ -1455,3 +1519,110 @@ def test_value_key_wins_over_the_ready_string_on_input(client):
     assert emp["hourly_rate_value"] == "99.999"
     back = ok(client.post("/api/employees", json=emp))
     assert back["hourly_rate_value"] == "99.999"
+
+
+# ---- приём записи обратно: что побеждает, голое имя или <поле>_value ------------
+
+def test_an_edited_ready_string_wins_over_a_stale_value_key(client):
+    """Экран показал «10,01», человек ввёл «20», обратно ушла вся запись со старым
+    price_value «10.005»: правка не должна исчезнуть молча. Побеждает голое имя,
+    если оно уже не равно money(<поле>_value); равно -- человек его не трогал."""
+    tender = make_tender(client)
+    url = f"/api/tenders/{tender['id']}/items"
+    item = create(client, f"tenders/{tender['id']}/items", name="x", price="10.005")
+    assert item["price"] == "10,01" and item["price_value"] == "10.005"
+    edited = ok(client.post(url, json={**item, "price": "20"}))
+    assert edited["price_value"] == "20" and edited["price"] == "20,00"
+    # не тронул -- сырое сохраняет точность
+    assert ok(client.post(url, json={**item, "id": item["id"]}))["price_value"] == "10.005"
+    # ввёл то же число иначе записанное -- это правка: побеждает введённое
+    assert ok(client.post(url, json={**item, "price": "10.01"}))["price_value"] == "10.01"
+
+
+def test_stale_value_key_does_not_swallow_edits_of_hours_and_norms(client):
+    tender = make_tender(client)
+    row = add_labor(client, tender["id"], hours="12.5")
+    assert ok(client.post(f"/api/tenders/{tender['id']}/labor",
+                          json={**row, "hours": "40"}))["hours_value"] == "40"
+    service = create(client, "services", code="КЭР", norms={"И": "12.5", "Д": "3.125"})
+    assert service["norms"] == {"И": "12,5", "Д": "3,125"}
+    edited = ok(client.post("/api/services",
+                            json={**service, "norms": {"И": "20", "Д": service["norms"]["Д"]}}))
+    # правка одной должности не стирается, нетронутая сохраняет сырое значение
+    assert edited["norms_value"] == {"И": "20", "Д": "3.125"}
+
+
+# ---- проценты принимаются на входе и переводятся на сервере --------------------
+
+def test_percent_is_accepted_back_and_converted_to_a_rate_on_the_server(client):
+    org = create(client, "organizations", role="customer", vat_rate="0.055")
+    assert org["vat_rate_percent"] == "5,5"
+    url = "/api/organizations"
+    # экран показал «5,5», человек ввёл «20»; сырая доля пришла со старым значением
+    changed = ok(client.post(url, json={**org, "vat_rate_percent": "20"}))
+    assert changed["vat_rate"] == "0.20" and changed["vat_rate_percent"] == "20"
+    # 0,7 % -- точно 0.007, а не 0.007000000000000001 браузера
+    small = ok(client.post(url, json={"id": org["id"], "vat_rate_percent": "0,7"}))
+    assert small["vat_rate"] == "0.007" and small["vat_rate_percent"] == "0,7"
+    # не тронул: эхо всей записи сохраняет точное сырое значение
+    other = create(client, "organizations", role="customer", vat_rate="0.0555")
+    assert other["vat_rate_percent"] == "5,55"
+    assert ok(client.post(url, json=other))["vat_rate"] == "0.0555"
+    # пустой процент -- ставка не задана
+    assert ok(client.post(url, json={"id": org["id"], "vat_rate_percent": ""}))["vat_rate"] is None
+
+
+def test_percent_has_the_same_limits_as_a_raw_rate(client):
+    tender = make_tender(client)
+    assert ok(client.post("/api/tenders", json={"id": tender["id"],
+                                                "vat_rate_percent": "20"}))["vat_rate"] == "0.20"
+    body = refused(client.post("/api/tenders", json={"id": tender["id"],
+                                                     "vat_rate_percent": "101"}))
+    assert body["path"] == ["vat_rate_percent"] and "от 0 до 100" in body["error"]
+    assert "(проценты)" in body["error"]
+    refused(client.post("/api/tenders", json={"id": tender["id"], "vat_rate_percent": "-1"}))
+    refused(client.post("/api/tenders", json={"id": tender["id"], "vat_rate_percent": "много"}))
+    refused(client.post("/api/tenders", json={"id": tender["id"], "vat_rate_percent": True}))
+    settings = ok(client.post("/api/settings", json={"vat_rate_percent": "6",
+                                                     "insurance_rate_percent": "30,2"}))
+    assert settings["vat_rate"] == "0.06" and settings["insurance_rate"] == "0.302"
+    refused(client.post("/api/settings", json={"vat_rate_percent": ""}))       # ставка обязательна
+    assert ok(client.get("/api/settings"))["vat_rate"] == "0.06"
+
+
+def test_percent_wins_over_a_stale_raw_rate_when_both_differ(client):
+    org = create(client, "organizations", role="customer", vat_rate="0.05")
+    sent = ok(client.post("/api/organizations", json={**org, "vat_rate": "0.05",
+                                                      "vat_rate_percent": "7"}))
+    assert sent["vat_rate"] == "0.07"
+
+
+# ---- сохранение не отвечает ошибкой после фиксации -----------------------------
+
+def test_kind_in_the_query_of_a_post_does_not_break_a_saved_row(client):
+    tender = make_tender(client)
+    url = f"/api/tenders/{tender['id']}/costs?kind=subcontract"
+    row = ok(client.post(url, json={"kind": "materials", "name": "Бумага", "price": "5"}), 201)
+    assert row["kind"] == "materials" and row["amount_value"] == "5.00"
+    assert len(ok(client.get(f"/api/tenders/{tender['id']}/costs"))["rows"]) == 1
+
+
+def test_failed_view_after_a_committed_write_is_success_with_a_warning(client, monkeypatch):
+    tender = make_tender(client)
+    tid = tender["id"]
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("секрет: C:\\Users\\x")
+
+    monkeypatch.setattr(routes_module, "build_context", broken)
+    response = client.post(f"/api/tenders/{tid}/labor", json={"post": "Инженер", "hours": "10",
+                                                              "rate": "100"})
+    body = ok(response, 201)
+    assert body["post"] == "Инженер" and "Запись сохранена" in body["warning"]
+    assert "секрет" not in response.get_data(as_text=True)
+    replaced = ok(client.put(f"/api/tenders/{tid}/items", json={"items": [
+        {"name": "а", "price": "1"}, {"name": "б", "price": "2"}]}))
+    assert "Запись сохранена" in replaced["warning"] and len(replaced["rows"]) == 2
+    monkeypatch.undo()
+    assert len(ok(client.get(f"/api/tenders/{tid}/labor"))["rows"]) == 1      # без дубля
+    assert len(ok(client.get(f"/api/tenders/{tid}/items"))["rows"]) == 2

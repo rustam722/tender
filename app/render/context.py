@@ -152,6 +152,13 @@ def percent(rate: Decimal) -> str:
     return format((rate * 100).normalize(), "f").replace(".", ",")
 
 
+def rate_from_percent(value: Decimal) -> Decimal:
+    """Обратное к percent: проценты -> ставка-доля, 20 -> 0.20, 0.7 -> 0.007.
+    Сдвиг порядка, а не деление: результат точен (в JavaScript 0.7 / 100 даёт
+    0.007000000000000001, а Decimal.scaleb -- ровно 0.007)."""
+    return value.scaleb(-2)
+
+
 def number_ru(value: Decimal) -> str:
     """Не деньги -- часы и количества: 12.50 -> «12,5», 360 -> «360». Запятая
     десятичная, разрядов нет."""

@@ -198,7 +198,7 @@ def _labor_view(rows) -> list[dict]:
     return view
 
 
-def _child_view(entity: Entity, repo: Repo, tender_id: int) -> dict:
+def _child_view(entity: Entity, repo: Repo, tender_id: int, kind: str | None = None) -> dict:
     """Строки тендера (позиции лота, ФОТ, материалы и субподряд) и итог под ними.
 
     Суммы строк и итоги -- не наши: суммы ФОТ и материалов берутся из контекста
@@ -225,7 +225,6 @@ def _child_view(entity: Entity, repo: Repo, tender_id: int) -> dict:
         return {"rows": _labor_view(repo.list_tender_labor(tender_id)),
                 "total": money(total), "total_value": plain(total)}
     # материалы и субподряд: строки обеих статей, итоги каждой
-    kind = request.args.get("kind")
     if kind is not None and kind not in COSTS.choices["kind"]:
         raise ApiError("Параметр «kind»: допустимо materials или subcontract.", path=["kind"])
     printed = {}
@@ -284,11 +283,26 @@ def _save(entity: Entity, tender_id: int | None = None):
     if tender_id is None:
         body = present(entity, saved)
     else:       # у строки есть сумма или НДС: их знает только расчёт
-        body = next(row for row in _child_view(entity, repo, tender_id)["rows"]
-                    if row["id"] == saved.id)
+        body = _row_after_write(entity, repo, saved, tender_id)
     response = jsonify(body)
     response.status_code = 200 if existing is not None else 201
     return response
+
+
+WRITTEN_BUT_NOT_RECALCULATED = ("Запись сохранена, но пересчитать суммы не удалось. "
+                                "Обновите страницу, чтобы увидеть их.")
+
+
+def _row_after_write(entity: Entity, repo: Repo, saved, tender_id: int) -> dict:
+    """Ответ на сохранение строки тендера. Запись уже зафиксирована, поэтому сбой при
+    построении вида (суммы считает контекст документов) -- не ошибка запроса: иначе
+    человек повторит сохранение и получит дубль. Отвечаем успехом с предупреждением."""
+    try:
+        return next(row for row in _child_view(entity, repo, tender_id)["rows"]
+                    if row["id"] == saved.id)
+    except Exception:
+        current_app.logger.exception("Не удалось построить вид сохранённой строки")
+        return {**present(entity, saved), "warning": WRITTEN_BUT_NOT_RECALCULATED}
 
 
 def _delete(entity: Entity, row_id: int, tender_id: int | None = None):
@@ -503,7 +517,12 @@ def _replace_items(tender_id: int):
         repo.replace_lot_items(tender_id, items)
     except sqlite3.IntegrityError as exc:
         raise errors.translate_integrity(exc, LOT_ITEMS, "save") from exc
-    return jsonify(_child_view(LOT_ITEMS, repo, tender_id))
+    try:
+        return jsonify(_child_view(LOT_ITEMS, repo, tender_id))
+    except Exception:       # список уже заменён: отвечаем успехом, а не ошибкой
+        current_app.logger.exception("Не удалось построить вид заменённого списка")
+        return jsonify({"rows": [present(LOT_ITEMS, i) for i in repo.list_lot_items(tender_id)],
+                        "warning": WRITTEN_BUT_NOT_RECALCULATED})
 
 
 def _inn(inn: str):
@@ -565,7 +584,7 @@ def register(app) -> None:
 
         def listing(tender_id, ent=ent):
             _tender(tender_id)
-            return jsonify(_child_view(ent, get_repo(), tender_id))
+            return jsonify(_child_view(ent, get_repo(), tender_id, request.args.get("kind")))
 
         def saving(tender_id, ent=ent):
             _tender(tender_id)

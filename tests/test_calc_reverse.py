@@ -313,3 +313,20 @@ def test_price_gap_shows_kopecks_even_when_total_is_rounded_to_rubles():
     # итог без НДС округлён до рублей, цель -- с копейками: разница видна до копейки
     result = estimate(solve(), MATERIALS, SUBCONTRACT, DEFAULTS)
     assert price_gap(Decimal("3999999.83"), result) == Decimal("0.17")
+
+
+def test_target_too_low_prints_money_the_way_money_does():
+    # «1 823 686,00 руб.», а не «1 823 686.00» с точкой и обычным пробелом
+    import re
+    from app.render.context import money
+    with pytest.raises(TargetTooLow) as plain:
+        solve(Decimal("1000000"))
+    text = str(plain.value)
+    assert money(Decimal("1000000")) in text
+    assert money(MATERIALS + SUBCONTRACT * PROFIT_MARKUP) in text
+    assert not re.search(r"\d\.\d", text) and not re.search(r"\d \d", text)
+    with pytest.raises(TargetTooLow) as with_vat:
+        solve_vat(Decimal("1050000"))
+    text = str(with_vat.value)
+    assert money(Decimal("1050000")) in text and money(Decimal("1000000")) in text
+    assert not re.search(r"\d\.\d", text) and not re.search(r"\d \d", text)

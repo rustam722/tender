@@ -25,6 +25,7 @@ from app.models import (
     Asset, CustomerProfile, DocSpec, Employee, ExperienceRecord, LotItem, Organization,
     OrgSettings, Service, Tender, TenderCostItem, TenderLaborRow,
 )
+from app.render.context import money, number_ru, rate_from_percent
 from app.web.errors import ApiError
 
 MAX_DECIMAL = Decimal(10) ** 12      # триллион: правдоподобный предел для денег и часов
@@ -207,12 +208,20 @@ _ROUNDING_RANGE = (-9, 2)        # знаков после запятой; 0 -- 
 
 # ---- разбор значений ----------------------------------------------------------
 
+def _label(entity: Entity, key: str) -> str:
+    """Подпись поля; у производных ключей ответа -- с пояснением."""
+    for suffix, note in (("_percent", "проценты"), ("_value", "сырое значение")):
+        if key.endswith(suffix) and key[:-len(suffix)] in entity.labels:
+            return f"{entity.labels[key[:-len(suffix)]]} ({note})"
+    return entity.labels.get(key, key)
+
+
 def _where(entity: Entity, path: list) -> str:
     """«Поле «Описание документов» → «Справка о МТР» → «Раскладка»»."""
     parts = []
     for i, step in enumerate(path):
         if i == 0:
-            parts.append(f"«{entity.labels.get(step, step)}»")
+            parts.append(f"«{_label(entity, step)}»")
         elif isinstance(step, int):
             parts.append(f"№{step + 1}")
         elif i == 2 and path[0] == "docs":
@@ -400,18 +409,62 @@ def output_only_keys(entity: Entity) -> set[str]:
     return keys
 
 
+def _untouched(text, raw, entity, key, fmt) -> bool:
+    """Голое имя по-прежнему равно готовой строке сырого значения: пользователь его
+    не трогал."""
+    return text == fmt(decimal_value(raw, entity, [key]))
+
+
 def prefer_raw_values(entity: Entity, data: dict) -> dict:
-    """Конвенция ответа: голое имя -- готовая строка («1 234,50», округлена до
-    копеек), <поле>_value -- сырое значение. Запись, отправленная обратно целиком,
-    не должна терять точность, поэтому <поле>_value, если оно есть, заменяет голое
-    имя. Без него голое имя читается как введённое руками (запятая и пробелы
-    разбираются)."""
+    """Приём записи, отправленной обратно целиком.
+
+    Конвенция ответа: голое имя -- готовая строка («1 234,50», округлена до копеек),
+    <поле>_value -- сырое значение. Что принять, решает сервер, экрану не нужно
+    помнить, какое поле тронули: если голое имя по-прежнему равно готовой строке
+    от <поле>_value, его не трогали -- берётся сырое (точность сохраняется); если
+    отличается -- пользователь ввёл своё, берётся голое (правка не пропадает).
+    Без <поле>_value голое имя читается как введённое руками (запятая и пробелы
+    разбираются).
+
+    Проценты: <поле>_percent переводится в долю здесь же (rate_from_percent) и
+    проверяется теми же пределами, что сырая ставка. Совпадает с сырой ставкой --
+    её не трогали; различаются -- побеждают проценты (их видит пользователь)."""
     data = dict(data)
-    names = entity.money + entity.numbers + (("norms",) if entity.cls is Service else ())
-    for name in names:
-        raw = name + "_value"
-        if raw in data:
-            data[name] = data.pop(raw)
+    for names, fmt in ((entity.money, money), (entity.numbers, number_ru)):
+        for name in names:
+            key = name + "_value"
+            if key not in data:
+                continue
+            raw = data.pop(key)
+            if name not in data or _untouched(data[name], raw, entity, key, fmt):
+                data[name] = raw
+    if entity.cls is Service and "norms_value" in data:
+        raw, bare = data.pop("norms_value"), data.get("norms")
+        if not isinstance(bare, dict) or not isinstance(raw, dict):
+            data.setdefault("norms", raw)
+        else:       # по должностям: нетронутая сохраняет сырое, исправленная остаётся
+            data["norms"] = {
+                post: (raw[post] if post in raw and _untouched(
+                    text, raw[post], entity, "norms_value", number_ru) else text)
+                for post, text in bare.items()}
+    for name in entity.percents:
+        key = name + "_percent"
+        if key not in data:
+            continue
+        value = data.pop(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            data[name] = None
+            continue
+        percent = decimal_value(value, entity, [key])
+        if percent > 100:
+            fail(entity, [key], "ставка в процентах -- от 0 до 100.")
+        rate = rate_from_percent(percent)
+        try:
+            same = name in data and decimal_value(data[name], entity, [name]) == rate
+        except ApiError:
+            same = False            # сырая ставка негодна -- поправка в процентах
+        if not same:
+            data[name] = rate
     return data
 
 
