@@ -34,7 +34,7 @@ def test_fresh_database_has_docs_and_no_old_profile_columns(conn):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(customer_profile)")}
     assert "docs" in cols
     assert not {"layouts", "file_prefixes"} & cols
-    assert db.SCHEMA_VERSION == 5
+    assert db.SCHEMA_VERSION == 6
 
 
 def test_foreign_keys_are_enforced(conn):

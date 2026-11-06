@@ -226,6 +226,17 @@ _MIGRATIONS = [
     PRAGMA user_version = 5;  -- номер этой миграции: при копировании сменить
     COMMIT;
     """,
+    # 6: услуга тендера. Раньше экран угадывал её по тексту предмета закупки и мог
+    # молча подставить чужие нормы часов; теперь она -- поле тендера. Услугу
+    # удалили -- у тендера она пуста (SET NULL), а не тендер удалён или заблокирован.
+    # Уже сохранённые тендеры получают «услуга не выбрана».
+    """
+    BEGIN;
+    ALTER TABLE tender
+        ADD COLUMN service_id INTEGER REFERENCES service (id) ON DELETE SET NULL;
+    PRAGMA user_version = 6;  -- номер этой миграции: при копировании сменить
+    COMMIT;
+    """,
 ]
 
 SCHEMA_VERSION = len(_MIGRATIONS)

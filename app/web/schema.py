@@ -156,10 +156,12 @@ TENDERS = Entity(
             "vat_rate": "Ставка НДС", "deadline": "Сроки исполнения",
             "payment_terms": "Условия оплаты", "doc_date": "Дата документов",
             "platform": "Площадка", "output_dir": "Папка пакета",
-            "deal_answers": "Ответы по условиям сделки", "experience_ids": "Отбор опыта"},
+            "deal_answers": "Ответы по условиям сделки", "experience_ids": "Отбор опыта",
+            "service_id": "Услуга"},
     save="save_tender", get="get_tender", list_="list_tenders", delete="delete_tender",
     refs={"customer_id": ("Заказчик", "get_organization"),
-          "participant_id": ("Участник", "get_organization")},
+          "participant_id": ("Участник", "get_organization"),
+          "service_id": ("Услуга", "get_service")},
     dates=("purchase_date", "doc_date"), dirs=("output_dir",),
     money=("price_wo_vat",), percents=("vat_rate",))
 

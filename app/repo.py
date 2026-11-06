@@ -330,6 +330,19 @@ class Repo:
     def delete_tender_labor(self, id: int) -> None:
         self._delete(_TENDER_LABOR, id)
 
+    def replace_tender_labor(self, tender_id: int,
+                             rows: list[TenderLaborRow]) -> list[int]:
+        """Заменяет все строки трудозатрат тендера списком rows -- одной
+        транзакцией, как replace_lot_items. Применение подобранных часов пишет
+        сразу весь ФОТ: обрыв посередине не должен оставить половину старых часов
+        и половину новых, из которых уже посчитан показанный итог. id и tender_id
+        внутри строк игнорируются (id назначаются заново); нет такого тендера --
+        sqlite3.IntegrityError, старый список цел. Возвращает id новых строк."""
+        with self.conn:
+            self.conn.execute("DELETE FROM tender_labor WHERE tender_id = ?", (tender_id,))
+            return [self._upsert(_TENDER_LABOR, replace(row, tender_id=tender_id, id=None), None)
+                    for row in rows]
+
     # ---- материалы и субподряд тендера -----------------------------------
 
     def save_tender_cost_item(self, item: TenderCostItem) -> int:

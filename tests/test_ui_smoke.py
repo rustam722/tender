@@ -113,7 +113,7 @@ def test_every_visible_string_is_russian():
     единой кириллицы считается английской фразой, если эти слова не названия
     CSS-классов: списки классов вроде «card inline» -- не текст для человека.)"""
     html = (BASE_DIR / "app" / "web" / "templates" / "index.html").read_text(encoding="utf-8")
-    html = re.sub(r"(?s)<(script|style).*?</>", "", html)
+    html = re.sub(r"(?s)<(script|style)\b.*?</\1>", "", html)
     assert not re.search(r"[A-Za-z]{3,}", re.sub(r"<[^>]+>", " ", html))
     css = (STATIC / "app.css").read_text(encoding="utf-8")
     technical = set(re.findall(r"\.([A-Za-z][\w-]*)", css)) | {"use", "strict"}

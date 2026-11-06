@@ -20,6 +20,8 @@ JSON, кроме главной страницы; все отказы -- {"error
     POST   /api/<справочник>                создать; с "id" в теле -- изменить
     DELETE /api/<справочник>/<id>           удалить
         справочники: organizations employees assets experience services profiles tenders
+    GET    /api/documents                   канонические имена документов пакета
+    PUT    /api/tenders/<id>/items|labor    замена всего списка одной транзакцией
     GET/POST /api/settings                  настройки калькуляции
     GET/POST/DELETE /api/tenders/<id>/items|labor|costs[/<row_id>]
                                             позиции лота, трудозатраты, материалы и
@@ -47,7 +49,7 @@ from flask import current_app, g, jsonify, render_template, request
 from app import db
 from app.calc import Estimate, LaborLine, estimate, money_total, price_gap, solve_hours
 from app.inn.lookup import build_draft
-from app.render.context import build_context, labor_rows, money
+from app.render.context import DOCUMENTS, build_context, labor_rows, money
 from app.render.package import build_package, planned_files
 from app.repo import Repo
 from app.web import errors, schema
@@ -472,7 +474,10 @@ def _solve(tender_id: int):
         "labor": _labor_view([replace(row, hours=line.hours)
                               for row, line in zip(rows, solved)]),
         "estimate": texts_of(result),
-        "estimate_value": plain(result)}
+        "estimate_value": plain(result),
+        # ставка, по которой считан подбор: экран не должен брать её из соседнего ответа
+        "vat_rate": plain(ctx["tender"]["vat_rate"]),
+        "vat_percent": ctx["tender"]["vat_percent"]}
     body.update(_gap_fields(target, includes_vat, result))
     return jsonify(body)
 
@@ -480,49 +485,70 @@ def _solve(tender_id: int):
 MAX_LOT_ITEMS = 2000
 
 
-def _replace_items(tender_id: int):
-    """Вставка списка из буфера: все позиции тендера заменяются присланными
-    одной транзакцией. Не прошла проверка хотя бы одной позиции -- ничего не
-    записано, а в ответе путь ["items", номер, поле]. id и tender_id внутри
-    позиций допускаются (список можно отправить обратно как получен) и
-    игнорируются: id назначаются заново, прежние номера строк недействительны."""
+def _replace_rows(tender_id: int, entity: Entity, body_key: str, noun: str, replacer: str,
+                  what: str):
+    """Замена всего списка строк тендера присланным -- одной транзакцией (вставка
+    списка лота из буфера, применение подобранных часов). Не прошла проверка
+    хотя бы одной строки -- ничего не записано, а в ответе путь [body_key, номер,
+    поле]. id и tender_id внутри строк допускаются (список можно отправить обратно
+    как получен) и игнорируются: id назначаются заново, прежние номера строк
+    недействительны. Записанный список уже зафиксирован, поэтому сбой при
+    построении вида -- не ошибка запроса, а успех с предупреждением."""
     repo = get_repo()
     _tender(tender_id)
     data = json_body()
-    _only(data, ("items",), "замена позиций лота")
-    raw = data.get("items")
+    _only(data, (body_key,), what)
+    raw = data.get(body_key)
     if not isinstance(raw, list):
-        raise ApiError("Поле «items»: должно быть списком позиций.", path=["items"])
+        raise ApiError(f"Поле «{body_key}»: должно быть списком.", path=[body_key])
     if len(raw) > MAX_LOT_ITEMS:
-        raise ApiError(f"Слишком много позиций: не больше {MAX_LOT_ITEMS} за раз.",
-                       path=["items"])
-    items = []
+        raise ApiError(f"Слишком много строк: не больше {MAX_LOT_ITEMS} за раз.",
+                       path=[body_key])
+    parsed = []
     for i, row in enumerate(raw):
-        where = ["items", i]
+        where = [body_key, i]
         if not isinstance(row, dict):
-            raise ApiError(f"Позиция №{i + 1}: должна быть набором полей "
-                           "«наименование, цена, порядок».", path=where)
+            raise ApiError(f"{noun} №{i + 1}: должна быть набором полей.", path=where)
         row = dict(row)
         row.pop("id", None)
         sent = row.pop("tender_id", None)
         if sent is not None and sent != tender_id:
-            raise ApiError(f"Позиция №{i + 1}: поле «tender_id» не совпадает с тендером "
+            raise ApiError(f"{noun} №{i + 1}: поле «tender_id» не совпадает с тендером "
                            "в адресе.", path=where + ["tender_id"])
         try:
-            items.append(schema.parse_object(LOT_ITEMS, row, None, {"tender_id": tender_id}))
+            parsed.append(schema.parse_object(entity, row, None, {"tender_id": tender_id}))
         except ApiError as exc:
-            raise ApiError(f"Позиция №{i + 1}. {exc.message}", exc.status,
+            raise ApiError(f"{noun} №{i + 1}. {exc.message}", exc.status,
                            where + list(exc.path or [])) from None
     try:
-        repo.replace_lot_items(tender_id, items)
+        getattr(repo, replacer)(tender_id, parsed)
     except sqlite3.IntegrityError as exc:
-        raise errors.translate_integrity(exc, LOT_ITEMS, "save") from exc
+        raise errors.translate_integrity(exc, entity, "save") from exc
     try:
-        return jsonify(_child_view(LOT_ITEMS, repo, tender_id))
+        return jsonify(_child_view(entity, repo, tender_id))
     except Exception:       # список уже заменён: отвечаем успехом, а не ошибкой
         current_app.logger.exception("Не удалось построить вид заменённого списка")
-        return jsonify({"rows": [present(LOT_ITEMS, i) for i in repo.list_lot_items(tender_id)],
+        saved = getattr(repo, entity.list_)(tender_id)
+        return jsonify({"rows": [present(entity, r) for r in saved],
                         "warning": WRITTEN_BUT_NOT_RECALCULATED})
+
+
+def _replace_items(tender_id: int):
+    """Вставка списка лота из буфера."""
+    return _replace_rows(tender_id, LOT_ITEMS, "items", "Позиция", "replace_lot_items",
+                         "замена позиций лота")
+
+
+def _replace_labor(tender_id: int):
+    """Применение подобранных часов: весь ФОТ заменяется разом."""
+    return _replace_rows(tender_id, LABOR, "rows", "Строка", "replace_tender_labor",
+                         "замена строк трудозатрат")
+
+
+def _documents():
+    """Канонические имена документов пакета: профиль заказчика отмечает и
+    упорядочивает нужные, но не заменяет список."""
+    return jsonify(list(DOCUMENTS))
 
 
 def _inn(inn: str):
@@ -561,6 +587,9 @@ def register(app) -> None:
     app.add_url_rule("/api/inn/<inn>", "inn", _inn, methods=["GET"])
     app.add_url_rule("/api/tenders/<int:tender_id>/items", "items_replace", _replace_items,
                      methods=["PUT"])
+    app.add_url_rule("/api/tenders/<int:tender_id>/labor", "labor_replace", _replace_labor,
+                     methods=["PUT"])
+    app.add_url_rule("/api/documents", "documents", _documents, methods=["GET"])
     app.add_url_rule("/api/settings", "settings_get",
                      lambda: jsonify(present(SETTINGS, get_repo().get_settings())),
                      methods=["GET"])

@@ -331,7 +331,7 @@ def test_migrate_twice_keeps_version_and_data(tmp_path):
     repo.save_tender_labor(TenderLaborRow(tender_id=tid, post="a"))
     repo.save_tender_cost_item(TenderCostItem(tender_id=tid, kind="materials"))
     db.migrate(conn)  # повторный вызов ничего не меняет и не стирает
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 5
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 6
     assert len(repo.list_tender_labor(tid)) == 1
     assert len(repo.list_tender_cost_items(tid)) == 1
     assert repo.get_tender(tid).experience_ids == [4, 7]
@@ -627,7 +627,7 @@ def test_migration_5_moves_layouts_and_prefixes_into_docs(tmp_path):
     assert {"layouts", "file_prefixes"} <= cols and "docs" not in cols
 
     db.migrate(conn)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 5
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 6
     _assert_profiles_moved(conn)
     # записанные миграцией данные -- обычный JSON без экранирования кириллицы
     (raw,) = conn.execute(
@@ -801,3 +801,108 @@ def test_replace_lot_items_for_missing_tender_changes_nothing(repo):
         repo.replace_lot_items(tid + 100, [LotItem(name="x")])
     assert [i.name for i in repo.list_lot_items(tid)] == ["a"]
     assert repo.conn.execute("SELECT COUNT(*) FROM lot_item").fetchone()[0] == 1
+
+
+# ---- услуга тендера (миграция 6) ---------------------------------------------------
+
+def test_tender_service_defaults_to_none_and_round_trips(repo):
+    sid = repo.save_service(Service(code="КЭР", name="Комплексный экологический отчёт"))
+    plain = make_tender(repo)
+    assert repo.get_tender(plain).service_id is None
+    tid = make_tender(repo, service_id=sid)
+    assert repo.get_tender(tid).service_id == sid
+
+
+def test_tender_with_unknown_service_is_refused_by_the_database(repo):
+    with pytest.raises(sqlite3.IntegrityError):
+        make_tender(repo, service_id=999)
+
+
+def test_deleting_a_service_leaves_its_tenders_without_one(repo):
+    sid = repo.save_service(Service(code="СЗЗ", name="Проект СЗЗ"))
+    tid = make_tender(repo, service_id=sid)
+    repo.delete_service(sid)
+    assert repo.get_tender(tid).service_id is None
+
+
+def test_migration_6_adds_tender_service_keeping_data(tmp_path):
+    conn = old_db(tmp_path / "old5.db", 5)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(tender)")}
+    assert "service_id" not in cols
+    db.migrate(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 6
+    repo = Repo(conn)
+    tender = repo.get_tender(1)
+    assert tender.purchase_number == "42" and tender.service_id is None
+    assert tender.price_wo_vat == Decimal("5700000.00")
+    db.migrate(conn)                                   # повторный вызов безопасен
+    conn.close()
+
+
+def test_migration_6_is_one_transaction():
+    script = db._MIGRATIONS[5].upper()
+    assert script.index("BEGIN;") < script.index("ALTER TABLE") < script.index(
+        "PRAGMA USER_VERSION") < script.rindex("COMMIT;")
+
+
+# ---- замена строк трудозатрат одной транзакцией ----------------------------------------
+
+def labor_rows_of(repo, tender_id):
+    return [(r.position, r.post, r.hours) for r in repo.list_tender_labor(tender_id)]
+
+
+def test_replace_tender_labor_replaces_everything_in_order(repo):
+    tid = make_tender(repo)
+    repo.save_tender_labor(TenderLaborRow(tender_id=tid, position=1, post="старая"))
+    ids = repo.replace_tender_labor(tid, [
+        TenderLaborRow(position=1, post="инженер", headcount=2, hours=Decimal("40.5"),
+                       rate=Decimal("1250")),
+        TenderLaborRow(position=2, post="руководитель", hours=Decimal("20"),
+                       rate=Decimal("2000"))])
+    assert labor_rows_of(repo, tid) == [(1, "инженер", Decimal("40.5")),
+                                        (2, "руководитель", Decimal("20"))]
+    assert ids == [r.id for r in repo.list_tender_labor(tid)]
+    assert repo.list_tender_labor(tid)[0].headcount == 2
+
+
+def test_replace_tender_labor_with_empty_list_clears_the_rows(repo):
+    tid = make_tender(repo)
+    repo.save_tender_labor(TenderLaborRow(tender_id=tid, post="a"))
+    assert repo.replace_tender_labor(tid, []) == []
+    assert repo.list_tender_labor(tid) == []
+
+
+def test_replace_tender_labor_leaves_other_tenders_alone(repo):
+    first, second = make_tender(repo), make_tender(repo)
+    repo.save_tender_labor(TenderLaborRow(tender_id=second, post="чужая"))
+    repo.replace_tender_labor(first, [TenderLaborRow(post="своя")])
+    assert [r.post for r in repo.list_tender_labor(second)] == ["чужая"]
+
+
+def test_replace_tender_labor_ignores_tender_and_id_inside_the_rows(repo):
+    first, second = make_tender(repo), make_tender(repo)
+    other = repo.save_tender_labor(TenderLaborRow(tender_id=second, post="чужая"))
+    repo.replace_tender_labor(first, [TenderLaborRow(tender_id=second, id=other, post="своя")])
+    assert [r.post for r in repo.list_tender_labor(first)] == ["своя"]
+    assert [r.post for r in repo.list_tender_labor(second)] == ["чужая"]
+
+
+def test_replace_tender_labor_is_all_or_nothing_when_the_third_fails(repo):
+    """Обрыв посередине не должен оставить часть старых часов и часть новых."""
+    tid = make_tender(repo)
+    repo.save_tender_labor(TenderLaborRow(tender_id=tid, position=1, post="прежняя",
+                                          hours=Decimal("7")))
+    rows = [TenderLaborRow(position=n, post=f"д{n}", hours=Decimal(n)) for n in range(1, 6)]
+    rows[2] = TenderLaborRow(position=3, post="сломанная", hours=object())   # не сохранится
+    with pytest.raises(Exception):
+        repo.replace_tender_labor(tid, rows)
+    assert labor_rows_of(repo, tid) == [(1, "прежняя", Decimal("7"))]
+    assert repo.conn.in_transaction is False
+
+
+def test_replace_tender_labor_for_missing_tender_changes_nothing(repo):
+    tid = make_tender(repo)
+    repo.save_tender_labor(TenderLaborRow(tender_id=tid, post="a"))
+    with pytest.raises(sqlite3.IntegrityError):
+        repo.replace_tender_labor(tid + 100, [TenderLaborRow(post="x")])
+    assert [r.post for r in repo.list_tender_labor(tid)] == ["a"]

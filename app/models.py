@@ -182,6 +182,9 @@ class Tender:
     output_dir: str = ""              # папка, куда собирается пакет
     deal_answers: dict[str, str] = field(default_factory=dict)    # условие -> ответ
     experience_ids: list[int] = field(default_factory=list)       # отобранный опыт, по порядку
+    # Услуга закупки из каталога: по ней подбираются нормы часов и фильтруется
+    # опыт. Одна услуга на тендер (КЭР; НДВ, НДС, НООЛР, ППЭЭ и ПЭК -- её этапы).
+    service_id: int | None = None
     id: int | None = None
 
 

@@ -1626,3 +1626,123 @@ def test_failed_view_after_a_committed_write_is_success_with_a_warning(client, m
     monkeypatch.undo()
     assert len(ok(client.get(f"/api/tenders/{tid}/labor"))["rows"]) == 1      # без дубля
     assert len(ok(client.get(f"/api/tenders/{tid}/items"))["rows"]) == 2
+
+
+# ---- услуга тендера, справочник документов, ставка НДС в подборе, замена ФОТ ---------
+
+def test_tender_carries_its_service(client):
+    service = create(client, "services", code="КЭР", name="Комплексный экологический отчёт",
+                     norms={})
+    tender = make_tender(client, service_id=str(service["id"]))
+    assert tender["service_id"] == service["id"]
+    assert ok(client.get(f"/api/tenders/{tender['id']}"))["service_id"] == service["id"]
+    # пустое поле формы -- «услуга не выбрана», а не отказ
+    cleared = ok(client.post("/api/tenders", json={"id": tender["id"], "service_id": ""}))
+    assert cleared["service_id"] is None
+    assert cleared["subject"] == "Разработка КЭР"                    # остальное не стёрто
+
+
+def test_tender_with_unknown_service_is_a_russian_400(client):
+    me = create(client, "organizations", role="participant", short_name="Я")
+    body = refused(client.post("/api/tenders", json={"participant_id": me["id"],
+                                                     "service_id": 999}))
+    assert "Услуга" in body["error"] and body["field"] == "service_id"
+
+
+def test_documents_catalogue_is_the_canonical_list(client):
+    names = ok(client.get("/api/documents"))
+    assert names == [
+        "Коммерческое предложение", "Калькуляция к КП", "ТКП по форме заказчика",
+        "Декларация соответствия", "Справка о кадровых ресурсах",
+        "Справка о наличии оборудования", "Справка о МТР", "Письмо о крупности сделки",
+        "Справка об опыте", "Анкета участника"]
+    from app.render.context import TABLE_DOCUMENTS
+    assert TABLE_DOCUMENTS <= set(names)          # ключи таблиц -- те же строки, что в списке
+
+
+def test_solve_returns_the_vat_percent_in_force(client):
+    tender = make_tender(client)
+    add_labor(client, tender["id"])
+    url = f"/api/tenders/{tender['id']}"
+    assert ok(client.post(f"{url}/solve", json={"target": "300000"}))["vat_percent"] == "5"
+    ok(client.post("/api/tenders", json={"id": tender["id"], "vat_rate_percent": "20"}))
+    body = ok(client.post(f"{url}/solve", json={"target": "300000"}))
+    assert body["vat_percent"] == "20"
+    assert body["vat_percent"] == ok(client.post(f"{url}/estimate", json={}))["vat_percent"]
+
+
+def test_put_labor_replaces_all_rows_in_one_go(client):
+    tender = make_tender(client)
+    tid = tender["id"]
+    add_labor(client, tid, post="старая")
+    rows = [{"position": 0, "post": "Инженер", "headcount": 2, "hours": "40,5", "rate": "1 250,50"},
+            {"position": 1, "post": "Руководитель", "headcount": 1, "hours": "20", "rate": "2000"}]
+    view = ok(client.put(f"/api/tenders/{tid}/labor", json={"rows": rows}))
+    assert [r["post"] for r in view["rows"]] == ["Инженер", "Руководитель"]
+    assert view["rows"][0]["hours_value"] == "40.5" and view["rows"][0]["rate_value"] == "1250.50"
+    assert view["total"] and view["rows"][0]["amount"]                 # суммы -- с сервера
+    assert ok(client.get(f"/api/tenders/{tid}/labor")) == view
+
+    # список можно отправить обратно как получен (id, суммы и готовые строки игнорируются)
+    again = ok(client.put(f"/api/tenders/{tid}/labor", json={"rows": view["rows"]}))
+    assert [r["hours_value"] for r in again["rows"]] == ["40.5", "20"]
+
+    assert ok(client.put(f"/api/tenders/{tid}/labor", json={"rows": []}))["rows"] == []
+
+
+def test_put_labor_keeps_the_precision_of_a_solved_proposal(client):
+    """Предложение подбора отправляется обратно целиком: сырые часы не теряют знаков."""
+    tender = make_tender(client)
+    tid = tender["id"]
+    add_labor(client, tid, hours="100", rate="1000")
+    solved = ok(client.post(f"/api/tenders/{tid}/solve", json={"target": "300000"}))
+    ok(client.put(f"/api/tenders/{tid}/labor", json={"rows": solved["labor"]}))
+    saved = ok(client.get(f"/api/tenders/{tid}/labor"))["rows"]
+    assert [r["hours_value"] for r in saved] == [r["hours_value"] for r in solved["labor"]]
+
+
+def test_put_labor_failing_on_the_third_changes_nothing(client):
+    tender = make_tender(client)
+    tid = tender["id"]
+    add_labor(client, tid, post="прежняя", hours="7")
+    rows = [{"post": f"Д{n}", "hours": "10", "rate": "100"} for n in range(5)]
+    rows[2]["hours"] = "много"
+    body = refused(client.put(f"/api/tenders/{tid}/labor", json={"rows": rows}))
+    assert body["path"] == ["rows", 2, "hours"] and body["field"] == "rows"
+    assert "Строка №3" in body["error"] and "Часы" in body["error"]
+    assert [r["post"] for r in ok(client.get(f"/api/tenders/{tid}/labor"))["rows"]] == ["прежняя"]
+
+
+def test_put_labor_refusals(client):
+    tender = make_tender(client)
+    other = make_tender(client)
+    url = f"/api/tenders/{tender['id']}/labor"
+    refused(client.put("/api/tenders/999/labor", json={"rows": []}), 404)
+    assert refused(client.put(url, json={}))["field"] == "rows"
+    refused(client.put(url, json={"rows": "список"}))
+    refused(client.put(url, json={"rows": ["строка"]}))
+    refused(client.put(url, json={"rows": [{"post": "x"}], "extra": 1}))
+    refused(client.put(url, json={"rows": [{"nme": "x"}]}))
+    body = refused(client.put(url, json={"rows": [{"post": "x", "tender_id": other["id"]}]}))
+    assert body["path"] == ["rows", 0, "tender_id"]
+    refused(client.put(url, json={"rows": [{"post": "x"}] * 2001}))
+    refused(client.put(url, data='{"rows": []}', content_type="text/plain"), 415)
+    refused(client.put(url, json={"rows": []}, headers={"Origin": "http://evil.example"}), 403)
+    assert ok(client.get(url))["rows"] == []
+
+
+def test_put_labor_after_a_failed_view_is_success_with_a_warning(client, monkeypatch):
+    tender = make_tender(client)
+    tid = tender["id"]
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("секрет")
+
+    monkeypatch.setattr(routes_module, "build_context", broken)
+    response = client.put(f"/api/tenders/{tid}/labor", json={"rows": [
+        {"post": "Инженер", "hours": "10", "rate": "100"}]})
+    body = ok(response)
+    assert "Запись сохранена" in body["warning"] and len(body["rows"]) == 1
+    assert "секрет" not in response.get_data(as_text=True)
+    monkeypatch.undo()
+    assert len(ok(client.get(f"/api/tenders/{tid}/labor"))["rows"]) == 1      # без дубля

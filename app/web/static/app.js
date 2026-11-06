@@ -122,10 +122,12 @@ function differenceKind(text) {
   return raw.startsWith('-') ? 'below' : 'above';
 }
 
-/* Галочки документов: сначала состав пакета из профиля заказчика (отмечены),
- * затем остальное, что где-либо описано в профилях (не отмечено). Никакого
- * списка «всех документов» экран не придумывает: его берёт только из профилей. */
-function documentChoices(profiles, tender) {
+/* Галочки документов. Список всех документов отдаёт сервер (канонические имена,
+ * /api/documents); профиль заказчика его не заменяет, а отмечает и упорядочивает:
+ * сначала состав пакета из профиля (отмечены, в порядке профиля), затем остальное
+ * из списка, затем то, что описано в профилях, но в списке не значится. У
+ * заказчика без профиля ничего не отмечено, но список не пуст. */
+function documentChoices(profiles, tender, catalogue = []) {
   const mine = profiles.find((profile) => String(profile.customer_id) === String(tender.customer_id));
   const seen = new Set();
   const choices = [];
@@ -135,10 +137,9 @@ function documentChoices(profiles, tender) {
       choices.push({ name, checked });
     }
   };
-  if (mine) {
-    (mine.documents || []).forEach((name) => add(name, true));
-    Object.keys(mine.docs || {}).forEach((name) => add(name, false));
-  }
+  if (mine) (mine.documents || []).forEach((name) => add(name, true));
+  catalogue.forEach((name) => add(name, false));
+  if (mine) Object.keys(mine.docs || {}).forEach((name) => add(name, false));
   profiles.filter((profile) => profile !== mine).forEach((profile) => {
     (profile.documents || []).forEach((name) => add(name, false));
     Object.keys(profile.docs || {}).forEach((name) => add(name, false));
@@ -146,16 +147,12 @@ function documentChoices(profiles, tender) {
   return choices;
 }
 
-/* В тендере нет поля «услуга», поэтому услугу для предварительного фильтра опыта
- * угадываем по предмету закупки -- и только когда совпадение одно. */
-function inferServiceId(subject, services) {
-  const escape = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const hits = services.filter((service) => [service.code, service.name].some((word) => {
-    if (!word || word.trim().length < 2) return false;
-    const pattern = new RegExp(`(^|[^\\p{L}\\p{N}])${escape(word.trim())}($|[^\\p{L}\\p{N}])`, 'iu');
-    return pattern.test(subject || '');
-  }));
-  return hits.length === 1 ? String(hits[0].id) : '';
+/* Услуга тендера -- его собственное поле (service_id); текст предмета закупки
+ * больше не угадывается: догадка подставила бы чужие нормы часов, а из них
+ * считается цена. */
+function serviceOf(tender) {
+  return tender && tender.service_id !== null && tender.service_id !== undefined
+    ? String(tender.service_id) : '';
 }
 
 function toggleId(list, id, on) {
@@ -222,7 +219,7 @@ function createBuilder({ api: call, confirmReplace, setBusy }) {
 if (typeof module === 'object' && module.exports) {
   module.exports = {
     ApiFailure, api, splitWarning, recordForWrite, writeRecord, parsePasted, lotPayload,
-    differenceKind, documentChoices, inferServiceId, toggleId, createBuilder,
+    differenceKind, documentChoices, serviceOf, toggleId, createBuilder,
   };
 }
 
@@ -905,6 +902,8 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       { key: 'method', label: 'Способ закупки', kind: 'text' },
       { key: 'platform', label: 'Площадка', kind: 'text' },
       { key: 'subject', label: 'Предмет закупки', kind: 'textarea', wide: true },
+      { key: 'service_id', label: 'Услуга', kind: 'select', ref: 'services',
+        hint: 'От неё зависят нормы часов в трудозатратах и отбор опыта при сборке. Одна услуга на тендер.' },
       { group: 'Объект' },
       { key: 'object_name', label: 'Объект', kind: 'text', wide: true },
       { key: 'object_address', label: 'Адрес объекта', kind: 'text', wide: true },
@@ -1283,13 +1282,21 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       /* -- трудозатраты: список должностей и заполнение по нормам -- */
       const postList = h('datalist', { id: 'post-list' },
         [...new Set(employees.map((e) => e.position).filter(Boolean))].map((p) => h('option', { value: p })));
-      const normSelect = h('select', { 'aria-label': 'Услуга для норм часов' },
-        h('option', { value: '', text: 'Услуга…' }), lookups.services.map(([id, label]) => h('option', { value: String(id), text: label })));
-      normSelect.value = inferServiceId(record.subject, lookups.serviceRecords);
-      const normBtn = h('button', { type: 'button', text: 'Заполнить по нормам услуги', onclick: () => {
-        const service = lookups.serviceRecords.find((s) => String(s.id) === normSelect.value);
-        if (!service) { laborTable.msg.show('warning', 'Выберите услугу, по нормам которой заполнить строки.'); return; }
+      const normBtn = h('button', { type: 'button', text: 'Заполнить по нормам услуги тендера', onclick: () => {
         laborTable.msg.clear();
+        if (serviceOf(record) === '') {
+          laborTable.msg.show('warning', 'В тендере не выбрана услуга. Выберите её в шапке (поле «Услуга») и сохраните тендер — тогда нормы часов подставятся из каталога.');
+          return;
+        }
+        if (form.inputs.service_id.value !== serviceOf(record)) {
+          laborTable.msg.show('warning', 'Услуга в шапке изменена, но тендер не сохранён: нормы берутся из сохранённой услуги. Сначала нажмите «Сохранить тендер».');
+          return;
+        }
+        const service = lookups.serviceRecords.find((s) => String(s.id) === serviceOf(record));
+        if (!service || !Object.keys(service.norms).length) {
+          laborTable.msg.show('warning', 'У услуги этого тендера в каталоге нет норм часов. Заполните их в справочнике «Услуги».');
+          return;
+        }
         const have = new Set(laborTable.rows().map((r) => r.inputs.post.value.trim().toLowerCase()));
         const missingRate = [];
         for (const post of Object.keys(service.norms)) {
@@ -1305,7 +1312,8 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
           missingRate.length ? [`В справочнике сотрудников нет должности «${missingRate.join('», «')}» — ставку введите вручную (поле подсвечено).`] : []);
       } });
       const laborCard = h('div', { class: 'card' }, h('h2', {}, 'Трудозатраты (ФОТ)'), postList,
-        h('div', { class: 'inline', style: 'margin-bottom:10px' }, h('div', {}, normSelect), normBtn), laborTable.el);
+        h('div', { class: 'actions', style: 'margin:0 0 10px' }, normBtn,
+          h('span', { class: 'hint', text: lookups.services.length ? 'Услуга берётся из шапки тендера.' : 'Каталог услуг пуст.' })), laborTable.el);
       const materialsCard = h('div', { class: 'card' }, h('h2', { text: 'Материалы' }), materialsTable.el);
       const subcontractCard = h('div', { class: 'card' }, h('h2', { text: 'Субподряд' }), subcontractTable.el);
 
@@ -1321,7 +1329,6 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         const stale = h('p', { class: 'stale', text: 'Цель или режим изменились — нажмите «Посчитать».', hidden: true });
         let proposal = null;     // последнее предложение подбора (ещё не записано)
         let shown = null;        // последний показанный расчёт
-        let vatPercent;          // ставка НДС из последнего ответа «Посчитать»: в ответе подбора её нет
         const includesVat = () => withVat.checked;
         const targetBody = () => {
           const text = targetInput.value.trim();
@@ -1336,9 +1343,8 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
 
         function drawEstimate(data, { pending }) {
           shown = { estimate: data.estimate, pending };
-          if (data.vat_percent !== undefined) vatPercent = data.vat_percent;
           const table = h('table', { class: 'estimate-table' }, h('tbody', {}, ROWS.map(([key, label]) => h('tr', { class: key.startsWith('total') ? 'total' : '' },
-            h('td', { text: key === 'vat' ? (vatPercent === undefined ? 'НДС' : `НДС по ставке ${vatPercent} %`) : label }), h('td', { text: data.estimate[key] })))));
+            h('td', { text: key === 'vat' ? (data.vat_percent === undefined ? 'НДС' : `НДС по ставке ${data.vat_percent} %`) : label }), h('td', { text: data.estimate[key] })))));
           const pieces = [pending ? h('p', { class: 'notice warning', text: 'Это расчёт по подобранным часам — они ещё не записаны в тендер.' }) : null, table,
             h('p', { class: 'hint', text: 'Итог без НДС округляется по настройке округления (обычно до целых рублей), поэтому может отличаться от суммы напечатанных выше статей — до 50 копеек. Так устроена книга заказчика.' })];
           if (data.difference !== undefined) {
@@ -1409,24 +1415,22 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
             return;
           }
           msg.clear();
-          const warnings = [];
+          const keep = targetBody();
+          let view;
           try {
-            for (const row of proposal.labor) {
-              const { warning } = await writeRecord(`${base}/labor`, recordForWrite(row, {}));
-              if (warning && !warnings.includes(warning)) warnings.push(warning);
-            }
+            // весь ФОТ одной транзакцией: обрыв не оставит половину старых часов и половину новых
+            view = await api('PUT', `${base}/labor`, { rows: proposal.labor });
           } catch (error) {
             msg.error(error);
             return;
           }
-          const keep = targetBody();
-          if (warnings.length) {
-            msg.show('warning', 'Часы записаны, но суммы не пересчитались.', warnings);
-            proposalBox.replaceChildren();
-            proposal = null;
+          laborTable.setView(view);
+          proposal = null;
+          proposalBox.replaceChildren();
+          if (view.warning) {
+            msg.show('warning', view.warning, ['Часы записаны. Суммы по строкам и итоги не пришли — не пересчитывайте их вручную: обновите страницу.']);
             return;
           }
-          laborTable.setView(await api('GET', `${base}/labor`));
           await refreshEstimate();
           if (keep.target) msg.show('ok', 'Подобранные часы записаны в тендер.');
         }
@@ -1472,11 +1476,12 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         root.append(h('p', { class: 'empty', text: tenders.length ? 'Выберите тендер, пакет документов для которого нужно собрать.' : 'Тендеров пока нет. Заведите тендер на экране «Карточка тендера».' }));
         return;
       }
-      const [profiles, experience, services] = await Promise.all([
-        api('GET', '/api/profiles'), api('GET', '/api/experience'), api('GET', '/api/services')]);
+      const [profiles, experience, services, catalogue] = await Promise.all([
+        api('GET', '/api/profiles'), api('GET', '/api/experience'), api('GET', '/api/services'),
+        api('GET', '/api/documents')]);
 
       /* документы */
-      const choices = documentChoices(profiles, tender);
+      const choices = documentChoices(profiles, tender, catalogue);
       const chosen = new Set(choices.filter((c) => c.checked).map((c) => c.name));
       const docList = h('div', { class: 'check-list' });
       const hasProfile = profiles.some((p) => String(p.customer_id) === String(tender.customer_id));
@@ -1484,7 +1489,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         docList.replaceChildren(...choices.map((c) => h('label', {},
           h('input', { type: 'checkbox', checked: chosen.has(c.name), onchange: (e) => { if (e.target.checked) chosen.add(c.name); else chosen.delete(c.name); } }),
           h('span', { text: c.name }))));
-        if (!choices.length) docList.replaceChildren(h('p', { class: 'empty', text: 'Профилей заказчиков пока нет, поэтому список документов пуст. Заведите профиль на экране «Справочники» или впишите название документа ниже.' }));
+        if (!choices.length) docList.replaceChildren(h('p', { class: 'empty', text: 'Сервер не прислал список документов. Обновите страницу или впишите название документа ниже.' }));
       }
       const extraName = h('input', { type: 'text', placeholder: 'Название документа, как в профиле', 'aria-label': 'Название документа', autocomplete: 'off' });
       const addDoc = () => {
@@ -1500,7 +1505,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
 
       /* опыт */
       let selected = (tender.experience_ids || []).map(String);
-      let serviceFilter = inferServiceId(tender.subject, services);
+      let serviceFilter = serviceOf(tender);
       const serviceSelect = h('select', { 'aria-label': 'Фильтр опыта по услуге' },
         h('option', { value: '', text: 'Все услуги' }), services.map((s) => h('option', { value: String(s.id), text: [s.code, s.name].filter(Boolean).join(' — ') })));
       serviceSelect.value = serviceFilter;
@@ -1570,12 +1575,12 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       root.append(h('div', { class: 'two-col' },
         h('div', {},
           h('div', { class: 'card' }, h('h2', { text: 'Документы пакета' }),
-            hasProfile ? h('p', { class: 'hint', text: 'Отмечены документы из профиля заказчика. Остальные описаны в других профилях — их можно добавить галочкой.' })
-              : h('p', { class: 'notice warning', text: 'У заказчика этого тендера нет профиля: ничего не отмечено заранее. Отметьте документы или заведите профиль в справочниках.' }),
+            hasProfile ? h('p', { class: 'hint', text: 'Отмечены документы из профиля заказчика, в порядке профиля. Остальные документы из общего списка можно добавить галочкой.' })
+              : h('p', { class: 'notice warning', text: 'У заказчика этого тендера нет профиля, поэтому заранее ничего не отмечено. Отметьте нужные документы сами или заведите профиль на экране «Справочники».' }),
             docList, h('div', { class: 'inline', style: 'margin-top:8px' }, h('div', {}, extraName), h('button', { type: 'button', text: 'Добавить документ', onclick: addDoc }))),
           h('div', { class: 'card' }, h('h2', { text: 'Опыт для справки' }),
             h('div', { class: 'inline' }, h('div', {}, h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Показать опыт по услуге' }), serviceSelect))),
-            h('p', { class: 'hint', text: tender.subject && serviceFilter ? 'Услуга подобрана по предмету закупки; выберите «Все услуги», чтобы увидеть остальное.' : 'В тендере нет поля «услуга»: выберите её сами или оставьте «Все услуги».' }),
+            h('p', { class: 'hint', text: serviceFilter ? 'Показан опыт по услуге тендера; выберите «Все услуги», чтобы увидеть остальное.' : 'В тендере не выбрана услуга (поле «Услуга» в шапке): показан весь опыт.' }),
             expList, expSummary)),
         h('div', { class: 'card sticky' }, h('h2', { text: 'Сборка' }),
           h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Папка, в которую собрать пакет' }), folder,

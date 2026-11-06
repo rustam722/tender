@@ -169,33 +169,37 @@ test('differenceKind reads the sign of the server string, kopecks included', () 
 
 // ---- документы и опыт -----------------------------------------------------------------
 
-test('document checkboxes: the customer\'s profile is ticked, other profiles\' documents are offered unticked', () => {
+const CATALOGUE = ['Коммерческое предложение', 'Декларация соответствия', 'Справка о МТР', 'Анкета участника'];
+
+test('document checkboxes: the whole catalogue is offered; the profile ticks and orders, it does not replace', () => {
   const profiles = [
     { customer_id: 2, documents: ['Справка о МТР', 'Декларация соответствия'],
       docs: { 'Справка о МТР': {}, 'Письмо о крупности сделки': {} } },
-    { customer_id: 9, documents: ['Анкета участника', 'Справка о МТР'], docs: {} },
+    { customer_id: 9, documents: ['Анкета участника', 'Справка о кадровых ресурсах'], docs: {} },
   ];
-  const choices = app.documentChoices(profiles, { customer_id: 2 });
+  const choices = app.documentChoices(profiles, { customer_id: 2 }, CATALOGUE);
   assert.deepEqual(choices.map((c) => [c.name, c.checked]), [
-    ['Справка о МТР', true], ['Декларация соответствия', true],
-    ['Письмо о крупности сделки', false], ['Анкета участника', false],
+    ['Справка о МТР', true], ['Декларация соответствия', true],            // порядок профиля
+    ['Коммерческое предложение', false], ['Анкета участника', false],       // остальное из списка
+    ['Письмо о крупности сделки', false],                                   // описано в профиле, в списке нет
+    ['Справка о кадровых ресурсах', false],                                 // из чужого профиля
   ]);
 });
 
-test('document checkboxes: no profile -- nothing ticked, nothing invented', () => {
-  assert.deepEqual(app.documentChoices([], { customer_id: 2 }), []);
+test('document checkboxes: a customer without a profile still gets the whole catalogue, nothing ticked', () => {
+  const none = app.documentChoices([], { customer_id: 2 }, CATALOGUE);
+  assert.deepEqual(none.map((c) => c.name), CATALOGUE);
+  assert.ok(none.every((c) => c.checked === false));
   const other = [{ customer_id: 9, documents: ['Анкета участника'], docs: {} }];
-  assert.deepEqual(app.documentChoices(other, { customer_id: 2 }).map((c) => c.checked), [false]);
+  assert.ok(app.documentChoices(other, { customer_id: 2 }, CATALOGUE).every((c) => !c.checked));
+  assert.deepEqual(app.documentChoices([], { customer_id: 2 }), [], 'без списка и профиля -- ничего не придумываем');
 });
 
-test('the tender\'s service is guessed from the subject only when it is unambiguous', () => {
-  const services = [{ id: 1, code: 'КЭР', name: 'Комплексный экологический отчёт' },
-                    { id: 2, code: 'СЗЗ', name: 'Санитарно-защитная зона' }];
-  assert.equal(app.inferServiceId('Разработка КЭР для АЗК', services), '1');
-  assert.equal(app.inferServiceId('Проект СЗЗ и КЭР', services), '');
-  assert.equal(app.inferServiceId('Услуги', services), '');
-  assert.equal(app.inferServiceId('Разработка проекта санитарно-защитная зона АЗК', services), '2');
-  assert.equal(app.inferServiceId('ПОКЭРНЫЙ', services), '', 'код внутри слова -- не совпадение');
+test('the service of a tender is its own field; the subject text is never read', () => {
+  assert.equal(app.serviceOf({ service_id: 3, subject: 'Проект СЗЗ' }), '3');
+  assert.equal(app.serviceOf({ service_id: null, subject: 'Разработка КЭР' }), '');
+  assert.equal(app.serviceOf({ subject: 'Разработка КЭР' }), '');
+  assert.equal(app.inferServiceId, undefined, 'догадка по тексту удалена');
 });
 
 test('toggleId keeps the order the user ticked and never duplicates', () => {
@@ -398,6 +402,16 @@ live('live: labor, estimate with a target, solve, apply, and the gap is always s
   const tender = tenders[tenders.length - 1];
   const base = `/api/tenders/${tender.id}`;
 
+  // услуга -- поле тендера; нормы часов берутся у неё, а не угадываются по тексту
+  const service = await app.api('POST', '/api/services', { code: 'КЭР', name: 'Комплексный экологический отчёт',
+    stage_wording: '', norms: { 'Инженер-эколог': '40,5' } });
+  assert.equal(app.serviceOf(tender), '', 'до выбора услуга пуста, хотя в предмете написано КЭР');
+  const withService = await app.writeRecord('/api/tenders', app.recordForWrite(tender, { service_id: String(service.id) }));
+  assert.equal(app.serviceOf(withService.record), String(service.id));
+  assert.equal(service.norms_value['Инженер-эколог'], '40.5');
+  const cleared = await app.writeRecord('/api/tenders', app.recordForWrite(withService.record, { service_id: '' }));
+  assert.equal(app.serviceOf(cleared.record), '');
+
   const row = await app.writeRecord(`${base}/labor`, { post: 'Инженер', headcount: '2', hours: '100,5', rate: '1 000' });
   assert.equal(row.record.hours, '100,5');
   assert.equal(row.record.amount, `201${NBSP}000,00`);
@@ -417,10 +431,13 @@ live('live: labor, estimate with a target, solve, apply, and the gap is always s
   assert.ok(['above', 'below', 'equal'].includes(app.differenceKind(solved.difference_value)));
   assert.equal(solved.labor.length, 1);
 
-  // применить предложение: запись с id возвращается как получена
-  const applied = await app.writeRecord(`${base}/labor`, app.recordForWrite(solved.labor[0], {}));
+  assert.equal(solved.vat_percent, '5', 'ставку НДС подбор отдаёт сам, а не берёт из соседнего ответа');
+
+  // применить предложение: весь ФОТ одной заменой, строки как получены
+  const applied = await app.api('PUT', `${base}/labor`, { rows: solved.labor });
   assert.equal(applied.warning, undefined);
-  assert.equal(applied.record.hours_value, solved.labor[0].hours_value, 'часы не потеряли знаков');
+  assert.equal(applied.rows[0].hours_value, solved.labor[0].hours_value, 'часы не потеряли знаков');
+  assert.equal(applied.rows.length, solved.labor.length);
 
   const gap = await app.api('POST', `${base}/estimate`, { target: '1 000 000', target_includes_vat: false });
   assert.equal(gap.difference, solved.difference);
@@ -441,8 +458,13 @@ live('live: build asks about replacement by document names, locks, and remembers
   assert.equal(profile.warning, undefined);
 
   const profiles = await app.api('GET', '/api/profiles');
-  const choices = app.documentChoices(profiles, tender);
+  const catalogue = await app.api('GET', '/api/documents');
+  assert.equal(catalogue.length, 10);
+  const choices = app.documentChoices(profiles, tender, catalogue);
   assert.deepEqual(choices.filter((c) => c.checked).map((c) => c.name), ['Справка о МТР', 'Декларация соответствия']);
+  assert.equal(choices.length, 10, 'профиль отметил нужное, но список остался полным');
+  const bare = app.documentChoices([], tender, catalogue);        // заказчик без профиля
+  assert.equal(bare.length, 10);
 
   const asked = [];
   const busy = [];
