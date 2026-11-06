@@ -17,6 +17,10 @@
   * Имя очищается от символов, запрещённых в Windows, и укорачивается так,
     чтобы влезть и в 255 знаков имени, и в 259 знаков полного пути. Обрезается
     только имя файла: содержимое документа остаётся целым.
+  * Любой документ пишется под временным именем (`~pkg-xxxxxxxx.ext`) рядом с
+    целью и становится файлом одним rename/replace: остаток оборванной записи
+    никогда не носит настоящего имени, а в начале сборки такие остатки
+    подметаются.
   * Существующий файл по умолчанию не перезаписывается: документ уходит в
     `skipped`, чтобы не потерять правки в уже поданной или подписанной версии.
     `overwrite=True` разрешает замену (пересборка после правки данных); новый
@@ -50,6 +54,7 @@ _SUPPORTED = (".docx", ".xlsx")
 # замками Word («~$имя.docx») и чужими файлами: по нему сборка подметает остатки
 # оборванных запусков, и ничего другого не трогает.
 _TEMP_PREFIX = "~pkg-"
+_TEMP_LENGTH = len(_TEMP_PREFIX) + 8     # «~pkg-» и 8 знаков, без расширения
 _TEMP_NAME = re.compile(r"~pkg-[0-9a-f]{8}\.(docx|xlsx)")
 _FALLBACK_NAME = "Документ"
 _RESERVED = frozenset(
@@ -163,9 +168,11 @@ def _temp_path(target: Path) -> Path:
 def _target(out_dir: Path, document: str, prefix: str, extension: str) -> Path:
     """Путь будущего файла. Имя -- префикс + документ, очищенные и обрезанные
     так, чтобы с расширением влезть в предел имени и в предел полного пути."""
-    room = min(MAX_NAME_LENGTH, MAX_PATH_LENGTH - _units(str(out_dir)) - 1)
-    room -= len(extension)
-    if room < 1:
+    path_room = MAX_PATH_LENGTH - _units(str(out_dir)) - 1
+    room = min(MAX_NAME_LENGTH, path_room) - len(extension)
+    # документ пишется под временным именем, оно длиннее короткого целевого:
+    # если не умещается оно, документ не записать, и отказ нужен сразу
+    if room < 1 or path_room < _TEMP_LENGTH + len(extension):
         raise _Refusal(
             f"Путь к папке слишком длинный: для имени файла не остаётся места "
             f"(Windows открывает пути не длиннее {MAX_PATH_LENGTH} знаков). "
@@ -226,6 +233,16 @@ def _plan_one(document: str, spec, out_dir: Path,
     return template, target
 
 
+def _move_refusal(target: Path, replacing: bool) -> str:
+    if replacing:
+        return (f"Файл «{target.name}» не заменён: он открыт в Word или Excel "
+                "либо защищён от записи. Закройте его и соберите заново; "
+                "прежняя версия осталась целой.")
+    return (f"Файл «{target.name}» не записан: такое имя уже занято или в "
+            "папку нельзя записывать. Проверьте, что файл не открыт в другой "
+            "программе, и соберите заново.")
+
+
 def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
                taken: set[str], warnings: list[tuple[str, str]],
                overwrite: bool, experience_ids) -> Path:
@@ -242,26 +259,24 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
     context = build_context(tender_id, repo, document=document,
                            experience_ids=experience_ids)
     warnings.extend((document, text) for text in context["warnings"])
-    # Заменяемый файл не трогается, пока новый не готов: пишется рядом под
-    # временным именем и подменяет прежний одним действием. Сбой посреди записи
-    # не должен стоить пользователю прежней версии.
-    work = _temp_path(target) if replacing else target
+    # Единый путь записи: документ всегда пишется под временным именем рядом с
+    # целью и становится настоящим файлом одним действием. Так оборванная или
+    # неудавшаяся запись оставляет только `~pkg-…`, который уберёт подметание,
+    # но не огрызок под настоящим именем, и заменяемый файл цел, пока новый не
+    # готов. rename не затирает чужой файл, появившийся за это время;
+    # replace -- только при разрешённой замене.
+    work = _temp_path(target)
     try:
         if template.suffix.lower() == ".xlsx":
             fill_workbook(template, load_cellmap(CELLMAPS_DIR / spec.cellmap),
                           context, work)
         else:
             render_docx(template, context, work)
-        if replacing:
-            try:
-                os.replace(work, target)
-            except OSError as exc:
-                raise _Refusal(
-                    f"Файл «{target.name}» не заменён: он открыт в Word или Excel "
-                    "либо защищён от записи. Закройте его и соберите заново; "
-                    "прежняя версия осталась целой.") from exc
+        try:
+            (os.replace if replacing else os.rename)(work, target)
+        except OSError as exc:
+            raise _Refusal(_move_refusal(target, replacing)) from exc
     except BaseException:
-        # work -- либо новый файл, либо временный: прежнего файла он не касается
         try:
             work.unlink(missing_ok=True)
         except OSError:

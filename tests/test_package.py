@@ -1144,3 +1144,149 @@ def test_empty_experience_ids_mean_no_experience_not_the_stored_selection(
     out = tmp_path / "out"
     build_package(tid, [EXPERIENCE], out, repo, experience_ids=[])
     assert text_of(out / f"{EXPERIENCE}.docx")[0] == "[]"
+
+
+# ---- единый путь записи: всегда через временное имя ---------------------------
+
+def test_every_document_is_written_under_a_temp_name_first(
+        repo, dirs, tmp_path, monkeypatch):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    make_template(templates / f"{MTR}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION, MTR])
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / f"{MTR}.docx").write_bytes(b"old")            # этот будет заменён
+    seen = []
+    real = package_module.render_docx
+
+    def spy(template, context, target):
+        seen.append(Path(target).name)
+        return real(template, context, target)
+
+    monkeypatch.setattr(package_module, "render_docx", spy)
+    result = build_package(tid, [DECLARATION, MTR], out, repo, overwrite=True)
+    assert len(result.written) == 2
+    assert len(seen) == 2 and all(n.startswith("~pkg-") for n in seen)
+    assert names(out) == sorted([f"{DECLARATION}.docx", f"{MTR}.docx"])
+
+
+def test_failed_new_document_never_leaves_a_half_file_under_the_real_name(
+        repo, dirs, tmp_path, monkeypatch):
+    # антивирус держит файл: удалить огрызок не удалось
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION])
+    out = tmp_path / "out"
+
+    def crash_after_writing(template, context, target):
+        Path(target).write_bytes(b"half")
+        raise package_module.TemplateError("Настоящая причина сбоя.")
+
+    real_unlink = Path.unlink
+
+    def stubborn(self, *args, **kwargs):
+        if self.parent == out:
+            raise PermissionError("held by antivirus")
+        return real_unlink(self, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(package_module, "render_docx", crash_after_writing)
+        patch.setattr(Path, "unlink", stubborn)
+        result = build_package(tid, [DECLARATION], out, repo)
+    assert "Настоящая причина сбоя" in result.skipped[0][1]
+    assert f"{DECLARATION}.docx" not in names(out)       # под настоящим именем -- ничего
+    leftovers = names(out)
+    assert len(leftovers) == 1 and leftovers[0].startswith("~pkg-")
+    # следующая сборка остаток подметает и пишет документ как обычно
+    again = build_package(tid, [DECLARATION], out, repo)
+    assert again.skipped == [] and names(out) == [f"{DECLARATION}.docx"]
+
+
+def test_refused_move_of_a_new_document_is_a_skip_without_leftovers(
+        repo, dirs, tmp_path, monkeypatch):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    make_template(templates / f"{MTR}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION, MTR])
+    out = tmp_path / "out"
+    real_rename = package_module.os.rename
+
+    def refuse_first(src, dst):
+        if Path(dst).name == f"{DECLARATION}.docx":
+            raise PermissionError("denied")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(package_module.os, "rename", refuse_first)
+    result = build_package(tid, [DECLARATION, MTR], out, repo)
+    assert [p.name for p in result.written] == [f"{MTR}.docx"]
+    assert result.skipped[0][0] == DECLARATION
+    assert "PermissionError" not in result.skipped[0][1]
+    assert names(out) == [f"{MTR}.docx"]
+
+
+def test_a_file_that_appears_meanwhile_is_not_clobbered_when_not_overwriting(
+        repo, dirs, tmp_path, monkeypatch):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "новый")
+    tid = make_tender(repo, documents=[DECLARATION])
+    out = tmp_path / "out"
+    real = package_module.render_docx
+
+    def render_then_user_saves_theirs(template, context, target):
+        real(template, context, target)
+        (Path(target).parent / f"{DECLARATION}.docx").write_bytes(b"theirs")
+        return target
+
+    monkeypatch.setattr(package_module, "render_docx", render_then_user_saves_theirs)
+    result = build_package(tid, [DECLARATION], out, repo)
+    assert result.written == [] and len(result.skipped) == 1
+    assert (out / f"{DECLARATION}.docx").read_bytes() == b"theirs"
+    assert names(out) == [f"{DECLARATION}.docx"]
+
+
+def room_for_temp_folder(tmp_path: Path, room: int) -> Path:
+    """Папка, после которой для имени файла остаётся ровно `room` знаков."""
+    length = package_module.MAX_PATH_LENGTH - room - 1
+    return tmp_path / ("к" * (length - len(str(tmp_path)) - 1))
+
+
+def test_path_budget_counts_the_longer_temp_name(
+        repo, dirs, tmp_path, monkeypatch):
+    # целевое имя («Д.docx») ещё умещается, а временное «~pkg-xxxxxxxx.docx» --
+    # нет: должен быть внятный отказ, а не «непредвиденная ошибка» при записи
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION])
+    monkeypatch.setattr(Path, "mkdir", lambda *a, **k: None)
+    out = room_for_temp_folder(tmp_path, room=10)
+    assert len(str(out)) + 1 + 10 == package_module.MAX_PATH_LENGTH
+    result = build_package(tid, [DECLARATION], out, repo)
+    assert result.written == []
+    assert "слишком длинный" in result.skipped[0][1]
+    assert planned_files(tid, [DECLARATION], out, repo) == []
+
+
+def test_path_budget_accepts_a_folder_where_the_temp_name_just_fits(
+        repo, dirs, tmp_path, monkeypatch):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION])
+    monkeypatch.setattr(Path, "mkdir", lambda *a, **k: None)
+    out = room_for_temp_folder(tmp_path, room=len("~pkg-xxxxxxxx.docx"))
+    plan = planned_files(tid, [DECLARATION], out, repo)
+    assert [doc for doc, _ in plan] == [DECLARATION]
+    assert len(str(plan[0][1])) <= package_module.MAX_PATH_LENGTH
+
+
+def test_a_folder_named_like_a_temp_file_survives_the_sweep(repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION])
+    out = tmp_path / "out"
+    lookalike = out / "~pkg-deadbeef.docx"
+    lookalike.mkdir(parents=True)
+    (lookalike / "внутри.txt").write_text("мои данные", encoding="utf-8")
+    result = build_package(tid, [DECLARATION], out, repo)
+    assert result.skipped == []
+    assert (lookalike / "внутри.txt").read_text(encoding="utf-8") == "мои данные"
