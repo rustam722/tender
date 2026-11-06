@@ -41,14 +41,14 @@ from urllib.parse import urlsplit
 from flask import current_app, g, jsonify, render_template, request
 
 from app import db
-from app.calc import Estimate, LaborLine, estimate, price_gap, solve_hours
+from app.calc import Estimate, LaborLine, estimate, money_total, price_gap, solve_hours
 from app.inn.lookup import build_draft
-from app.render.context import build_context, money
+from app.render.context import build_context, labor_rows, money
 from app.render.package import build_package, planned_files
 from app.repo import Repo
 from app.web import errors, schema
 from app.web.errors import ApiError
-from app.web.texts import money_total, number_text, present, texts_of
+from app.web.texts import present, texts_of
 from app.web.schema import (
     CHILDREN, COSTS, EXPERIENCE, LABOR, LOT_ITEMS, ORGANIZATIONS, PROFILES, SETTINGS, SOLVE, TENDERS, TOP_LEVEL,
     Entity, plain,
@@ -182,6 +182,18 @@ def _find(entity: Entity, repo: Repo, row_id: int, tender_id: int | None = None)
     raise _not_found(entity, row_id)
 
 
+def _labor_view(rows) -> list[dict]:
+    """Строки ФОТ (сохранённые или подобранные) в одной форме: сырые значения,
+    готовые строки и сумма строки -- её считает контекст документов, как для
+    печатной калькуляции."""
+    view = []
+    for row, printed in zip(rows, labor_rows(rows)):
+        body = present(LABOR, row)
+        body["amount"], body["amount_text"] = plain(printed["amount_value"]), printed["amount"]
+        view.append(body)
+    return view
+
+
 def _child_view(entity: Entity, repo: Repo, tender_id: int) -> dict:
     """Строки тендера (позиции лота, ФОТ, материалы и субподряд) и итог под ними.
 
@@ -189,21 +201,25 @@ def _child_view(entity: Entity, repo: Repo, tender_id: int) -> dict:
     документов (округление и порядок те же, что в печатной форме, итоги ФОТ,
     материалов и субподряда -- статьи расчёта), итог позиций лота --
     money_total. Экран только показывает."""
-    if entity is LOT_ITEMS:
-        items = repo.list_lot_items(tender_id)
-        total = money_total(i.price for i in items)
-        return {"rows": [present(entity, i) for i in items],
-                "total": plain(total), "total_text": money(total)}
     ctx = build_context(tender_id, repo)
-    if entity is LABOR:
-        stored = repo.list_tender_labor(tender_id)
+    if entity is LOT_ITEMS:
+        # НДС позиции -- как в контексте документов (округлён на строке); итог НДС --
+        # сумма напечатанных строк, как складывает колонку форма заказчика
+        items = repo.list_lot_items(tender_id)
         rows = []
-        for row, printed in zip(stored, ctx["labor"]):
-            body = present(entity, row)
-            body["amount"], body["amount_text"] = plain(printed["amount_value"]), printed["amount"]
+        for item, printed in zip(items, ctx["items"]):
+            body = present(entity, item)
+            body["vat"], body["vat_text"] = plain(printed["vat_value"]), printed["vat"]
             rows.append(body)
+        total = money_total(i.price for i in items)
+        vat_total = money_total(printed["vat_value"] for printed in ctx["items"])
+        return {"rows": rows, "total": plain(total), "total_text": money(total),
+                "vat_total": plain(vat_total), "vat_total_text": money(vat_total),
+                "vat_percent": ctx["tender"]["vat_percent"]}
+    if entity is LABOR:
         total = ctx["estimate"]["labor"]
-        return {"rows": rows, "total": plain(total), "total_text": money(total)}
+        return {"rows": _labor_view(repo.list_tender_labor(tender_id)),
+                "total": plain(total), "total_text": money(total)}
     # материалы и субподряд: строки обеих статей, итоги каждой
     kind = request.args.get("kind")
     if kind is not None and kind not in COSTS.choices["kind"]:
@@ -263,9 +279,7 @@ def _save(entity: Entity, tender_id: int | None = None):
     saved = _find(entity, repo, saved_id, tender_id)
     if tender_id is None:
         body = present(entity, saved)
-    elif entity is LOT_ITEMS:
-        body = present(entity, saved)
-    else:       # у строки ФОТ и материалов есть сумма: её знает только расчёт
+    else:       # у строки есть сумма или НДС: их знает только расчёт
         body = next(row for row in _child_view(entity, repo, tender_id)["rows"]
                     if row["id"] == saved.id)
     response = jsonify(body)
@@ -436,10 +450,9 @@ def _solve(tender_id: int):
                          target_includes_vat=includes_vat)
     result = estimate(solved, materials, subcontract, settings)
     body = {
-        "labor": [{"id": row.id, "post": line.post, "headcount": line.headcount,
-                   "hours": plain(line.hours), "hours_text": number_text(line.hours),
-                   "rate": plain(line.rate), "rate_text": money(line.rate)}
-                  for row, line in zip(rows, solved)],
+        # та же форма, что у сохранённых строк ФОТ: с суммой строки
+        "labor": _labor_view([replace(row, hours=line.hours)
+                              for row, line in zip(rows, solved)]),
         "estimate": plain(result),
         "estimate_text": texts_of(result)}
     body.update(_gap_fields(target, includes_vat, result))

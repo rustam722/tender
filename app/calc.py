@@ -42,6 +42,16 @@ def _money(value: Decimal) -> Decimal:
     return value.quantize(KOPECK, rounding=ROUND_HALF_UP)
 
 
+def money_total(values) -> Decimal:
+    """Итог списка денег: сумма строк, КАЖДАЯ из которых округлена до копеек,
+    как она будет напечатана. Доктрина напечатанной строки: итог сходится с
+    видимыми над ним строками (три цены по 0,005 печатаются «0,01» и дают 0,03,
+    а не 0,02 от суммы сырых). Пустой список -- 0.00.
+
+    Живёт здесь, а не в веб-слое и не на экране: в JavaScript нет Decimal."""
+    return sum((_money(Decimal(v)) for v in values), Decimal("0.00"))
+
+
 def estimate(labor: list[LaborLine], materials: Decimal, subcontract: Decimal,
              settings: OrgSettings) -> Estimate:
     """Считает все статьи по формулам книги КП.xlsx.

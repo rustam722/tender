@@ -145,9 +145,17 @@ def _today() -> date:
     return date.today()
 
 
-def _percent(rate: Decimal) -> str:
-    """0.05 -> «5», 0.055 -> «5,5»."""
+def percent(rate: Decimal) -> str:
+    """Ставка-доля -> проценты строкой: 0.05 -> «5», 0.002 -> «0,2», 0.055 -> «5,5».
+    Лежит рядом с money: форматирование денег и процентов -- в одном месте, чтобы
+    экран не умножал ставку на 100 сам (в JavaScript нет Decimal)."""
     return format((rate * 100).normalize(), "f").replace(".", ",")
+
+
+def number_ru(value: Decimal) -> str:
+    """Не деньги -- часы и количества: 12.50 -> «12,5», 360 -> «360». Запятая
+    десятичная, разрядов нет."""
+    return format(value.normalize(), "f").replace(".", ",")
 
 
 def _vat_rate(tender, participant: Organization | None, settings) -> Decimal:
@@ -212,7 +220,7 @@ def _cost_rows(items: list[TenderCostItem]) -> list[dict]:
     return rows
 
 
-def _labor_rows(rows: list[TenderLaborRow]) -> list[dict]:
+def labor_rows(rows: list[TenderLaborRow]) -> list[dict]:
     result = []
     for n, r in enumerate(rows, start=1):
         amount = _round(r.headcount * r.hours * r.rate)   # один раз, на строке
@@ -259,10 +267,10 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
 
     settings = repo.get_settings()
     rate = _vat_rate(tender, participant, settings)
-    labor_rows = repo.list_tender_labor(tender_id)
+    stored_labor = repo.list_tender_labor(tender_id)
     materials = repo.list_tender_cost_items(tender_id, COST_MATERIALS)
     subcontract = repo.list_tender_cost_items(tender_id, COST_SUBCONTRACT)
-    labor = _labor_rows(labor_rows)
+    labor = labor_rows(stored_labor)
     materials_table, subcontract_table = _cost_rows(materials), _cost_rows(subcontract)
     # В калькуляцию уходят суммы напечатанных (округлённых) строк. ФОТ идёт
     # строками «1 чел. * сумма строки * 1 руб.»: estimate округляет ФОТ сам, и
@@ -276,7 +284,7 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
 
     tender_fields = asdict(tender)
     tender_fields["vat_rate"] = rate
-    tender_fields["vat_percent"] = _percent(rate)
+    tender_fields["vat_percent"] = percent(rate)
 
     layouts = _layouts(profile, document)
     spec = _doc_spec(profile, document)

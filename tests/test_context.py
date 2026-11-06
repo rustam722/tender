@@ -704,3 +704,26 @@ def test_tender_dates_pass_through_the_date_helpers(repo):
     tid = add_tender(repo, None, None, purchase_date="2025-10-24")
     ctx = build_context(tid, repo)
     assert ctx["date_ru"](ctx["tender"]["purchase_date"]) == "24.10.2025"
+
+
+# ---- форматирование для экрана: рядом с money ---------------------------------
+
+def test_percent_and_number_formatters_live_next_to_money():
+    from app.render.context import number_ru, percent
+    assert percent(Decimal("0.05")) == "5"
+    assert percent(Decimal("0.002")) == "0,2"
+    assert percent(Decimal("0.055")) == "5,5"
+    assert percent(Decimal("0")) == "0"
+    assert percent(Decimal("1")) == "100"
+    assert number_ru(Decimal("12.50")) == "12,5"
+    assert number_ru(Decimal("360")) == "360"
+    assert number_ru(Decimal("1E+2")) == "100"
+    assert number_ru(Decimal("0.000")) == "0"
+
+
+def test_labor_rows_builder_is_public_and_takes_stored_rows():
+    from app.render.context import labor_rows
+    rows = labor_rows([TenderLaborRow(post="Эколог", headcount=2, hours=Decimal("12.5"),
+                                      rate=Decimal("270"))])
+    assert rows[0]["amount_value"] == Decimal("6750.00")
+    assert rows[0]["amount"] == f"6{NBSP}750,00"

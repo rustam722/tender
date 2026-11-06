@@ -11,6 +11,7 @@ import re
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from pathlib import Path
 
 import docx
@@ -1141,7 +1142,8 @@ def decimal_field_names() -> set[str]:
     return names
 
 
-DECIMAL_FIELDS = decimal_field_names() | {"difference", "target", "total"}
+DECIMAL_FIELDS = decimal_field_names() | {"difference", "target", "total", "amount", "vat",
+                                                      "vat_total"}
 NUMERIC = re.compile(r"-?\d+(\.\d+)?")
 TWINNED_DICTS = {"estimate", "lines", "totals", "norms"}
 
@@ -1231,7 +1233,8 @@ def test_lot_items_come_with_texts_and_a_server_side_total(client):
     again = ok(client.get(f"/api/tenders/{tid}/items"))
     assert again == body
     assert ok(client.get(f"/api/tenders/{create(client, 'tenders')['id']}/items")) == {
-        "rows": [], "total": "0.00", "total_text": "0,00"}
+        "rows": [], "total": "0.00", "total_text": "0,00", "vat_total": "0.00",
+        "vat_total_text": "0,00", "vat_percent": "5"}
 
 
 def test_lot_total_is_the_sum_of_printed_prices_not_of_raw_ones(client):
@@ -1350,3 +1353,62 @@ def test_a_record_can_be_sent_back_exactly_as_received(client):
         back = ok(client.post(f"/api/{path}", json=record))
         assert back == record, path
     refused(client.post("/api/employees", json={**employee, "hourly_rate_texts": "1"}))
+
+
+# ---- арифметики в слое веба нет: итоги и НДС позиций, суммы строк подбора -------
+
+def test_lot_items_carry_vat_per_row_and_a_vat_total(client):
+    tender = make_tender(client)                       # НДС из настроек, 5 %
+    tid = tender["id"]
+    body = ok(client.put(f"/api/tenders/{tid}/items", json={"items": [
+        {"position": 1, "name": "а", "price": "100"},
+        {"position": 2, "name": "б", "price": "0.50"}]}))
+    assert [r["vat"] for r in body["rows"]] == ["5.00", "0.03"]       # 0,025 -> 0,03 на строке
+    assert [r["vat_text"] for r in body["rows"]] == ["5,00", "0,03"]
+    assert body["vat_total"] == "5.03" and body["vat_total_text"] == "5,03"
+    assert body["vat_percent"] == "5"
+    assert body["total"] == "100.50"
+
+
+def test_lot_vat_total_is_the_sum_of_printed_row_vat_not_vat_of_the_total(client):
+    # три позиции по 0,50: НДС строки 0,025 печатается «0,03»; итог напечатанных --
+    # 0,09, а НДС от итога 1,50 был бы 0,075 -> «0,08». Форма Роснефти складывает
+    # колонку НДС её же формулами, поэтому сходиться надо со строками.
+    tender = make_tender(client)
+    body = ok(client.put(f"/api/tenders/{tender['id']}/items", json={
+        "items": [{"name": str(n), "price": "0.50"} for n in range(3)]}))
+    assert body["vat_total"] == "0.09"
+
+
+def test_lot_vat_uses_the_tender_rate(client):
+    tender = make_tender(client, vat_rate="0.20")
+    body = ok(client.put(f"/api/tenders/{tender['id']}/items", json={
+        "items": [{"name": "а", "price": "10.05"}]}))
+    assert body["rows"][0]["vat"] == "2.01" and body["vat_percent"] == "20"
+    one = create(client, f"tenders/{tender['id']}/items", name="б", price="100")
+    assert one["vat"] == "20.00" and one["vat_text"] == "20,00"      # одна запись -- тоже с НДС
+
+
+def test_empty_lot_has_zero_vat_total(client):
+    tender = make_tender(client)
+    body = ok(client.get(f"/api/tenders/{tender['id']}/items"))
+    assert body["vat_total"] == "0.00" and body["vat_total_text"] == "0,00"
+    assert body["total"] == "0.00" and body["rows"] == []
+
+
+def test_solved_rows_carry_amounts_like_stored_labor_rows(client):
+    tender = make_tender(client)
+    tid = tender["id"]
+    add_labor(client, tid)                                              # 1 чел., 100 ч, 1000
+    add_labor(client, tid, post="Помощник", headcount=2, hours="50", rate="100")   # 10 000
+    body = ok(client.post(f"/api/tenders/{tid}/solve", json={"target": "300000"}))
+    rows = body["labor"]
+    assert [set(r) for r in rows] == [set(ok(client.get(f"/api/tenders/{tid}/labor"))["rows"][0])] * 2
+    for row in rows:
+        hours, rate = Decimal(row["hours"]), Decimal(row["rate"])
+        assert Decimal(row["amount"]) == row["headcount"] * hours * rate
+        assert row["amount_text"] == f"{Decimal(row['amount']):,.2f}".translate(
+            {ord(","): NBSP, ord("."): ","})
+    # решение не сохранено, но строки подбора -- в той же форме, что у сохранённых
+    assert ok(client.get(f"/api/tenders/{tid}/labor"))["rows"][0]["hours"] == "100"
+    assert body["estimate"]["labor"] == format(sum(Decimal(r["amount"]) for r in rows), "f")

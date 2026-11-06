@@ -398,6 +398,8 @@ def output_only_keys(entity: Entity) -> set[str]:
         keys.add("norms_text")
     if entity in (LABOR, COSTS):
         keys |= {"amount", "amount_text"}
+    if entity is LOT_ITEMS:
+        keys |= {"vat", "vat_text"}
     return keys
 
 

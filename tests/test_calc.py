@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from app.calc import Estimate, LaborLine, estimate
+from app.calc import Estimate, LaborLine, estimate, money_total
 from app.models import OrgSettings
 
 DEFAULTS = OrgSettings(
@@ -232,3 +232,24 @@ def test_estimate_does_not_mutate_arguments():
     before = [vars(x).copy() for x in lines]
     estimate(lines, Decimal("1"), Decimal("1"), DEFAULTS)
     assert [vars(x) for x in lines] == before
+
+
+# ---- итог списка денег ---------------------------------------------------------
+
+def test_money_total_is_the_sum_of_lines_each_rounded_to_kopecks():
+    # три цены по 0,005 печатаются «0,01»: итог напечатанных строк -- 0,03,
+    # а не 0,02 от суммы сырых 0,015. Итог сходится со строками над ним.
+    total = money_total([Decimal("0.005")] * 3)
+    assert total == Decimal("0.03")
+    assert money_total([Decimal("100.50"), Decimal("20")]) == Decimal("120.50")
+
+
+def test_money_total_of_nothing_is_zero_with_kopecks():
+    empty = money_total([])
+    assert empty == 0 and str(empty) == "0.00"
+    assert str(money_total(x for x in [])) == "0.00"        # годится и генератор
+
+
+def test_money_total_rounds_half_up_like_the_rest_of_the_calculator():
+    assert money_total([Decimal("0.125"), Decimal("0.135")]) == Decimal("0.27")   # 0,13 + 0,14
+    assert str(money_total([Decimal("5700000")])) == "5700000.00"

@@ -9,35 +9,17 @@
                      число с запятой без разрядов -- «12,5»
     <поле>_percent   ставка-доля как проценты строкой -- 0,05 -> «5», 0,002 -> «0,2»
 
-Единственная арифметика этого слоя -- вынужденная: ставка * 100 и итог списка
-(сумма уже напечатанных строк). Всё остальное берётся из расчёта и контекста.
+Арифметики здесь нет вовсе: форматирование (money, percent, number_ru) живёт в
+app.render.context, итог списка (money_total) -- в app.calc, суммы строк и НДС
+позиций -- в контексте документов. Этот слой только собирает ответ.
 """
-from decimal import ROUND_HALF_UP, Decimal
-
-from app.render.context import money
+from app.render.context import money, number_ru, percent
 from app.web.schema import Entity, plain
 
-_KOPECK = Decimal("0.01")
 
-
-def percent_text(rate: Decimal | None) -> str | None:
-    """0.05 -> «5», 0.055 -> «5,5»; нет ставки -- None."""
-    if rate is None:
-        return None
-    return format((rate * 100).normalize(), "f").replace(".", ",")
-
-
-def number_text(value: Decimal) -> str:
-    """Не деньги: часы и количества. 12.50 -> «12,5», 360 -> «360»."""
-    return format(value.normalize(), "f").replace(".", ",")
-
-
-def money_total(values) -> Decimal:
-    """Итог списка денег: сумма строк, КАЖДАЯ из которых округлена до копеек,
-    как она будет напечатана (доктрина напечатанной строки: итог сходится с
-    видимыми над ним строками). Пустой список -- 0.00."""
-    return sum((v.quantize(_KOPECK, rounding=ROUND_HALF_UP) for v in values),
-               Decimal("0.00"))
+def percent_text(rate) -> str | None:
+    """Ставка-доля -> «5», «5,5»; нет ставки -- None."""
+    return None if rate is None else percent(rate)
 
 
 def present(entity: Entity, obj) -> dict:
@@ -47,11 +29,11 @@ def present(entity: Entity, obj) -> dict:
         value = getattr(obj, name)
         body[name + "_text"] = None if value is None else money(value)
     for name in entity.numbers:
-        body[name + "_text"] = number_text(getattr(obj, name))
+        body[name + "_text"] = number_ru(getattr(obj, name))
     for name in entity.percents:
         body[name + "_percent"] = percent_text(getattr(obj, name))
     if hasattr(obj, "norms"):
-        body["norms_text"] = {post: number_text(hours) for post, hours in obj.norms.items()}
+        body["norms_text"] = {post: number_ru(hours) for post, hours in obj.norms.items()}
     return body
 
 
