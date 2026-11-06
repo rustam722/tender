@@ -1,0 +1,11 @@
+{
+  "source": "employees",
+  "numbered": true,
+  "columns": [
+    {"header": "№ п/п"},
+    {"header": "Должность сотрудников / профессия", "parts": ["position"]},
+    {"header": "Фамилия, имя, отчество сотрудника", "parts": ["full_name"]},
+    {"header": "Образование, квалификация, сертификаты, ученая степень, награды, участие в международных проектах и др.", "parts": ["education", "qualification"], "join": ", "},
+    {"header": "Стаж работы в данной или аналогичной должности, лет", "parts": ["experience_years"]}
+  ]
+}

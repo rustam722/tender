@@ -1,0 +1,13 @@
+{
+  "source": "assets",
+  "numbered": false,
+  "columns": [
+    {"header": "Наименование", "parts": ["name"]},
+    {"header": "Изготовитель, марка", "parts": ["maker_model"]},
+    {"header": "Количество, шт.", "parts": ["quantity"]},
+    {"header": "Год выпуска", "parts": ["year"]},
+    {"header": "Мощность (производительность)", "parts": []},
+    {"header": "Нынешнее состояние (местонахождение и текущие обязательства)", "parts": ["location"]},
+    {"header": "Источник (собственное, взято в аренду, лизинг и т.д.) (на балансе Участника, у кого арендовано, договор № и т.д.)", "parts": ["ownership_basis", "ownership_doc"], "join": ": "}
+  ]
+}
