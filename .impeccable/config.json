@@ -1,0 +1,17 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "app/web/static/app.css"
+        ],
+        "createdAt": "2026-11-06T05:16:16.936Z",
+        "reason": "Claude: L59 is .notice, a semantic alert element, not a card. The coloured left edge encodes severity together with --err-line/--warn-line/--ok-line, a pre-AI alert convention (Bootstrap alerts, docs admonitions). Error legibility is this project's core concern: the user is a non-programmer and the refusal banner is their only diagnostic. Cards (.card, L71) carry no accent stripe."
+      }
+    ]
+  }
+}
