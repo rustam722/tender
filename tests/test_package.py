@@ -15,7 +15,7 @@ from openpyxl import load_workbook
 from app import db
 from app.models import (
     ROLE_CUSTOMER, ROLE_PARTICIPANT, Asset, CustomerProfile, DocSpec,
-    LotItem, Organization, Tender,
+    ExperienceRecord, LotItem, Organization, Tender,
 )
 from app.render import package as package_module
 from app.render.package import (
@@ -578,6 +578,7 @@ def test_document_listed_twice_is_built_once(repo, dirs, tmp_path):
     assert len(result.skipped) == 1
     assert result.skipped[0][0] == DECLARATION
     assert "дважды" in result.skipped[0][1]
+    assert "обработан один раз" in result.skipped[0][1]
 
 
 def test_two_documents_with_the_same_final_name_do_not_overwrite_each_other(
@@ -632,7 +633,8 @@ def test_excel_form_is_filled_from_the_customers_own_workbook(repo, dirs, tmp_pa
     ws = load_workbook(result.written[0])["Лист1"]
     assert ws["D8"].value == "Ставка НДС: 5%"
     assert ws["E9"].value == "=C9+D9"               # формулы заказчика целы
-    assert ws["C9"].value == pytest.approx(100000.10)
+    # точное сравнение: приближённое спрятало бы регресс округления денег
+    assert Decimal(str(ws["C9"].value)) == Decimal("100000.10")
 
 
 def test_refused_excel_form_leaves_no_file_and_spares_the_word_documents(
@@ -958,3 +960,187 @@ def test_planned_files_missing_templates_folder_is_package_error(
 def test_planned_files_for_an_empty_package_is_empty(repo, dirs, tmp_path):
     tid = make_tender(repo)
     assert planned_files(tid, [], tmp_path / "out", repo) == []
+
+
+# ---- круг ревью: временные файлы, experience_ids, мелочи ----------------------
+
+def test_leftover_temp_files_of_a_killed_build_are_swept_at_the_start(
+        repo, dirs, tmp_path):
+    # питание отключили посреди пересборки: остаток не должен уйти заказчику
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION])
+    out = tmp_path / "out"
+    out.mkdir()
+    ours = ["~pkg-deadbeef.docx", "~pkg-0123abcd.xlsx"]
+    foreign = ["~$Декларация соответствия.docx",     # замок Word
+               "~pkg-zzzzzzzz.docx", "~pkg-deadbeef.pdf", "~заметки.docx",
+               "чужой.docx"]
+    for name in ours + foreign:
+        (out / name).write_bytes(b"x")
+    build_package(tid, [DECLARATION], out, repo)
+    assert names(out) == sorted(foreign + [f"{DECLARATION}.docx"])
+
+
+def test_planned_files_does_not_sweep(repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION])
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "~pkg-deadbeef.docx").write_bytes(b"x")
+    planned_files(tid, [DECLARATION], out, repo)
+    assert names(out) == ["~pkg-deadbeef.docx"]
+
+
+def test_temp_name_is_checked_for_being_taken(repo, dirs, tmp_path, monkeypatch):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "новый")
+    tid = make_tender(repo, documents=[DECLARATION])
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / f"{DECLARATION}.docx").write_bytes(b"old")
+    stale = out / "~pkg-aaaaaaaa.docx"
+    stale.write_bytes(b"stale")
+    ids = iter(["a" * 32, "b" * 32])
+
+    class Fake:
+        def __init__(self, hex):
+            self.hex = hex
+
+    monkeypatch.setattr(package_module.uuid, "uuid4", lambda: Fake(next(ids)))
+    monkeypatch.setattr(package_module, "_sweep_temp_files", lambda folder: None)
+    result = build_package(tid, [DECLARATION], out, repo, overwrite=True)
+    assert result.skipped == [] and len(result.written) == 1
+    assert stale.read_bytes() == b"stale"            # чужой остаток не затронут
+    assert text_of(out / f"{DECLARATION}.docx") == ["новый"]
+
+
+def test_failure_to_remove_the_temp_file_does_not_hide_the_real_reason(
+        repo, dirs, tmp_path, monkeypatch):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION])
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / f"{DECLARATION}.docx").write_bytes(b"old")
+
+    def crash_after_writing(template, context, target):
+        Path(target).write_bytes(b"half")
+        raise package_module.TemplateError("Настоящая причина сбоя.")
+
+    real_unlink = Path.unlink
+
+    def stubborn(self, *args, **kwargs):
+        if self.name.startswith("~pkg-"):
+            raise PermissionError("held by antivirus")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(package_module, "render_docx", crash_after_writing)
+    monkeypatch.setattr(Path, "unlink", stubborn)
+    result = build_package(tid, [DECLARATION], out, repo, overwrite=True)
+    assert result.written == []
+    assert "Настоящая причина сбоя" in result.skipped[0][1]
+    assert "PermissionError" not in result.skipped[0][1]
+
+
+def test_duplicate_message_does_not_claim_the_first_one_was_built(
+        repo, dirs, tmp_path):
+    # первый экземпляр не собрался (нет шаблона) -- «собран один раз» было бы ложью
+    tid = make_tender(repo, documents=[MTR])
+    result = build_package(tid, [MTR, MTR], tmp_path / "out", repo)
+    assert result.written == [] and len(result.skipped) == 2
+    second = result.skipped[1][1]
+    assert "дважды" in second and "собран" not in second
+
+
+def test_target_that_is_a_folder_gets_the_right_advice(repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    make_template(templates / f"{MTR}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION, MTR])
+    out = tmp_path / "out"
+    (out / f"{DECLARATION}.docx").mkdir(parents=True)
+    assert planned_files(tid, [DECLARATION, MTR], out, repo) == [
+        (MTR, out / f"{MTR}.docx")]
+    for overwrite in (False, True):
+        result = build_package(tid, [DECLARATION, MTR], out, repo,
+                               overwrite=overwrite)
+        reason = dict(result.skipped)[DECLARATION]
+        assert "папк" in reason and "Word" not in reason
+        assert (out / f"{DECLARATION}.docx").is_dir()
+        (out / f"{MTR}.docx").unlink(missing_ok=True)
+
+
+def test_second_document_is_written_when_replacing_the_first_is_refused(
+        repo, dirs, tmp_path, monkeypatch):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "новый")
+    make_template(templates / f"{MTR}.docx", "новый")
+    tid = make_tender(repo, documents=[DECLARATION, MTR])
+    out = tmp_path / "out"
+    out.mkdir()
+    for name in (DECLARATION, MTR):
+        (out / f"{name}.docx").write_bytes(b"old")
+    real_replace = package_module.os.replace
+
+    def locked_first(src, dst):
+        if Path(dst).name == f"{DECLARATION}.docx":
+            raise PermissionError("open in Word")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(package_module.os, "replace", locked_first)
+    result = build_package(tid, [DECLARATION, MTR], out, repo, overwrite=True)
+    assert [p.name for p in result.written] == [f"{MTR}.docx"]
+    assert result.skipped[0][0] == DECLARATION and "открыт" in result.skipped[0][1]
+    assert (out / f"{DECLARATION}.docx").read_bytes() == b"old"
+    assert text_of(out / f"{MTR}.docx") == ["новый"]
+    assert names(out) == sorted([f"{DECLARATION}.docx", f"{MTR}.docx"])
+
+
+EXPERIENCE_LINE = "{% for r in experience.rows %}{{ r[1] }};{% endfor %}"
+
+
+def experience_tender(repo):
+    first = repo.save_experience(ExperienceRecord(customer_name="Первый"))
+    second = repo.save_experience(ExperienceRecord(customer_name="Второй"))
+    third = repo.save_experience(ExperienceRecord(customer_name="Третий"))
+    tid = make_tender(repo, documents=[EXPERIENCE])
+    tender = repo.get_tender(tid)
+    tender.experience_ids = [first]               # отбор, сохранённый при тендере
+    repo.save_tender(tender)
+    return tid, (first, second, third)
+
+
+def test_experience_ids_choose_the_contracts_for_the_experience_reference(
+        repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{EXPERIENCE}.docx", EXPERIENCE_LINE)
+    tid, (first, second, third) = experience_tender(repo)
+    out = tmp_path / "out"
+    build_package(tid, [EXPERIENCE], out, repo, experience_ids=[third, second])
+    # те, что выбрал пользователь, в его порядке; сохранённый отбор не применён
+    text = text_of(out / f"{EXPERIENCE}.docx")[0]
+    assert text.index("Третий") < text.index("Второй")
+    assert "Первый" not in text
+
+
+def test_experience_ids_none_takes_the_selection_stored_with_the_tender(
+        repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{EXPERIENCE}.docx", EXPERIENCE_LINE)
+    tid, _ = experience_tender(repo)
+    out = tmp_path / "out"
+    build_package(tid, [EXPERIENCE], out, repo)
+    text = text_of(out / f"{EXPERIENCE}.docx")[0]
+    assert "Первый" in text and "Второй" not in text
+
+
+def test_empty_experience_ids_mean_no_experience_not_the_stored_selection(
+        repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{EXPERIENCE}.docx", "[" + EXPERIENCE_LINE + "]")
+    tid, _ = experience_tender(repo)
+    out = tmp_path / "out"
+    build_package(tid, [EXPERIENCE], out, repo, experience_ids=[])
+    assert text_of(out / f"{EXPERIENCE}.docx")[0] == "[]"

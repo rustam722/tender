@@ -46,6 +46,11 @@ MAX_NAME_LENGTH = 255       # предел имени файла в NTFS, в з�
 MAX_PATH_LENGTH = 259       # MAX_PATH Windows без завершающего нуля: дальше
                             # Проводник, Word и Excel файл не открывают
 _SUPPORTED = (".docx", ".xlsx")
+# Временный файл заменяемого документа. Имя узнаваемо и не пересекается с
+# замками Word («~$имя.docx») и чужими файлами: по нему сборка подметает остатки
+# оборванных запусков, и ничего другого не трогает.
+_TEMP_PREFIX = "~pkg-"
+_TEMP_NAME = re.compile(r"~pkg-[0-9a-f]{8}\.(docx|xlsx)")
 _FALLBACK_NAME = "Документ"
 _RESERVED = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
@@ -128,6 +133,33 @@ def _make_folder(out_dir: Path) -> None:
             "файла и что в этом месте можно записывать.") from exc
 
 
+def _sweep_temp_files(folder: Path) -> None:
+    """Убирает остатки оборванных замен: питание отключили или задачу сняли
+    посреди сборки, и уборка «по ходу» не сработала. Папка уходит заказчику,
+    лишнего в ней быть не должно. Удаляются только файлы по шаблону имени."""
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return                  # уборка -- забота второго плана
+    for entry in entries:
+        if _TEMP_NAME.fullmatch(entry.name):
+            try:
+                if entry.is_file():
+                    entry.unlink()
+            except OSError:
+                pass            # занят -- подметём в следующий раз
+
+
+def _temp_path(target: Path) -> Path:
+    """Свободное временное имя рядом с целью (в той же папке: замена -- один
+    os.replace, без копирования между томами)."""
+    while True:
+        candidate = target.with_name(
+            f"{_TEMP_PREFIX}{uuid.uuid4().hex[:8]}{target.suffix}")
+        if not candidate.exists():
+            return candidate
+
+
 def _target(out_dir: Path, document: str, prefix: str, extension: str) -> Path:
     """Путь будущего файла. Имя -- префикс + документ, очищенные и обрезанные
     так, чтобы с расширением влезть в предел имени и в предел полного пути."""
@@ -174,8 +206,15 @@ def _plan_one(document: str, spec, out_dir: Path,
             f"Имя файла «{target.name}» совпало с другим документом пакета: "
             "второй не записан. Задайте документам разные префиксы в профиле "
             "заказчика.")
+    if target.is_dir():
+        raise _Refusal(
+            f"На месте файла «{target.name}» в папке лежит папка с таким же "
+            "именем. Переименуйте или уберите её, либо выберите другую папку.")
     if template.suffix.lower() == ".xlsx":
         if not spec or not spec.cellmap:
+            # Недостижимо: DocSpec отвергает .xlsx без карты при создании, а
+            # пустой template всегда даёт .docx. Оставлено на случай профиля,
+            # собранного в обход DocSpec; не полагайтесь на эту ветку.
             raise _Refusal(
                 f"Для книги «{template.name}» в профиле заказчика не указана "
                 "карта ячеек. Добавьте её в описание документа.")
@@ -189,7 +228,7 @@ def _plan_one(document: str, spec, out_dir: Path,
 
 def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
                taken: set[str], warnings: list[tuple[str, str]],
-               overwrite: bool) -> Path:
+               overwrite: bool, experience_ids) -> Path:
     """Собирает один документ; при отказе поднимает исключение. Нового файла
     после отказа не остаётся, а прежний (при overwrite) остаётся целым."""
     template, target = _plan_one(document, spec, out_dir, taken)
@@ -200,13 +239,13 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
             "не потерять ваши правки. Разрешите замену существующих файлов, "
             "переименуйте или удалите его либо выберите другую папку.")
 
-    context = build_context(tender_id, repo, document=document)
+    context = build_context(tender_id, repo, document=document,
+                           experience_ids=experience_ids)
     warnings.extend((document, text) for text in context["warnings"])
     # Заменяемый файл не трогается, пока новый не готов: пишется рядом под
     # временным именем и подменяет прежний одним действием. Сбой посреди записи
     # не должен стоить пользователю прежней версии.
-    work = (target.with_name(f"~{uuid.uuid4().hex[:8]}{target.suffix}")
-            if replacing else target)
+    work = _temp_path(target) if replacing else target
     try:
         if template.suffix.lower() == ".xlsx":
             fill_workbook(template, load_cellmap(CELLMAPS_DIR / spec.cellmap),
@@ -223,7 +262,10 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
                     "прежняя версия осталась целой.") from exc
     except BaseException:
         # work -- либо новый файл, либо временный: прежнего файла он не касается
-        work.unlink(missing_ok=True)
+        try:
+            work.unlink(missing_ok=True)
+        except OSError:
+            pass        # настоящая причина важнее; остаток подметёт следующая сборка
         raise
     return target
 
@@ -275,7 +317,9 @@ def planned_files(tender_id: int, documents: list[str], out_dir: Path,
 
 
 def build_package(tender_id: int, documents: list[str], out_dir: Path,
-                  repo: Repo, overwrite: bool = False) -> PackageResult:
+                  repo: Repo, overwrite: bool = False,
+                  experience_ids: list[int] | tuple[int, ...] | None = None
+                  ) -> PackageResult:
     """Собирает документы `documents` тендера в папку `out_dir`.
 
     Папка создаётся, если её нет. `overwrite=False` (по умолчанию): существующий
@@ -283,12 +327,19 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
     заменяется, но только когда новый готов; не собрался -- прежний цел.
     Экран спрашивает пользователя один раз, если хоть один целевой файл есть.
 
+    `experience_ids` -- записи опыта для справки об опыте, в нужном порядке;
+    `None` -- отбор, сохранённый при тендере (как в `build_context`), пустой
+    список -- без опыта.
+
+    Перед сборкой из папки убираются остатки оборванных замен (`~pkg-xxxxxxxx`).
+
     Неизвестный тендер -- `LookupError`; нет папки шаблонов или нельзя создать
     папку пакета -- `PackageError`; в обоих случаях на диск ничего не пишется.
     Сбой одного документа в исключение не превращается: см. `PackageResult.skipped`.
     """
     profile, out_dir = _prepare(tender_id, documents, out_dir, repo)
     _make_folder(out_dir)
+    _sweep_temp_files(out_dir)
 
     result = PackageResult()
     seen: set[str] = set()
@@ -296,13 +347,14 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
     for document in documents:
         if document in seen:
             result.skipped.append((document, (
-                "Документ указан в составе пакета дважды: собран один раз.")))
+                "Документ указан в составе пакета дважды: обработан один раз.")))
             continue
         seen.add(document)
         spec = profile.docs.get(document) if profile else None
         try:
             path = _build_one(tender_id, document, spec, out_dir, repo,
-                              taken, result.warnings, overwrite)
+                              taken, result.warnings, overwrite,
+                              experience_ids)
         except _Refusal as exc:
             result.skipped.append((document, str(exc)))
         except (TemplateError, CellMapError, LayoutError) as exc:
