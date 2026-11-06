@@ -86,7 +86,7 @@ async function writeRecord(path, record) {
  * колонками. Цена остаётся ТЕКСТОМ, как вставлена: разбирает её сервер. Строку без
  * чёткого разделителя не угадываем -- «АЗК № 4 350 000,00» не отличить от
  * «АЗК № 4 350» и «000,00», а неверная цена в заявке хуже лишнего вопроса. */
-function parsePasted(text) {
+function splitPasted(text) {
   const lines = String(text).split(/\r\n|\r|\n/).filter((line) => line.trim() !== '');
   const delimiter = lines.some((line) => line.includes('\t')) ? '\t'
     : lines.some((line) => line.includes(';')) ? ';' : '';
@@ -162,13 +162,59 @@ function toggleId(list, id, on) {
   return rest.filter((item) => item !== key);
 }
 
-/* Сборка пакета. Замок: пока одна сборка идёт, вторая не стартует -- её
- * подметание удалило бы временный файл первой. Кнопка блокируется до первого
- * ответа сервера (setBusy вызывается синхронно). Перед сборкой -- plan: если в
- * папке уже лежат файлы, вопрос называет документы, которые будут заменены. */
-function createBuilder({ api: call, confirmReplace, setBusy }) {
-  let running = false;
+/* Реестр идущих сборок. Живёт на уровне МОДУЛЯ, а не экрана: экран при каждом
+ * переходе строится заново, и замок, лежавший в нём, снимался бы переходом на
+ * «Карточку тендера» и обратно -- вторая сборка уходила бы в ту же папку, а
+ * результат первой рисовался бы в отсоединённый DOM. Замок -- по папке и по
+ * тендеру: в одну папку и по одному тендеру одновременно собирается не больше
+ * одной сборки (подметание второй удалило бы временный файл первой).
+ * Экран подключается (attach) и получает: занята ли сборка его тендера, и
+ * результат -- и текущий, и тот, что закончился, пока экрана не было. */
+function folderKey(folder) {
+  return String(folder || '').trim().replace(/[\\/]+/g, '/').replace(/\/$/, '').toLowerCase();
+}
 
+function createBuildRegistry() {
+  const active = [];
+  const finished = new Map();
+  let view = null;
+  const same = (a, b) => String(a) === String(b);
+  const isBusy = (tenderId) => active.some((entry) => same(entry.tenderId, tenderId));
+  const folderOf = (tenderId) => (active.find((entry) => same(entry.tenderId, tenderId)) || {}).raw;
+  const tell = (tenderId) => { if (view && same(view.tenderId, tenderId)) view.setBusy(isBusy(tenderId), folderOf(tenderId)); };
+  return {
+    isBusy,
+    begin(tenderId, folder) {
+      const key = folderKey(folder);
+      if (active.some((entry) => entry.folder === key || same(entry.tenderId, tenderId))) return false;
+      active.push({ tenderId, folder: key, raw: String(folder || '').trim() });
+      finished.delete(String(tenderId));
+      tell(tenderId);
+      return true;
+    },
+    end(tenderId, folder, outcome) {
+      const key = folderKey(folder);
+      const index = active.findIndex((entry) => entry.folder === key && same(entry.tenderId, tenderId));
+      if (index >= 0) active.splice(index, 1);
+      if (outcome && (outcome.status === 'built' || outcome.status === 'failed')) finished.set(String(tenderId), outcome);
+      tell(tenderId);
+      if (outcome && view && same(view.tenderId, tenderId)) view.show(outcome);
+    },
+    attach(tenderId, handlers) {
+      view = { tenderId, ...handlers };
+      handlers.setBusy(isBusy(tenderId), folderOf(tenderId));
+      if (finished.has(String(tenderId))) handlers.show(finished.get(String(tenderId)));
+    },
+    detach() { view = null; },
+  };
+}
+
+const buildRegistry = createBuildRegistry();
+
+/* Сборка пакета. Кнопка блокируется до первого ответа сервера (реестр говорит
+ * экрану busy синхронно). Перед сборкой -- plan: если в папке уже лежат файлы,
+ * вопрос называет документы, которые будут заменены. */
+function createBuilder({ api: call, confirmReplace, registry = buildRegistry }) {
   async function attempt(request) {
     const { tenderId, documents, experienceIds } = request;
     const outputDir = String(request.outputDir || '').trim();
@@ -198,28 +244,31 @@ function createBuilder({ api: call, confirmReplace, setBusy }) {
   }
 
   async function run(request) {
-    if (running) return { status: 'busy' };
-    running = true;
-    setBusy(true);
+    const folder = String(request.outputDir || '').trim();
+    if (!registry.begin(request.tenderId, folder)) return { status: 'busy' };
+    let outcome;
     try {
-      return await attempt(request);
+      outcome = await attempt(request);
     } catch (error) {
-      if (error instanceof ApiFailure) return { status: 'failed', error: error.message };
-      console.error(error);
-      return { status: 'failed', error: 'Сборка прервана из-за ошибки в самой странице. Обновите страницу и повторите.' };
+      if (error instanceof ApiFailure) {
+        outcome = { status: 'failed', error: error.message };
+      } else {
+        console.error(error);
+        outcome = { status: 'failed', error: 'Сборка прервана из-за ошибки в самой странице. Обновите страницу и повторите.' };
+      }
     } finally {
-      running = false;
-      setBusy(false);
+      registry.end(request.tenderId, folder, outcome);
     }
+    return outcome;
   }
 
-  return { run, get busy() { return running; } };
+  return { run };
 }
 
 if (typeof module === 'object' && module.exports) {
   module.exports = {
-    ApiFailure, api, splitWarning, recordForWrite, writeRecord, parsePasted, lotPayload,
-    differenceKind, documentChoices, serviceOf, toggleId, createBuilder,
+    ApiFailure, api, splitWarning, recordForWrite, writeRecord, splitPasted, lotPayload,
+    differenceKind, documentChoices, serviceOf, toggleId, createBuilder, createBuildRegistry, buildRegistry,
   };
 }
 
@@ -341,6 +390,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
 
     async function render() {
       renderToken += 1;
+      buildRegistry.detach();                 // экран сборки подключится заново, если он следующий
       const mine = { token: renderToken, dirty: [] };
       active = mine;
       const parts = location.hash.replace(/^#\/?/, '').split('/');
@@ -1203,12 +1253,12 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         let preview = [];       // { name, price, problem, tr, nameInput, priceInput, problemCell }
         const applyBtn = h('button', { type: 'button', class: 'primary', text: 'Заменить список лота этим списком', disabled: true });
 
-        function drawPreview(parsed) {
+        function drawPreview(incoming) {
           preview = [];
           previewBox.replaceChildren();
-          if (!parsed.length) { applyBtn.disabled = true; return; }
+          if (!incoming.length) { applyBtn.disabled = true; return; }
           const body = h('tbody');
-          for (const item of parsed) {
+          for (const item of incoming) {
             const nameInput = h('input', { type: 'text', value: item.name, 'aria-label': 'Наименование', autocomplete: 'off' });
             const priceInput = h('input', { type: 'text', value: item.price, class: 'num', 'aria-label': 'Цена', autocomplete: 'off', inputmode: 'decimal' });
             const problemCell = h('td', { class: 'row-problem', text: item.problem });
@@ -1230,9 +1280,9 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
           const flagged = preview.some((e) => e.problemCell.textContent);
           applyBtn.disabled = !preview.length || blank || flagged;
         }
-        const parseBtn = h('button', { type: 'button', text: 'Разобрать список', onclick: () => {
+        const splitBtn = h('button', { type: 'button', text: 'Разобрать список', onclick: () => {
           pasteMsg.clear();
-          const { rows } = parsePasted(area.value);
+          const { rows } = splitPasted(area.value);
           if (!rows.length) { pasteMsg.show('warning', 'В поле пусто: вставьте список (Ctrl+V) и нажмите «Разобрать список».'); drawPreview([]); return; }
           drawPreview(rows);
           if (rows.some((r) => r.problem)) pasteMsg.show('warning', 'В некоторых строках есть замечания — они подсвечены. Поправьте или уберите такие строки.');
@@ -1241,7 +1291,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
           pasteMsg.clear();
           try {
             area.value = await navigator.clipboard.readText();
-            parseBtn.click();
+            splitBtn.click();
           } catch (error) {
             pasteMsg.show('warning', 'Браузер не дал прочитать буфер обмена. Щёлкните в поле ниже и нажмите Ctrl+V.');
             area.focus();
@@ -1276,7 +1326,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         });
         return h('details', { class: 'paste' }, h('summary', { text: 'Вставить список из буфера обмена', style: 'cursor:pointer;font-weight:600;margin-top:12px' }),
           pasteMsg.el, h('div', { class: 'actions' }, clipBtn), h('div', { style: 'margin-top:8px' }, area),
-          h('div', { class: 'actions' }, parseBtn), previewBox, h('div', { class: 'actions' }, applyBtn));
+          h('div', { class: 'actions' }, splitBtn), previewBox, h('div', { class: 'actions' }, applyBtn));
       }
 
       /* -- трудозатраты: список должностей и заполнение по нормам -- */
@@ -1344,7 +1394,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         function drawEstimate(data, { pending }) {
           shown = { estimate: data.estimate, pending };
           const table = h('table', { class: 'estimate-table' }, h('tbody', {}, ROWS.map(([key, label]) => h('tr', { class: key.startsWith('total') ? 'total' : '' },
-            h('td', { text: key === 'vat' ? (data.vat_percent === undefined ? 'НДС' : `НДС по ставке ${data.vat_percent} %`) : label }), h('td', { text: data.estimate[key] })))));
+            h('td', { text: key === 'vat' ? (data.vat_percent === undefined ? 'НДС' : `НДС по ставке ${data.vat_percent} %`) : label }), h('td', { text: data.estimate[key] ?? DASH })))));
           const pieces = [pending ? h('p', { class: 'notice warning', text: 'Это расчёт по подобранным часам — они ещё не записаны в тендер.' }) : null, table,
             h('p', { class: 'hint', text: 'Итог без НДС округляется по настройке округления (обычно до целых рублей), поэтому может отличаться от суммы напечатанных выше статей — до 50 копеек. Так устроена книга заказчика.' })];
           if (data.difference !== undefined) {
@@ -1353,9 +1403,9 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
             const own = data.target_includes_vat ? data.estimate.total_with_vat : data.estimate.total_wo_vat;
             const verdict = { above: 'итог выше цели', below: 'итог ниже цели', equal: 'итог равен цели', unknown: '' }[kind];
             pieces.push(h('div', { class: `gap ${kind}`, role: 'status' },
-              h('div', { class: 'line', text: `Цель ${which}: ${data.target} руб.` }),
-              h('div', { class: 'line', text: `Итог ${which} по расчёту: ${own} руб.` }),
-              h('div', { class: 'line' }, 'Расхождение (итог минус цель): ', h('span', { class: 'figure', text: `${data.difference} руб.` }), verdict ? ` — ${verdict}` : '')));
+              h('div', { class: 'line', text: `Цель ${which}: ${data.target ?? DASH} руб.` }),
+              h('div', { class: 'line', text: `Итог ${which} по расчёту: ${own ?? DASH} руб.` }),
+              h('div', { class: 'line' }, 'Расхождение (итог минус цель): ', h('span', { class: 'figure', text: `${data.difference ?? DASH} руб.` }), verdict ? ` — ${verdict}` : '')));
           } else {
             pieces.push(h('p', { class: 'hint', text: 'Целевая цена не задана — расхождение показывается, когда она введена.' }));
           }
@@ -1428,7 +1478,11 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
           proposal = null;
           proposalBox.replaceChildren();
           if (view.warning) {
-            msg.show('warning', view.warning, ['Часы записаны. Суммы по строкам и итоги не пришли — не пересчитывайте их вручную: обновите страницу.']);
+            // часы записаны, а расчёта по ним нет: прежний расчёт (с пометкой «ещё не записаны») убираем
+            shown = null;
+            resultBox.replaceChildren();
+            priceBtn.disabled = true;
+            msg.show('warning', view.warning, ['Часы записаны. Суммы по строкам и итоги не пришли — не пересчитывайте их вручную: нажмите «Посчитать» или обновите страницу.']);
             return;
           }
           await refreshEstimate();
@@ -1532,11 +1586,6 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       const buildButton = h('button', { type: 'button', class: 'primary big', text: 'Собрать пакет' });
       const builder = createBuilder({
         api,
-        setBusy: (busy) => {
-          buildButton.disabled = busy;
-          buildButton.textContent = busy ? 'Идёт сборка… не закрывайте страницу' : 'Собрать пакет';
-          buildButton.setAttribute('aria-busy', String(busy));
-        },
         confirmReplace: (files) => ask({
           title: 'В папке уже есть документы',
           message: 'Эти документы будут заменены новыми. Правки, внесённые в них вручную, пропадут:',
@@ -1544,25 +1593,35 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
           ok: 'Заменить и собрать', cancel: 'Отмена' }),
       });
       buildButton.addEventListener('click', async () => {
-        msg.clear();
-        resultBox.replaceChildren();
         const outcome = await builder.run({ tenderId: tender.id, documents: choices.filter((c) => chosen.has(c.name)).map((c) => c.name),
           outputDir: folder.value, experienceIds: selected });
+        if (outcome.status === 'busy') msg.show('warning', 'Сборка этого тендера или в эту папку уже идёт. Дождитесь её окончания.');
+      });
+      /* Состояние кнопки и результат приходят из реестра: так они переживают переход
+         на другой экран и обратно. */
+      function setBusy(busy, runningFolder) {
+        buildButton.disabled = busy;
+        if (busy && runningFolder && !folder.value.trim()) folder.value = runningFolder;   // экран собран заново, поле было пусто
+        buildButton.textContent = busy ? 'Идёт сборка… не закрывайте страницу' : 'Собрать пакет';
+        buildButton.setAttribute('aria-busy', String(busy));
+        if (busy) { msg.clear(); resultBox.replaceChildren(); }
+      }
+      function showOutcome(outcome) {
         if (outcome.status === 'failed') msg.show('error', outcome.error);
         else if (outcome.status === 'cancelled') msg.show('warning', 'Сборка отменена: файлы в папке не тронуты.');
         else if (outcome.status === 'built') drawResult(outcome);
-      });
+      }
       function drawResult({ result, note }) {
         const parts = [h('h2', { text: 'Результат сборки' }),
-          h('p', {}, 'Папка: ', h('code', { class: 'path', text: result.output_dir }))];
+          h('p', {}, 'Папка: ', h('code', { class: 'path', text: str(result.output_dir) }))];
         parts.push(h('h3', { text: 'Записано' }),
-          result.written.length ? h('ul', { class: 'result-list' }, result.written.map((w) => h('li', {}, w.name, ' ', h('code', { class: 'path', text: w.path }))))
+          (result.written || []).length ? h('ul', { class: 'result-list' }, result.written.map((w) => h('li', {}, w.name, ' ', h('code', { class: 'path', text: w.path }))))
             : h('p', { class: 'empty', text: 'Ни один документ не записан.' }));
-        if (result.skipped.length) {
+        if ((result.skipped || []).length) {
           parts.push(h('div', { class: 'notice error' }, h('p', { class: 'title', text: 'Не собрано — и почему' }),
             h('ul', {}, result.skipped.map((s) => h('li', { text: `${s.document}: ${s.reason}` })))));
         }
-        if (result.warnings.length) {
+        if ((result.warnings || []).length) {
           parts.push(h('div', { class: 'notice warning' }, h('p', { class: 'title', text: 'Предупреждения — проверьте перед подачей' }),
             h('ul', {}, result.warnings.map((w) => h('li', { text: `${w.document}: ${w.text}` })))));
         }
@@ -1586,6 +1645,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
           h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Папка, в которую собрать пакет' }), folder,
             h('span', { class: 'hint', text: 'Полный путь на этом компьютере, например C:\\Тендеры\\Коряжма. Браузер не умеет выбирать папку, поэтому путь вводится текстом (его можно скопировать из проводника). Папка запоминается в тендере после первой сборки.' })),
           h('div', { class: 'actions' }, buildButton), msg.el, resultBox)));
+      buildRegistry.attach(tender.id, { setBusy, show: showOutcome });
     }
 
     /* ---- запуск ---- */

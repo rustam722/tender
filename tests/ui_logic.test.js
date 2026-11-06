@@ -108,7 +108,7 @@ test('recordForWrite keeps everything that came back and overlays only the edits
 // ---- вставка списком ---------------------------------------------------------------
 
 test('paste from Excel: tab-separated name and price are kept as text, untouched', () => {
-  const { rows } = app.parsePasted(`АЗК № 4\t350${NBSP}000,00\r\nАЗК № 6\t420000\r\n\r\nАвтоколонна\t99 500,50\r\n`);
+  const { rows } = app.splitPasted(`АЗК № 4\t350${NBSP}000,00\r\nАЗК № 6\t420000\r\n\r\nАвтоколонна\t99 500,50\r\n`);
   assert.deepEqual(rows.map((r) => [r.name, r.price, r.problem]), [
     ['АЗК № 4', `350${NBSP}000,00`, ''],
     ['АЗК № 6', '420000', ''],
@@ -117,17 +117,17 @@ test('paste from Excel: tab-separated name and price are kept as text, untouched
 });
 
 test('paste: a leading ordinal column is dropped', () => {
-  const { rows } = app.parsePasted('1\tАЗК № 4\t350 000,00\n2.\tАЗК № 6\t420000');
+  const { rows } = app.splitPasted('1\tАЗК № 4\t350 000,00\n2.\tАЗК № 6\t420000');
   assert.deepEqual(rows.map((r) => [r.name, r.price]), [['АЗК № 4', '350 000,00'], ['АЗК № 6', '420000']]);
 });
 
 test('paste: semicolons work when there are no tabs', () => {
-  const { rows } = app.parsePasted('Разработка проекта; 5 700 000,00');
+  const { rows } = app.splitPasted('Разработка проекта; 5 700 000,00');
   assert.deepEqual(rows.map((r) => [r.name, r.price, r.problem]), [['Разработка проекта', '5 700 000,00', '']]);
 });
 
 test('paste: a line without a clear separator is NOT guessed -- a wrong price is worse than a question', () => {
-  const { rows } = app.parsePasted('Разработка проекта 5 700 000,00');
+  const { rows } = app.splitPasted('Разработка проекта 5 700 000,00');
   assert.equal(rows.length, 1);
   assert.equal(rows[0].price, '');
   assert.match(rows[0].problem, /цен/);
@@ -135,19 +135,19 @@ test('paste: a line without a clear separator is NOT guessed -- a wrong price is
 });
 
 test('paste: a name with no price is flagged, a price with no name is flagged', () => {
-  const { rows } = app.parsePasted('Только имя\n\t5000');
+  const { rows } = app.splitPasted('Только имя\n\t5000');
   assert.match(rows[0].problem, /цен/);
   assert.match(rows[1].problem, /наименован/);
 });
 
 test('paste: more than two columns is flagged, not silently dropped', () => {
-  const { rows } = app.parsePasted('АЗК\tшт.\t5\t350000');
+  const { rows } = app.splitPasted('АЗК\tшт.\t5\t350000');
   assert.equal(rows.length, 1);
   assert.match(rows[0].problem, /колон/);
 });
 
 test('empty paste gives no rows', () => {
-  assert.deepEqual(app.parsePasted('  \n\r\n').rows, []);
+  assert.deepEqual(app.splitPasted('  \n\r\n').rows, []);
 });
 
 test('lotPayload sends rows in order without computing numbers', () => {
@@ -212,15 +212,19 @@ test('toggleId keeps the order the user ticked and never duplicates', () => {
 // ---- сборка: замок, вопрос о замене, итог --------------------------------------------
 
 function builderWith(handler, overrides = {}) {
-  const calls = fakeFetch(handler);
+  const calls = overrides.keepFetch ? [] : fakeFetch(handler);   // keepFetch: тот же fetch, что у первого экрана
   const asked = [];
   const busy = [];
+  const shown = [];
+  const registry = overrides.registry || app.createBuildRegistry();
+  // «экран»: видит, занята ли сборка этого тендера, и получает результат
+  registry.attach(7, { setBusy: (value) => busy.push(value), show: (outcome) => shown.push(outcome) });
+  busy.length = 0;                       // первое setBusy(false) при подключении -- не событие сборки
   const builder = app.createBuilder({
-    api: app.api,
+    api: app.api, registry,
     confirmReplace: async (files) => { asked.push(files); return overrides.answer ?? true; },
-    setBusy: (value) => busy.push(value),
   });
-  return { builder, calls, asked, busy };
+  return { builder, calls, asked, busy, shown, registry };
 }
 const REQUEST = { tenderId: 7, documents: ['Справка о МТР', 'Декларация соответствия'],
                   outputDir: 'C:\\Тендеры\\Заявка', experienceIds: ['3', '4'] };
@@ -313,6 +317,65 @@ test('build: nothing ticked or no folder -- Russian refusal, no request at all',
   assert.deepEqual(busy, [true, false, true, false]);
 });
 
+test('build lock outlives the screen: leaving the build screen and coming back does not unlock a running build', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const registry = app.createBuildRegistry();          // один на всю страницу, экраны приходят и уходят
+  const first = builderWith(async (url) => {
+    if (url.endsWith('/plan')) { await gate; return { json: planOf([]) }; }
+    return buildRoutes([])(url);
+  }, { registry });
+  const running = first.builder.run(REQUEST);
+  assert.deepEqual(first.busy, [true]);
+
+  // переход на «Карточку тендера» и обратно: экран собран заново, сборщик новый, реестр тот же
+  registry.detach();
+  const callsBefore = first.calls.length;
+  const reopened = builderWith(null, { registry, keepFetch: true });
+  assert.deepEqual(reopened.busy, [], 'новый экран при подключении получил busy, а не «свободно»');
+  const again = await reopened.builder.run(REQUEST);
+  assert.equal(again.status, 'busy', 'вторая сборка в ту же папку не стартует');
+  assert.equal(first.calls.length, callsBefore, 'вторая сборка не отправила ни одного запроса');
+
+  release();
+  assert.equal((await running).status, 'built');
+  // результат первой сборки получил НОВЫЙ экран, а не отсоединённый старый
+  assert.equal(reopened.shown.length, 1);
+  assert.equal(reopened.shown[0].status, 'built');
+  assert.deepEqual(reopened.shown[0].result.skipped, builtOf.skipped, 'пропущенные документы видны пользователю');
+  assert.equal(first.shown.length, 0);
+  assert.deepEqual(reopened.busy, [false]);
+});
+
+test('build lock: a screen opened after the build finished still shows its result, once attached', async () => {
+  const registry = app.createBuildRegistry();
+  const one = builderWith(buildRoutes([]), { registry });
+  registry.detach();                                       // пользователь ушёл с экрана
+  await one.builder.run(REQUEST);
+  assert.equal(one.shown.length, 0, 'старый экран ничего не получает');
+  const late = [];
+  registry.attach(7, { setBusy: () => {}, show: (outcome) => late.push(outcome) });
+  assert.equal(late.length, 1);
+  assert.equal(late[0].status, 'built');
+});
+
+test('build lock is per folder and per tender: the same folder or the same tender cannot be built twice at once', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const registry = app.createBuildRegistry();
+  const slow = async (url) => { if (url.endsWith('/7/plan')) await gate; return buildRoutes([])(url); };
+  const a = builderWith(slow, { registry });
+  const running = a.builder.run(REQUEST);
+  const sameFolderOtherTender = await a.builder.run({ ...REQUEST, tenderId: 8, outputDir: 'c:/Тендеры/Заявка/' });
+  assert.equal(sameFolderOtherTender.status, 'busy', 'та же папка (слэши и регистр не обманывают)');
+  const sameTenderOtherFolder = await a.builder.run({ ...REQUEST, outputDir: 'C:\\Тендеры\\Другая' });
+  assert.equal(sameTenderOtherFolder.status, 'busy', 'тот же тендер -- одна сборка за раз');
+  const other = await a.builder.run({ ...REQUEST, tenderId: 8, outputDir: 'C:\\Тендеры\\Другая' });
+  assert.equal(other.status, 'built', 'другой тендер и другая папка не мешают');
+  release();
+  await running;
+});
+
 test('build: a built package whose folder could not be remembered still reports success, with a note', async () => {
   const { builder } = builderWith((url) => url === '/api/tenders'
     ? { status: 400, json: { error: 'Не сохранено.' } } : buildRoutes([])(url));
@@ -378,7 +441,7 @@ live('live: paste replaces the lot in one go; a bad row names itself and nothing
   const tender = await app.api('POST', '/api/tenders', { customer_id: String(customer.id), participant_id: String(me.id),
     subject: 'Разработка КЭР', purchase_date: '2025-10-24', price_wo_vat: '0' });
 
-  const pasted = app.parsePasted(`Объект 1\t350${NBSP}000,00\nОбъект 2\t420 000,50\n`);
+  const pasted = app.splitPasted(`Объект 1\t350${NBSP}000,00\nОбъект 2\t420 000,50\n`);
   const first = await app.api('PUT', `/api/tenders/${tender.id}/items`, app.lotPayload(pasted.rows));
   assert.equal(first.rows.length, 2);
   assert.equal(first.rows[0].price, `350${NBSP}000,00`);
@@ -386,7 +449,7 @@ live('live: paste replaces the lot in one go; a bad row names itself and nothing
   assert.equal(first.vat_percent, '5');
   assert.match(first.vat_total, /^\d/);
 
-  const bad = app.parsePasted('Раз\t100\nДва\tдорого\nТри\t300');
+  const bad = app.splitPasted('Раз\t100\nДва\tдорого\nТри\t300');
   await assert.rejects(app.api('PUT', `/api/tenders/${tender.id}/items`, app.lotPayload(bad.rows)), (error) => {
     assert.match(error.message, /Позиция №2/);
     assert.deepEqual(error.path.slice(0, 2), ['items', 1], 'экран знает, какую строку подсветить');
@@ -468,7 +531,9 @@ live('live: build asks about replacement by document names, locks, and remembers
 
   const asked = [];
   const busy = [];
-  const builder = app.createBuilder({ api: app.api, setBusy: (v) => busy.push(v),
+  const registry = app.createBuildRegistry();
+  registry.attach(tender.id, { setBusy: (v) => busy.push(v), show: () => {} });
+  const builder = app.createBuilder({ api: app.api, registry,
     confirmReplace: async (files) => { asked.push(files.map((f) => f.document)); return true; } });
   const request = { tenderId: tender.id, documents: choices.filter((c) => c.checked).map((c) => c.name),
                     outputDir: outDir, experienceIds: [] };
@@ -494,6 +559,56 @@ live('live: build asks about replacement by document names, locks, and remembers
   assert.equal(refusal.written.length, 0);
   assert.equal(refusal.skipped.length, 2);
   assert.match(refusal.skipped[0].reason, /уже есть/);
+});
+
+live('live: raw precision survives sending the whole labor list back (rate 10.005, hours 40,5)', async () => {
+  useRealServer();
+  const me = await app.api('POST', '/api/organizations', { role: 'participant', short_name: 'Я', inn: '5904188041' });
+  const tender = await app.api('POST', '/api/tenders', { participant_id: String(me.id), subject: 'Точность', price_wo_vat: '0' });
+  const base = `/api/tenders/${tender.id}`;
+  const made = await app.writeRecord(`${base}/labor`, { post: 'Инженер', headcount: '1', hours: '40,5', rate: '10.005' });
+  assert.equal(made.record.rate, '10,01', 'на экране копейки округлены');
+  assert.equal(made.record.rate_value, '10.005', 'а в записи -- нет');
+  const view = await app.api('GET', `${base}/labor`);
+  // весь список обратно, как получен: голая «10,01» не должна затереть «10.005»
+  const back = await app.api('PUT', `${base}/labor`, { rows: view.rows });
+  assert.equal(back.rows[0].rate_value, '10.005');
+  assert.equal(back.rows[0].hours_value, '40.5');
+  // подобранное предложение -- тоже целиком
+  await app.api('POST', `${base}/costs`, { kind: 'materials', name: 'м', unit: 'шт', quantity: '1', price: '1000' });
+  const solved = await app.api('POST', `${base}/solve`, { target: '500 000' });
+  assert.equal(solved.labor[0].rate_value, '10.005');
+  assert.equal(typeof solved.target, 'string', 'сервер присылает цель готовой строкой');
+  assert.equal(solved.target, `500${NBSP}000,00`);
+  const applied = await app.api('PUT', `${base}/labor`, { rows: solved.labor });
+  assert.equal(applied.rows[0].rate_value, '10.005', 'ставка в предложении не потеряла знаков при применении');
+  assert.equal(applied.rows[0].hours_value, solved.labor[0].hours_value);
+  const gap = await app.api('POST', `${base}/estimate`, { target: '500 000', target_includes_vat: false });
+  assert.equal(typeof gap.target, 'string');
+  assert.equal(gap.difference, solved.difference);
+});
+
+live('live: selected experience goes as string ids, the server accepts them and remembers numbers in the order ticked', async () => {
+  useRealServer();
+  const me = await app.api('POST', '/api/organizations', { role: 'participant', short_name: 'Я', inn: '5904188041' });
+  const customer = await app.api('POST', '/api/organizations', { role: 'customer', short_name: 'З', inn: '7708514824' });
+  const tender = await app.api('POST', '/api/tenders', { customer_id: String(customer.id), participant_id: String(me.id), subject: 'Опыт', price_wo_vat: '0' });
+  await app.api('POST', '/api/profiles', { customer_id: String(customer.id), documents: ['Справка о МТР'], docs: {}, declaration_text: '' });
+  const first = await app.api('POST', '/api/experience', { customer_name: 'А', amount: '1', contract_number: '1' });
+  const second = await app.api('POST', '/api/experience', { customer_name: 'Б', amount: '2', contract_number: '2' });
+  const outDir = path.join(process.env.TENDER_OUT_DIR, 'experience');
+  const ids = app.toggleId(app.toggleId([], second.id, true), first.id, true);       // как на экране: строками
+  assert.deepEqual(ids, [String(second.id), String(first.id)]);
+  assert.equal(typeof ids[0], 'string');
+  const builder = app.createBuilder({ api: app.api, registry: app.createBuildRegistry(), confirmReplace: async () => true });
+  const outcome = await builder.run({ tenderId: tender.id, documents: ['Справка о МТР'], outputDir: outDir, experienceIds: ids });
+  assert.equal(outcome.status, 'built', outcome.error);
+  assert.equal(outcome.note, '');
+  const remembered = await app.api('GET', `/api/tenders/${tender.id}`);
+  assert.deepEqual(remembered.experience_ids, [second.id, first.id]);
+  // чужой идентификатор сервер отвергает русской фразой, а не принимает молча
+  await assert.rejects(app.api('POST', `/api/tenders/${tender.id}/plan`, { documents: ['Справка о МТР'], output_dir: outDir, experience_ids: ['abc'] }),
+    (error) => { assert.match(error.message, /[А-Яа-я]/); return true; });
 });
 
 process.on('exit', () => {

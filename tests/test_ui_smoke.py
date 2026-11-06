@@ -1,19 +1,26 @@
-"""Интерфейс: что можно проверить без браузера.
+"""Интерфейс: что можно проверить без браузера -- и чего нельзя.
 
-Эти тесты доказывают СТРОЕНИЕ, а не вид и не удобство: что три экрана есть,
-что страница находит свои файлы, что каждая запись уходит с нужным типом
-содержимого, что ответы разбираются, что предупреждение `warning` не приводит
-к повторной отправке, что кнопка сборки не даёт начать вторую сборку, что вопрос
-о замене называет документы. Как это выглядит и удобно ли этим пользоваться,
-они не знают: это проверяет человек в задаче 15.
+Четыре слоя, от грубого к точному:
 
-Логика экрана лежит в `app/web/static/app.js` чистыми функциями и выносится
-наружу, когда нет страницы (`module.exports`). Эти функции гоняет Node.js
-(`tests/ui_logic.test.js`, только встроенные модули, ни npm, ни сборки): сначала
-с подставным `fetch`, потом против настоящего сервера Werkzeug на свободном порту
-и настоящей базы во временной папке -- через настоящий HTTP, с настоящими отказами
-сервера (415 без типа содержимого, 400 с русской фразой). Нет Node -- эти тесты
-пропускаются, а не молча считаются зелёными: в отчёте это видно.
+1. Текст страницы и скрипта (Python): три экрана названы, файлы отдаются,
+   страница не ходит во внешнюю сеть, в скрипте один `fetch`, нет разбора и
+   форматирования чисел, нет арифметических операторов, все тексты для человека
+   по-русски.
+2. Чистые функции (`tests/ui_logic.test.js`, Node): запросы с типом содержимого
+   JSON, разбор отказа, разбор вставки, галочки документов, реестр сборок и
+   замок, который переживает пересборку экрана. Сначала с подставным `fetch`,
+   затем против настоящего сервера Werkzeug и настоящей базы.
+3. Исполнение кода отрисовки (`tests/ui_render.test.js`, Node): весь код
+   страницы запускается поверх заглушки DOM (`tests/fake_dom.js`) и работает
+   с настоящим сервером. Проверяется, что построение таблиц, отрисовка расчёта и
+   результата сборки, переходы между экранами доходят до конца и не падают на
+   ответах без итогов и с `warning`, и что на экране нет «undefined»/«null»/«NaN».
+4. Вид, удобство, настоящее поведение браузера (фокус, диалог, буфер обмена,
+   раскрытие блоков, прокрутка) -- НЕ проверяются ничем из этого файла. Это
+   делает человек в задаче 15. Заглушка DOM -- не браузер: она не знает ни CSS,
+   ни вёрстки.
+
+Нет Node -- слои 2 и 3 пропускаются (с причиной), а не считаются зелёными.
 """
 import json
 import os
@@ -101,10 +108,33 @@ def test_script_never_parses_or_formats_a_number():
     (Грубая проверка текста; настоящая гарантия -- что сервер отдаёт готовые
     строки, это проверяет test_web.py.)"""
     code = _code_without_comments()
-    for forbidden in (r"\bparseFloat\b", r"\bparseInt\b", r"\bNumber\(", r"\.toFixed\b",
-                      r"\.toLocaleString\b", r"\bIntl\.", r"\bMath\.(round|floor|ceil|trunc)\b",
-                      r"\bBigInt\b"):
+    for forbidden in (r"(?<!JSON\.)\bparse\w*", r"\bNumber\b", r"\.toFixed\b", r"\.toPrecision\b",
+                      r"\.toLocale\w*", r"\bIntl\b", r"\bMath\.\w+", r"\bBigInt\b",
+                      r"\bDecimal\b", r"\bisNaN\b", r"\bisFinite\b", r"\.valueOf\b"):
         assert not re.search(forbidden, code), f"в app.js найдено запрещённое: {forbidden}"
+
+
+def _strip_literals(code: str) -> str:
+    """Код без строк и регулярных выражений: остаются только операции."""
+    code = re.sub(r"`(?:\\.|\$\{[^}]*\}|[^`\\])*`", "``", code)
+    code = re.sub(r"'(?:\\.|[^'\\\n])*'", "''", code)
+    code = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', code)
+    code = re.sub(r"(?<=[(,=:!&|?{;])\s*/(?![/*])(?:\\.|\[(?:\\.|[^\]\\\n])*\]|[^/\\\n\[])+/[a-z]*", " /r/", code)
+    return re.sub(r"//[^\n]*", "", code)       # хвостовые комментарии: литералы уже убраны
+
+
+def test_script_has_no_arithmetic_operators_on_anything():
+    """Ни умножения, ни деления, ни вычитания, ни сложения: ни `* 100`, ни `a - b`.
+    Единственное разрешённое исключение -- счётчик отрисовок `renderToken += 1`
+    (не число на экране: защита от гонки при быстрой смене экранов). Конкатенация
+    строк тоже не нужна: тексты собираются шаблонными строками."""
+    code = _strip_literals(_code_without_comments())
+    code = code.replace("renderToken += 1", "")
+    hits = []
+    for number, line in enumerate(code.split("\n"), 1):
+        for match in re.finditer(r"[\w)\]]\s*(\+\+|--|\+=|-=|\*=|/=|%=|\*\*|[*%])|[\w)\]]\s+[+\-/]\s+[\w(]|[\w)\]][+\-/][\w(]", line):
+            hits.append((number, line.strip()[:100]))
+    assert not hits, hits
 
 
 def test_every_visible_string_is_russian():
@@ -125,6 +155,29 @@ def test_every_visible_string_is_russian():
         words = re.findall(r"[A-Za-z][A-Za-z-]*", literal)
         if (re.search(r"[A-Za-z]{3,}\s+[A-Za-z]{2,}", literal) and not re.search("[А-Яа-яЁё]", literal)
                 and not all(word in technical for word in words)):
+            english.append(literal)
+    assert not english, english
+
+
+def test_every_literal_text_shown_to_the_user_is_russian():
+    """Строже общей проверки выше: любой литерал, который уходит человеку --
+    `text: '…'`, `textContent = '…'`, `.show('вид', '…')`, `title:`, `message:`,
+    `placeholder:`, `ok:`/`cancel:` -- содержит кириллицу или вовсе не содержит
+    латинских букв. Односложное «Save» и `text: 'OK'` здесь не проходят."""
+    code = _code_without_comments()
+    shown = []
+    patterns = (r"\b(?:text|title|message|placeholder|ok|cancel)\s*[:=]\s*(?:'((?:\\.|[^'\\\n])*)'|\"((?:\\.|[^\"\\\n])*)\"|`((?:\\.|[^`\\])*)`)",
+                r"\.show\(\s*'[a-z]+'\s*,\s*(?:'((?:\\.|[^'\\\n])*)'|`((?:\\.|[^`\\])*)`)")
+    for pattern in patterns:
+        for match in re.finditer(pattern, code):
+            shown.extend(g for g in match.groups() if g is not None)
+    assert len(shown) > 80, f"проверка не нашла тексты ({len(shown)}): шаблон устарел"
+    english = []
+    for literal in shown:
+        literal = re.sub(r"\$\{[^}]*\}", " ", literal)
+        if literal.startswith("http"):
+            continue                              # пример адреса в подсказке поля
+        if re.search("[A-Za-z]{2,}", literal) and not re.search("[А-Яа-яЁё]", literal):
             english.append(literal)
     assert not english, english
 
@@ -194,3 +247,20 @@ def test_screen_logic_against_the_real_server(live_server):
     # страховка от пустого прогона: сценарий обязан дойти до сервера
     counted = re.search(r"REQUESTS_SENT=(\d+)", done.stdout)
     assert counted and int(counted.group(1)) > 25, done.stdout[-500:]
+
+
+@NEEDS_NODE
+def test_screens_render_against_the_real_server(live_server):
+    """Код страницы ИСПОЛНЯЕТСЯ в Node поверх заглушки DOM (tests/fake_dom.js) и
+    разговаривает с настоящим сервером: справочники, карточка тендера, калькулятор,
+    сборка и переходы между экранами рисуются без падений и без «undefined» на
+    экране -- на полных ответах, без итогов и с предупреждением. Это проверка
+    того, что код отрисовки доходит до конца; как это выглядит, она не знает."""
+    out_dir = live_server["tmp"] / "render"
+    out_dir.mkdir()
+    done = _run_node("tests/ui_render.test.js", env={
+        "TENDER_BASE": live_server["base"], "TENDER_OUT_DIR": str(out_dir),
+        "TENDER_REPORT_REQUESTS": "1"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    counted = re.search(r"REQUESTS_SENT=(\d+)", done.stdout)
+    assert counted and int(counted.group(1)) > 80, done.stdout[-500:]
