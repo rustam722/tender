@@ -3,10 +3,40 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Тендеры</title>
+  <title>Тендеры: подготовка документов</title>
+  <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <h1>Тендеры</h1>
-  <p>Программа запущена. Экраны подключаются следующим шагом.</p>
+  <header class="topbar">
+    <div class="brand">Тендеры</div>
+    <nav aria-label="Экраны программы">
+      <a href="#/refs" id="nav-refs">Справочники</a>
+      <a href="#/tender" id="nav-tender">Карточка тендера</a>
+      <a href="#/build" id="nav-build">Сборка</a>
+    </nav>
+    <div class="current-tender" id="current-tender"></div>
+  </header>
+
+  <main id="screen" aria-live="polite">
+    <p class="loading">Загрузка…</p>
+  </main>
+
+  <dialog id="dialog" aria-labelledby="dialog-title">
+    <form method="dialog">
+      <h2 id="dialog-title"></h2>
+      <p id="dialog-message"></p>
+      <ul id="dialog-items"></ul>
+      <div class="actions">
+        <button type="submit" value="cancel" id="dialog-cancel">Отмена</button>
+        <button type="submit" value="ok" id="dialog-ok" class="primary">Да</button>
+      </div>
+    </form>
+  </dialog>
+
+  <noscript>
+    <p>Для работы программы в браузере должны быть включены скрипты. Включите их и обновите страницу.</p>
+  </noscript>
+
+  <script src="/static/app.js" defer></script>
 </body>
 </html>
