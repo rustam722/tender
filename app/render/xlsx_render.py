@@ -23,7 +23,9 @@
          "source": "items",                        // список из контекста
          "columns": {"C": "{row.price_value}",     // буква колонки -> выражение
                      "D": "{row.vat_value}"}}
-      ]
+      ],
+      "rates": {"insurance": "C17", "injury": "C18",   // где книга держит СВОИ
+                "overhead": "C24", "profit": "C25"}    // ставки калькуляции
     }
 
 Блоков может быть несколько (книга с подтаблицами: материалы, трудозатраты,
@@ -50,6 +52,16 @@
     пишется, клетка остаётся как в форме заказчика. Отсутствующий путь и здесь
     отказ: «может быть пустым» не значит «может отсутствовать».
 
+Раздел `rates` -- необязательный и, в отличие от всего остального, читается, а
+не пишется: книга заказчика хранит ставки калькуляции в своих клетках и считает
+по ним, что бы ни стояло в настройках программы. Имена ставок -- только
+`insurance`, `injury`, `overhead`, `profit` (RATE_FIELDS: ключ -> поле
+OrgSettings); значение -- адрес клетки. Адреса свои у каждого заказчика, поэтому
+их место здесь, рядом со всеми прочими адресами. `read_rates` достаёт эти ставки
+из книги; по ним считает `app.calc.workbook_total`, а расхождение с
+настройками называет предупреждение сборки (app.render.context). Раздела нет --
+ставки берутся из настроек, как раньше.
+
 Чего здесь нет намеренно: клетки с названиями, номерами позиций и условиями
 заказчика (колонки A, B, C формы Роснефти) в карту не входят -- это его текст.
 Строки удалять и добавлять нельзя (форма это запрещает): позиций больше, чем
@@ -59,10 +71,19 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
+
+
+# Ставки калькуляции, которые книга заказчика хранит у себя: имя в карте ячеек
+# -> поле OrgSettings, с которым ставка сравнивается. Это весь словарь раздела
+# `rates`: имени вне этого списка в книге соответствовать нечему, поэтому
+# карта с ним отвергается, а не читается наполовину.
+RATE_FIELDS = {"insurance": "insurance_rate", "injury": "injury_rate",
+               "overhead": "overhead_rate", "profit": "profit_rate"}
 
 
 class CellMapError(Exception):
@@ -83,6 +104,7 @@ class CellMap:
     cells: dict[str, str]             # адрес клетки -> выражение
     rows: list[RowBlock] = field(default_factory=list)
     optional: set[str] = field(default_factory=set)   # клетки, где пусто -- законно
+    rates: dict[str, str] = field(default_factory=dict)   # ставка -> адрес, ЧИТАЕТСЯ
 
 
 _ADDRESS = re.compile(r"[A-Z]{1,3}[1-9][0-9]*")
@@ -226,7 +248,81 @@ def load_cellmap(path: Path) -> CellMap:
             "(даже если блок один).")
     rows = [_row_block(raw, name) for raw in raw_rows]
     _check_overlaps(cells, rows, name)
-    return CellMap(sheet=sheet, cells=cells, rows=rows, optional=optional)
+    return CellMap(sheet=sheet, cells=cells, rows=rows, optional=optional,
+                   rates=_rates(data.get("rates"), name))
+
+
+def _rates(raw: object, name: str) -> dict[str, str]:
+    """Раздел rates: имя ставки -> адрес клетки. Нет раздела -- пустой словарь."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise CellMapError(
+            f"Карта ячеек {name}: rates должно быть объектом «ставка -> адрес "
+            "клетки».")
+    known = ", ".join(sorted(RATE_FIELDS))
+    rates: dict[str, str] = {}
+    for key, address in raw.items():
+        if key not in RATE_FIELDS:
+            raise CellMapError(
+                f"Карта ячеек {name}: в rates неизвестная ставка «{key}»; "
+                f"допустимы {known}.")
+        if not isinstance(address, str) or not _ADDRESS.fullmatch(address):
+            raise CellMapError(
+                f"Карта ячеек {name}: у ставки «{key}» в rates должен быть "
+                f"адрес клетки (например C17, заглавными), а там {address!r}.")
+        rates[key] = address
+    return rates
+
+
+def read_rates(template: Path, cell_map: CellMap) -> dict[str, Decimal]:
+    """Ставки калькуляции из самой книги заказчика: имя ставки -> доля (0.3).
+
+    Книга считает по своим ставкам, что бы ни стояло в настройках программы,
+    поэтому читаются они из книги, а не из настроек. Нет раздела rates --
+    пустой словарь, и книга считается по настройкам, как раньше. Клетка с
+    формулой, с текстом или пустая -- отказ: молча взятая вместо ставки нулевая
+    доля дала бы правдоподобную цену без взносов.
+    """
+    if not cell_map.rates:
+        return {}
+    template = Path(template)
+    wb = _open(template)
+    try:
+        if cell_map.sheet not in wb.sheetnames:
+            names = ", ".join(f"«{n}»" for n in wb.sheetnames)
+            raise CellMapError(
+                f"В книге {template.name} нет листа «{cell_map.sheet}». "
+                f"Есть: {names}.")
+        ws = wb[cell_map.sheet]
+        rates = {}
+        for key, address in cell_map.rates.items():
+            value = ws[address].value
+            if isinstance(value, bool) or not isinstance(value, (int, float,
+                                                                 Decimal, str)):
+                value = None
+            if isinstance(value, str):
+                value = value.strip().replace(",", ".")
+                if value.startswith("="):
+                    raise CellMapError(
+                        f"В книге {template.name} клетка {address} (ставка "
+                        f"«{key}») занята формулой: ставку оттуда не прочитать. "
+                        "Проверьте адрес в карте ячеек.")
+            if value is None or value == "":
+                raise CellMapError(
+                    f"В книге {template.name} клетка {address} (ставка "
+                    f"«{key}») пуста: ставку оттуда не прочитать. Проверьте "
+                    "адрес в карте ячеек или заполните клетку в шаблоне.")
+            try:
+                rates[key] = Decimal(str(value))
+            except InvalidOperation:
+                raise CellMapError(
+                    f"В книге {template.name} в клетке {address} (ставка "
+                    f"«{key}») не число, а «{value}». Проверьте адрес в карте "
+                    "ячеек.") from None
+        return rates
+    finally:
+        wb.close()
 
 
 # ---- вычисление выражений --------------------------------------------------------

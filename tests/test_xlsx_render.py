@@ -23,7 +23,8 @@ from app.models import (
 )
 from app.render.context import build_context
 from app.render.xlsx_render import (
-    CellMap, CellMapError, RowBlock, fill_workbook, load_cellmap,
+    RATE_FIELDS, CellMap, CellMapError, RowBlock, fill_workbook, load_cellmap,
+    read_rates,
 )
 from app.repo import Repo
 
@@ -782,3 +783,102 @@ def test_bad_optional_cell_is_rejected(tmp_path, cell, fragment):
 def test_real_map_has_no_optional_cells():
     # у Роснефти каждая графа обязательна: пустая -- отказ
     assert load_cellmap(REAL_MAP).optional == set()
+
+
+# ---- ставки, которые книга хранит у себя ------------------------------------------
+
+RATES_MAP = {"insurance": "C17", "injury": "C18",
+             "overhead": "C24", "profit": "C25"}
+
+
+@pytest.fixture
+def rates_form(tmp_path):
+    """Форма, которая держит ставки калькуляции в своих клетках, как книга
+    Арктикгаза: C17, C18, C24, C25 и формула рядом."""
+    path = make_form(tmp_path / "rates.xlsx")
+    wb = load_workbook(path)
+    ws = wb["Лист1"]
+    ws["C17"], ws["C18"], ws["C24"], ws["C25"] = 0.3, 0.002, 0.05, 0.1
+    ws["C26"] = "=C17+C18"
+    wb.save(path)
+    wb.close()
+    return path
+
+
+def test_cellmap_file_reads_the_rates_section(tmp_path):
+    data = dict(GOOD, rates={"insurance": "C17", "profit": "C25"})
+    assert load_cellmap(write_map(tmp_path, data)).rates == {
+        "insurance": "C17", "profit": "C25"}
+
+
+def test_cellmap_without_rates_keeps_them_empty(tmp_path):
+    assert load_cellmap(write_map(tmp_path, GOOD)).rates == {}
+
+
+def test_real_map_of_rosneft_names_no_rates():
+    # в форме ТКП калькуляции нет вовсе: читать ставки неоткуда и незачем
+    assert load_cellmap(REAL_MAP).rates == {}
+
+
+@pytest.mark.parametrize("rates, fragment", [
+    ({"страховые": "C17"}, "страховые"),          # имя не из списка
+    ({"insurance_rate": "C17"}, "insurance_rate"),
+    ({"insurance": "c17"}, "insurance"),          # не адрес
+    ({"insurance": "C0"}, "insurance"),
+    ({"insurance": 17}, "insurance"),             # не строка
+], ids=["русское имя", "имя поля", "строчные", "нулевая строка", "не строка"])
+def test_bad_rates_section_is_rejected_with_a_russian_reason(tmp_path, rates,
+                                                             fragment):
+    data = dict(GOOD, rates=rates)
+    with pytest.raises(CellMapError) as caught:
+        load_cellmap(write_map(tmp_path, data))
+    assert fragment in str(caught.value)
+
+
+def test_rates_section_must_be_an_object(tmp_path):
+    data = dict(GOOD, rates=["C17"])
+    with pytest.raises(CellMapError) as caught:
+        load_cellmap(write_map(tmp_path, data))
+    assert "rates" in str(caught.value)
+
+
+def test_read_rates_takes_every_rate_from_the_book(rates_form):
+    cell_map = CellMap("Лист1", {}, rates=RATES_MAP)
+    assert read_rates(rates_form, cell_map) == {
+        "insurance": Decimal("0.3"), "injury": Decimal("0.002"),
+        "overhead": Decimal("0.05"), "profit": Decimal("0.1")}
+    # имена раздела -- ровно поля настроек, с которыми ставки сравниваются
+    assert set(RATES_MAP) == set(RATE_FIELDS)
+
+
+def test_read_rates_without_the_section_does_not_even_open_the_book(tmp_path):
+    assert read_rates(tmp_path / "нет-такой-книги.xlsx", basic_map()) == {}
+
+
+@pytest.mark.parametrize("address, fragment", [
+    ("C19", "пуста"),            # клетка пуста
+    ("C26", "формул"),           # клетка занята формулой
+    ("A3", "не число"),          # в клетке текст заказчика
+], ids=["пусто", "формула", "текст"])
+def test_read_rates_refuses_a_cell_without_a_rate(rates_form, address, fragment):
+    # молча взятая вместо ставки нулевая доля дала бы правдоподобную цену
+    # без взносов -- такую заявку никто не перепроверит
+    cell_map = CellMap("Лист1", {}, rates={"insurance": address})
+    with pytest.raises(CellMapError) as caught:
+        read_rates(rates_form, cell_map)
+    text = str(caught.value)
+    assert fragment in text and address in text and "insurance" in text
+
+
+def test_read_rates_names_the_missing_sheet(rates_form):
+    cell_map = CellMap("Нет такого", {}, rates={"insurance": "C17"})
+    with pytest.raises(CellMapError) as caught:
+        read_rates(rates_form, cell_map)
+    assert "Нет такого" in str(caught.value)
+
+
+def test_read_rates_reports_a_missing_book_in_russian(tmp_path):
+    cell_map = CellMap("Лист1", {}, rates={"insurance": "C17"})
+    with pytest.raises(CellMapError) as caught:
+        read_rates(tmp_path / "net.xlsx", cell_map)
+    assert "net.xlsx" in str(caught.value) and "Errno" not in str(caught.value)

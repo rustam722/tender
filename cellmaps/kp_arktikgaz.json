@@ -9,6 +9,12 @@
     "A69": "{org.head_position} {org.head_name}",
     "E72": "Дата: {today}г."
   },
+  "rates": {
+    "insurance": "C17",
+    "injury": "C18",
+    "overhead": "C24",
+    "profit": "C25"
+  },
   "rows": [
     {
       "first_row": 35,
