@@ -21,7 +21,6 @@ from app import config, db
 from app.config import BASE_DIR
 from app.inn.fns import CaptchaRequired, InnNotFound, SourceUnavailable
 from app.models import ROLE_CUSTOMER, Organization
-from app.render import package as package_module
 from app.repo import Repo
 from app.web import create_app
 from app.web import routes as routes_module

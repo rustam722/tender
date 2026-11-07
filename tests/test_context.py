@@ -782,8 +782,10 @@ def test_kp_document_total_equals_sum_of_printed_rows(repo, tmp_path):
     for column in (3, 4, 5):          # НДС, цена, всего с НДС
         assert _printed(total[column]) == sum(_printed(r[column]) for r in lines)
     assert _printed(total[5]) == _printed(total[3]) + _printed(total[4])
-    # обе колонки непустые и обе ловушечные: цена 0,105 печатается «0,11»
-    # (сырая сумма 0,315 дала бы 0,32), НДС 0,00525 -- «0,01» (сырая 0,01575 -- 0,02)
+    # Ловушки -- колонки цены и «всего с НДС»: цена 0,105 печатается «0,11»
+    # (сырая сумма 0,315 дала бы 0,32), а «всего» по сырым 0,105 + 0,01 дало бы
+    # 0,35 вместо 0,36. Колонка НДС ловушкой не служит: vat_value уже округлён
+    # на строке, так что она проверяет только, что итог равен сумме строк.
     assert [r[4] for r in lines] == ["0,11"] * 3
     assert [r[3] for r in lines] == ["0,01"] * 3
     assert _printed(total[4]) == Decimal("0.33")

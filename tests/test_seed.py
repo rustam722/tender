@@ -11,7 +11,6 @@ from app.models import ROLE_CUSTOMER, ROLE_PARTICIPANT, LotItem, Tender
 from app.render.context import DOCUMENTS, TABLE_DOCUMENTS, build_context
 from app.render.docx_render import render_docx
 from app.repo import Repo
-from scripts import seed as seed_module
 from scripts.seed import SeedError, seed
 
 
@@ -213,6 +212,10 @@ def _images_outside_whitelist(templates_dir) -> list[str]:
 
 
 def test_templates_carry_no_signature_or_stamp_images():
+    # пустая или не та папка дала бы зелёный тест, который ничего не проверил
+    found = {p.suffix.lower() for p in Path(config.TEMPLATES_DOCS_DIR).glob("*")}
+    assert {".docx", ".xlsx"} <= found, (
+        f"в папке шаблонов {config.TEMPLATES_DOCS_DIR} не нашлось ни .docx, ни .xlsx")
     assert not _images_outside_whitelist(config.TEMPLATES_DOCS_DIR), \
         "\n".join(_images_outside_whitelist(config.TEMPLATES_DOCS_DIR))
 

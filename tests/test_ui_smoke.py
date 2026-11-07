@@ -37,7 +37,6 @@ from werkzeug.serving import make_server
 from app import config
 from app.config import BASE_DIR
 from app.models import CustomerProfile, DocSpec
-from app.render import package as package_module
 from app.repo import Repo
 from app.web import create_app
 
