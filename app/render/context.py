@@ -42,7 +42,10 @@
     date_ru, date_long функции: ISO-строка -> «24.10.2025» и «24» октября 2025 г.;
                        пустая строка -> пустая строка
     warnings           list[str]: что пропущено или подставлено по умолчанию
-                       (пропавший опыт, документ без назначенной раскладки)
+                       (пропавший опыт, документ без назначенной раскладки;
+                       для документа с картой ячеек -- строки материалов,
+                       субподряда и ФОТ, где произведение не ложится в копейку:
+                       книга заказчика сложит неокруглённое)
 
 Деньги в клетках таблиц. Раскладки (задача 7) ничего не форматируют, поэтому
 перед build_rows каждое Decimal-поле записи заменяется своим текстом через
@@ -67,9 +70,11 @@ from app.models import (
     CustomerProfile, DocSpec, LotItem, Organization, TenderCostItem, TenderLaborRow,
 )
 from app.render.layouts import TableLayout, build_rows, load_layout
+from app.render.xlsx_render import CellMapError, load_cellmap
 from app.repo import Repo
 
 LAYOUTS_DIR = BASE_DIR / "layouts"
+CELLMAPS_DIR = BASE_DIR / "cellmaps"
 
 NBSP = " "
 _KOPECK = Decimal("0.01")
@@ -248,6 +253,64 @@ def _cost_rows(items: list[TenderCostItem]) -> list[dict]:
     return rows
 
 
+def _exact(value: Decimal) -> str:
+    """Число как оно есть, без округления: 1851.855 -> «1 851,855»."""
+    text = f"{value.normalize():,f}"
+    return text.translate({ord(","): NBSP, ord("."): ","})
+
+
+def _inexact_rows(label: str, factors: list[tuple[str, tuple[Decimal, ...]]]
+                  ) -> list[str]:
+    """Строки, где произведение множителей не ложится в копейку ровно."""
+    found = []
+    for name, numbers in factors:
+        product = numbers[0]
+        for number in numbers[1:]:
+            product *= number
+        if product != _round(product):
+            found.append((name, numbers, product))
+    return [
+        f"строка «{name}» ({label}): "
+        f"{' × '.join(_exact(n) for n in numbers)} = {_exact(product)} -- "
+        "не целое число копеек"
+        for name, numbers, product in found]
+
+
+def _workbook_sums_warnings(document: str, spec: DocSpec | None, labor, materials,
+                            subcontract) -> list[str]:
+    """Документ, который заполняет книгу Excel заказчика, и строки с долями
+    копейки. Книга показывает строку округлённой, но складывает неокруглённые
+    произведения (формулу менять нельзя: арифметика книги -- заказчика), а
+    программа и документы Word складывают напечатанные строки. Подытог книги
+    может не сойтись с суммой строк над ним, а две бумаги -- друг с другом.
+    Отказ был бы неправ: цена бывает из прайса заказчика, и человеку нечего
+    исправлять; поэтому предупреждение. Смотрим только те списки, которые
+    карта этого документа действительно отправляет в книгу."""
+    if not (spec and spec.cellmap):
+        return []
+    try:
+        sources = {b.source for b in
+                   load_cellmap(Path(CELLMAPS_DIR) / spec.cellmap).rows}
+    except CellMapError:
+        return []          # пропавшую или битую карту назовёт сборка пакета
+    details = []
+    if "materials" in sources:
+        details += _inexact_rows("материалы", [
+            (i.name, (i.quantity, i.price)) for i in materials])
+    if "subcontract" in sources:
+        details += _inexact_rows("субподряд", [
+            (i.name, (i.quantity, i.price)) for i in subcontract])
+    if "labor" in sources:
+        details += _inexact_rows("трудозатраты", [
+            (r.post, (Decimal(r.headcount), r.hours, r.rate)) for r in labor])
+    return [
+        f"В «{document}» {detail}. Книга Excel сложит неокруглённое, а "
+        "программа и документы Word -- напечатанные строки, поэтому итоги "
+        "в книге могут не сойтись со строками над ними и с другими "
+        "документами пакета. Исправьте количество или цену так, чтобы "
+        "произведение было целым числом копеек." for detail in details]
+
+
 def labor_rows(rows: list[TenderLaborRow]) -> list[dict]:
     result = []
     for n, r in enumerate(rows, start=1):
@@ -324,6 +387,8 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
             f"Для документа «{document}» в профиле заказчика не назначена "
             "раскладка таблиц: колонки взяты по умолчанию. Если у заказчика "
             "своя форма таблицы, добавьте раскладку в профиль.")
+    warnings.extend(_workbook_sums_warnings(
+        document or "", spec, stored_labor, materials, subcontract))
     if experience_ids is None:
         experience_ids = tender.experience_ids
     selected = []

@@ -4,6 +4,12 @@
 из настоящей базы, вычисляем её формулы здесь же (мини-вычислитель ниже) и
 сверяем итог книги с калькулятором программы. Расхождение значило бы, что КП
 уйдёт заказчику с ценой, которой в программе нет.
+
+Данные тестов -- дробные количества и часы (1,5 ед., 25,5 ч), но с произведениями
+в целую копейку: на них книга и программа обязаны сойтись. Данные, где
+произведение даёт долю копейки, они расходятся (книга складывает неокруглённое,
+программа -- напечатанные строки); для них сборка выдаёт предупреждение, и это
+проверено отдельно ниже.
 """
 import re
 from decimal import ROUND_HALF_UP, Decimal
@@ -15,6 +21,7 @@ from openpyxl import load_workbook
 from app import db
 from app.models import Tender, TenderCostItem, TenderLaborRow
 from app.render.context import build_context
+from app.render.package import build_package
 from app.render.xlsx_render import CellMapError, fill_workbook, load_cellmap
 from app.repo import Repo
 from scripts.seed import DOC_ESTIMATE, seed
@@ -23,6 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "templates_docs" / "Калькуляция к КП Арктикгаз.xlsx"
 CELLMAP = ROOT / "cellmaps" / "kp_arktikgaz.json"
 SHEET = "Лист1"
+NBSP = " "
 
 
 # ---- вычислитель формул книги: ровно то, что в ней встречается -------------------
@@ -66,8 +74,14 @@ def repo(tmp_path):
     conn.close()
 
 
-def make_tender(repo, *, materials=2, labor=2, subcontract=3) -> int:
-    """Тендер Арктикгаза из справочников, которые наполняет seed."""
+def make_tender(repo, *, materials=2, labor=2, subcontract=3,
+                quantity="1.5", price="1234.56", hours="25.5",
+                rate="181.20") -> int:
+    """Тендер Арктикгаза из справочников, которые наполняет seed.
+
+    Множители дробные, но произведения ложатся в копейку ровно:
+    1,5 * 1234,56 = 1851,84; 25,5 * 181,20 = 4620,60. Данные с долей копейки --
+    параметрами (price="1234.57")."""
     seed(repo)
     me = repo.find_organization_by_inn("5904188041")
     customer = next(p.customer_id for p in repo.list_customer_profiles()
@@ -80,13 +94,14 @@ def make_tender(repo, *, materials=2, labor=2, subcontract=3) -> int:
     for n in range(1, labor + 1):
         repo.save_tender_labor(TenderLaborRow(
             tender_id=tid, position=n, post=f"Должность {n}", headcount=n,
-            hours=Decimal("120"), rate=Decimal("270.25")))
-    for kind, count, price in (("materials", materials, "1234.57"),
-                               ("subcontract", subcontract, "70000.40")):
+            hours=Decimal(hours), rate=Decimal(rate)))
+    for kind, count, unit_price in (("materials", materials, price),
+                                    ("subcontract", subcontract, "70000.40")):
         for n in range(1, count + 1):
             repo.save_tender_cost_item(TenderCostItem(
                 tender_id=tid, kind=kind, position=n, name=f"{kind} {n}",
-                unit="шт.", quantity=Decimal("2"), price=Decimal(price),
+                unit="шт.", quantity=Decimal(quantity),
+                price=Decimal(unit_price),
                 note="содержание" if kind == "subcontract" else ""))
     return tid
 
@@ -101,16 +116,25 @@ def fill(repo, tmp_path, **sizes):
 
 # ---- шаблон чист ------------------------------------------------------------------
 
+# каждая клетка, которую в поданной заявке занимали данные прошлого тендера
+CLEARED = (["A4", "A5", "A6", "A7", "D2", "A69", "E72"]
+           + [f"{c}{r}" for r in (35, 36, 40) for c in "BCDE"]
+           + [f"{c}{r}" for r in (48, 49) for c in "BCDE"]
+           + [f"{c}{r}" for r in (60, 61, 62) for c in "BCDEF"])
+
+
 def test_template_holds_no_data_of_the_submitted_bid():
     ws = load_workbook(TEMPLATE)[SHEET]
-    for address in ("A4", "A5", "A6", "A7", "D2", "A69", "E72",
-                    "B35", "B36", "B40", "B48", "B49", "B60", "B61", "B62",
-                    "F60", "F61", "F62", "E48", "E49", "D48", "D49", "C48", "C49"):
+    for address in CLEARED:
         assert ws[address].value is None, address
     everything = " ".join(str(c.value) for row in ws.iter_rows() for c in row
-                          if c.value is not None)
-    for leftover in ("Рабичко", "10.02.2026", "АРКТИКГАЗ", "спецодежда",
-                     "teh-sfera", "Эколог-проектировщик", "Исследования"):
+                          if c.value is not None).lower()
+    # фразы, дословно стоявшие в очищенных клетках поданной книги
+    for leftover in ("рабичко", "10.02.2026", "арктикгаз", "инвентарь, оборудование",
+                     "расходные материалы", "спецодежда", "teh-sfera",
+                     "эколог-проектировщик", "проведение исследований",
+                     "фоновые концентрации и климатические", "экспертиза проектной",
+                     "яро-яхинск", "шестидесяти", "декабрь 2026", "куйбышева"):
         assert leftover not in everything, leftover
 
 
@@ -155,8 +179,9 @@ def test_rows_are_numbers_not_printed_strings(repo, tmp_path):
                + [f"{c}{r}" for r in range(60, 63) for c in "EF"])
     for address in numeric:
         assert isinstance(ws[address].value, (int, float, Decimal)), address
-    assert Decimal(str(ws["E35"].value)) == Decimal("1234.57")
-    assert Decimal(str(ws["D48"].value)) == Decimal("120")
+    assert Decimal(str(ws["E35"].value)) == Decimal("1234.56")
+    assert Decimal(str(ws["D35"].value)) == Decimal("1.5")
+    assert Decimal(str(ws["D48"].value)) == Decimal("25.5")
     assert Decimal(str(ws["F62"].value)) == Decimal("70000.40")
     assert ws["B60"].value == "subcontract 1"
     assert ws["C60"].value == "содержание"
@@ -175,7 +200,7 @@ def test_workbook_totals_equal_the_programs_estimate(repo, tmp_path):
     ws, context = fill(repo, tmp_path, materials=4, labor=6, subcontract=3)
     calc = context["estimate"]
     assert calc["total_wo_vat"] > 0              # сверка не на нулях
-    assert evaluate(ws, "D13") == calc["materials"]
+    assert evaluate(ws, "D13") == calc["materials"] == Decimal("7407.36")
     assert evaluate(ws, "D16") == calc["labor"]
     assert evaluate(ws, "D21") == calc["subcontract"]
     assert evaluate(ws, "D26") == calc["total_wo_vat"]
@@ -190,6 +215,18 @@ def test_partial_lists_leave_surplus_rows_as_in_the_form(repo, tmp_path):
     assert evaluate(ws, "D26") == context["estimate"]["total_wo_vat"]
 
 
+def test_fractions_of_a_kopeck_make_the_workbook_and_the_program_differ(
+        repo, tmp_path):
+    # то самое расхождение, о котором предупреждает сборка: книга складывает
+    # неокруглённое (4 x 1,5 x 1234,57 = 7407,42), программа -- напечатанные
+    # строки (4 x 1851,86 = 7407,44)
+    ws, context = fill(repo, tmp_path, materials=4, quantity="1.5",
+                       price="1234.57")
+    assert evaluate(ws, "D13") == Decimal("7407.42")
+    assert context["estimate"]["materials"] == Decimal("7407.44")
+    assert len(context["warnings"]) == 4
+
+
 # ---- ёмкость: лишняя позиция -- отказ, а не тихо заниженная цена --------------------
 
 @pytest.mark.parametrize("sizes", [
@@ -202,9 +239,115 @@ def test_one_item_over_capacity_refuses_the_build(repo, tmp_path, sizes):
         fill(repo, tmp_path, **sizes)
 
 
-def test_cellmap_blocks_match_the_workbook_sums():
+def _summed_rows(formula: str, column: str) -> list[int]:
+    match = re.fullmatch(rf"=SUM\({column}(\d+):{column}(\d+)\)", formula)
+    assert match, formula
+    return list(range(int(match[1]), int(match[2]) + 1))
+
+
+def test_cellmap_capacities_are_derived_from_the_workbook_formulas():
+    ws = load_workbook(TEMPLATE)[SHEET]
     cell_map = load_cellmap(CELLMAP)
-    blocks = {b.source: (b.first_row, b.last_row) for b in cell_map.rows}
-    assert blocks == {"materials": (35, 38), "labor": (48, 53),
-                      "subcontract": (60, 62)}
-    assert "D88" not in cell_map.cells          # разрядность округления не в карте
+    blocks = {b.source: list(range(b.first_row, b.last_row + 1))
+              for b in cell_map.rows}
+    # материалы и ФОТ: подытог суммирует свою подтаблицу
+    assert blocks["materials"] == _summed_rows(ws["F34"].value, "F")
+    assert blocks["labor"] == _summed_rows(ws["F54"].value, "F")
+    # субподряд: итог приходит окольным путём D21 = G54 = SUM(G48:G50), где
+    # каждая G -- произведение одной строки субподряда; в сумму входят
+    # только эти строки
+    assert ws["D21"].value == "=G54"
+    reached = []
+    for row in _summed_rows(ws["G54"].value, "G"):
+        match = re.fullmatch(r"=F(\d+)\*E(\d+)", ws[f"G{row}"].value)
+        assert match and match[1] == match[2], ws[f"G{row}"].value
+        reached.append(int(match[1]))
+    assert blocks["subcontract"] == reached
+    assert "D88" not in cell_map.cells          # решение контроллера
+
+
+# ---- предупреждение: доли копейки при заполнении книги ------------------------------
+
+def warnings_of(repo, document=DOC_ESTIMATE, **sizes):
+    tid = make_tender(repo, **sizes)
+    return build_context(tid, repo, document=document)["warnings"]
+
+
+def test_no_warning_on_whole_kopeck_products(repo):
+    # настоящие данные Арктикгаза: целые часы, копеечные цены; и дробные
+    # множители, если произведение ровное
+    assert warnings_of(repo) == []
+    assert warnings_of(repo, quantity="1", hours="1200", rate="270",
+                       price="24000") == []
+
+
+def test_warns_about_material_row_with_half_a_kopeck(repo):
+    found = warnings_of(repo, materials=1, quantity="1.5", price="1234.57")
+    assert len(found) == 1
+    text = found[0]
+    assert "«Калькуляция к КП»" in text and "«materials 1»" in text
+    assert "1,5 × 1 234,57 = 1 851,855" in text.replace(NBSP, " ")
+    assert "Исправьте количество или цену" in text
+
+
+def test_warns_about_labor_row_with_fractional_kopecks(repo):
+    found = warnings_of(repo, labor=1, hours="25.7", rate="181.26")
+    assert len(found) == 1
+    assert "«Должность 1»" in found[0] and "трудозатраты" in found[0]
+    assert "1 × 25,7 × 181,26 = 4 658,382" in found[0].replace(NBSP, " ")
+
+
+def test_warns_about_subcontract_row_by_name(repo):
+    tid = make_tender(repo)
+    repo.save_tender_cost_item(TenderCostItem(
+        tender_id=tid, kind="subcontract", position=9, name="экспертиза",
+        quantity=Decimal("0.5"), price=Decimal("0.01")))
+    found = build_context(tid, repo, document=DOC_ESTIMATE)["warnings"]
+    assert len(found) == 1 and "«экспертиза»" in found[0]
+    assert "субподряд" in found[0]
+
+
+def test_warning_names_every_offending_row(repo):
+    found = warnings_of(repo, materials=3, labor=1, quantity="1.5",
+                        price="1234.57", hours="25.7", rate="181.26")
+    assert len(found) == 4          # три материала и одна строка ФОТ
+
+
+def test_no_warning_for_a_document_without_a_cellmap(repo):
+    # те же дроби, но документ собирается Word: там всё и так сходится
+    tid = make_tender(repo, materials=1, quantity="1.5", price="1234.57")
+    assert build_context(tid, repo, document="Коммерческое предложение"
+                         )["warnings"] == []
+    assert build_context(tid, repo)["warnings"] == []
+
+
+def test_no_warning_about_lists_the_workbook_does_not_receive(repo):
+    # ТКП Роснефти пишет в книгу только позиции лота: материалы и ФОТ тендера
+    # в ней не участвуют, предупреждать о них было бы враньём
+    tid = make_tender(repo, materials=1, quantity="1.5", price="1234.57")
+    tender = repo.get_tender(tid)
+    tender.customer_id = next(p.customer_id for p in repo.list_customer_profiles()
+                              if "ТКП по форме заказчика" in p.docs)
+    repo.save_tender(tender)
+    assert build_context(tid, repo, document="ТКП по форме заказчика"
+                         )["warnings"] == []
+
+
+# ---- сквозная сборка: профиль -> пакет -> файл ----------------------------------------
+
+def test_package_builds_the_estimate_from_the_customer_profile(repo, tmp_path):
+    tid = make_tender(repo, materials=1, quantity="1.5", price="1234.57")
+    result = build_package(tid, [DOC_ESTIMATE], tmp_path / "out", repo)
+    assert result.skipped == []
+    assert [p.suffix for p in result.written] == [".xlsx"]
+    ws = load_workbook(result.written[0])[SHEET]
+    # шаблон и карту выбрал профиль заказчика, а не константы теста
+    assert ws["A4"].value == "Наименование заказчика: АО «АРКТИКГАЗ»"
+    assert ws["B35"].value == "materials 1"
+    assert ws["D35"].value == 1.5
+    assert ws["A69"].value == "Директор Рабичко Елена Михайловна"
+    assert ws["F35"].value == "=E35*D35"
+    # предупреждение дошло до результата сборки вместе с названием документа
+    assert len(result.warnings) == 1
+    document, text = result.warnings[0]
+    assert document == DOC_ESTIMATE and "«materials 1»" in text
