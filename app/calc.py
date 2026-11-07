@@ -54,12 +54,18 @@ def money_total(values) -> Decimal:
 
 def estimate(labor: list[LaborLine], materials: Decimal, subcontract: Decimal,
              settings: OrgSettings) -> Estimate:
-    """Считает все статьи по формулам книги КП.xlsx.
+    """Считает все статьи по составу формул книги КП.xlsx, но своей арифметикой.
 
     Накладные -- от расходов на оплату труда, то есть от ФОТ вместе со
     страховыми (D15 = SUM(D16:D18)); прибыль -- от расходов на ОТ, субподряда
     и накладных, материалы в базу прибыли не входят. Итог без НДС округляется
-    до settings.total_rounding_digits знаков."""
+    до settings.total_rounding_digits знаков.
+
+    Это НЕ воспроизведение книги до копейки: книга складывает неокруглённые
+    произведения строк и не округляет страховые взносы, а здесь каждая статья
+    округляется до копеек (доктрина напечатанной строки) и следующие считаются
+    от уже округлённых. Поэтому итоги расходятся на границе рубля. Книгу
+    воспроизводит `workbook_total`, и сборка сравнивает их два итога."""
     fot = _money(sum((Decimal(x.headcount) * x.hours * x.rate for x in labor),
                      Decimal("0")))
     materials = _money(materials)
@@ -105,10 +111,16 @@ def workbook_total(labor: list[LaborLine], materials: Decimal, subcontract: Deci
         D26 = ROUND(D11+D23+D24+D25, D88)
 
     `labor` -- строки как их вводит человек (сырые множители), `materials` и
-    `subcontract` -- суммы сырых произведений количества на цену. Ставки берутся
-    из `settings`: книга хранит их в своих клетках C17, C18, C24, C25, и они
-    совпадают с настройками, пока их не правили. `digits` -- D88: пустая клетка
-    значит ROUND(..., 0), то есть целые рубли (форма заполняется без D88)."""
+    `subcontract` -- суммы сырых произведений количества на цену. `digits` --
+    D88: пустая клетка значит ROUND(..., 0), то есть целые рубли (форма
+    заполняется без D88).
+
+    Ставки берутся из `settings`, а книга считает по своим -- тем, что лежат в
+    её клетках C17, C18, C24, C25. Поэтому вызывающий подставляет ставки книги
+    в `settings` (`dataclasses.replace`), когда карта ячеек говорит, где они
+    лежат (раздел `rates`, `xlsx_render.read_rates`); так делает
+    `app.render.context`. Без подстановки итог предсказывает книгу лишь до тех
+    пор, пока ставки в настройках не правили."""
     fot = sum((Decimal(x.headcount) * x.hours * x.rate for x in labor),
               Decimal("0"))
     labor_cost = fot + fot * settings.insurance_rate + fot * settings.injury_rate

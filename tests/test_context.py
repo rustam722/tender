@@ -14,6 +14,7 @@ from app.models import (
 from app.render import context as ctx_module
 from app.render.context import build_context
 from app.render.layouts import Column, TableLayout
+from app.render.xlsx_render import RATE_FIELDS
 from app.repo import Repo
 
 NBSP = " "
@@ -475,6 +476,12 @@ def test_all_four_table_documents_warn_when_they_have_no_layout(repo):
     for document in names:
         (warning,) = build_context(tid, repo, document=document)["warnings"]
         assert document in warning
+
+
+def test_every_rate_of_the_cellmap_schema_has_a_russian_name():
+    # карта ячеек знает четыре ставки; новая, добавленная в схему без русского
+    # имени, уронила бы сборку на KeyError в тексте предупреждения
+    assert set(ctx_module._RATE_NAMES) == set(RATE_FIELDS)
 
 
 def test_document_layout_replaces_only_its_own_source(repo_with_koryazhma):

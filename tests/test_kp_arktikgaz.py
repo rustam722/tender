@@ -15,6 +15,7 @@
   * `workbook_total` из app.calc сверяется здесь с формулами самой книги.
 """
 import re
+from dataclasses import replace
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from openpyxl import load_workbook
 from app import db
 from app.calc import LaborLine, workbook_total
 from app.models import Tender, TenderCostItem, TenderLaborRow
-from app.render.context import build_context
+from app.render.context import build_context, money
 from app.render.package import build_package
 from app.render.xlsx_render import CellMapError, fill_workbook, load_cellmap
 from app.repo import Repo
@@ -360,6 +361,18 @@ def test_warns_about_labor_row_and_suggests_all_three_factors(repo):
     assert "численность, часы или ставку" in text and "количество или цену" not in text
 
 
+def test_row_kind_is_taken_from_the_data_not_from_the_assembled_text(repo):
+    # должность «Инженер (материалы)» -- это трудозатраты, и совет ей положен
+    # про численность, часы и ставку; искать вид строки в собранном тексте
+    # значит верить тому, что сам же и написал
+    (text,) = custom_warnings(
+        repo, labor=[("Инженер (материалы)", 1, "25.7", "181.26")])
+    text = plain(text)
+    assert "«Инженер (материалы)» (трудозатраты)" in text
+    assert "исправьте численность, часы или ставку (трудозатраты)" in text
+    assert "количество или цену" not in text
+
+
 def test_warns_about_a_row_even_when_the_totals_coincide(repo):
     # четыре строки 4 x 1,5 x 1234,57: итоги до рубля одинаковы (7 407), но
     # подытог книги 7 407,42 не сойдётся с четырьмя напечатанными по 1 851,86
@@ -372,9 +385,13 @@ def test_warns_about_a_row_even_when_the_totals_coincide(repo):
         assert f"«м{n}» (материалы)" in text
 
 
-def test_warns_about_subcontract_row_by_name(repo):
+def test_warns_about_subcontract_row_by_name_and_suggests_its_own_factors(repo):
     (text,) = custom_warnings(repo, subcontract=[("экспертиза", "0.5", "0.01")])
-    assert "«экспертиза» (субподряд)" in plain(text)
+    text = plain(text)
+    assert "«экспертиза» (субподряд)" in text
+    assert "0,5 × 0,01 = 0,005" in text
+    assert "исправьте количество или цену (субподряд)" in text
+    assert "численность" not in text and "(материалы)" not in text
 
 
 def test_one_warning_names_every_offending_row(repo):
@@ -395,17 +412,200 @@ def test_no_warning_for_a_document_without_a_cellmap(repo):
     assert build_context(tid, repo)["warnings"] == []
 
 
-def test_no_warning_about_lists_the_workbook_does_not_receive(repo):
-    # ТКП Роснефти пишет в книгу только позиции лота: материалы и ФОТ тендера
-    # в ней не участвуют, предупреждать о них было бы враньём
-    tid = make_custom_tender(repo, labor=[("Эколог", 1, "1", "1002.45")],
-                             materials=[("м", "1.5", "1234.57")])
+def move_to_rosneft(repo, tid):
+    """Тот же тендер, но заказчик -- Роснефть: её карта шлёт в книгу только
+    позиции лота."""
     tender = repo.get_tender(tid)
     tender.customer_id = next(p.customer_id for p in repo.list_customer_profiles()
                               if "ТКП по форме заказчика" in p.docs)
     repo.save_tender(tender)
+
+
+@pytest.mark.parametrize("lists", [
+    {"labor": [("Эколог", 1, "1", "1002.45")]},
+    {"materials": [("м", "1.5", "1234.57")]},
+    {"subcontract": [("экспертиза", "0.5", "0.01")]},
+], ids=["трудозатраты", "материалы", "субподряд"])
+def test_no_warning_about_lists_the_workbook_does_not_receive(repo, lists):
+    # ТКП Роснефти пишет в книгу только позиции лота: материалы, ФОТ и
+    # субподряд тендера в ней не участвуют, предупреждать о них было бы враньём
+    tid = make_custom_tender(repo, **lists)
+    assert build_context(tid, repo, document=DOC_ESTIMATE)["warnings"]
+    move_to_rosneft(repo, tid)
     assert build_context(tid, repo, document="ТКП по форме заказчика"
                          )["warnings"] == []
+
+
+# ---- ставки: книга считает по своим --------------------------------------------
+
+@pytest.mark.parametrize("field, value, label, in_book, in_settings", [
+    ("insurance_rate", "0.31", "страховых взносов", "30", "31"),
+    ("injury_rate", "0.003", "взносов на травматизм", "0,2", "0,3"),
+    ("overhead_rate", "0.10", "накладных расходов", "5", "10"),
+    ("profit_rate", "0.11", "прибыли", "10", "11"),
+], ids=["страховые", "травматизм", "накладные", "прибыль"])
+def test_each_rate_of_the_book_is_compared_with_the_settings(
+        repo, tmp_path, field, value, label, in_book, in_settings):
+    # ставку страховых меняет закон, остальные -- человек в настройках; книга
+    # посчитает по своим клеткам C17, C18, C24, C25, что бы мы ни думали
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT)
+    repo.save_settings(replace(repo.get_settings(), **{field: Decimal(value)}))
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    totals, note = (plain(w) for w in context["warnings"])
+    assert (f"ставка {label} {in_book} %, а в настройках программы "
+            f"{in_settings} %") in note
+    assert "Книга посчитает по своей" in note
+    assert "Исправьте ставку в настройках или в самом шаблоне книги" in note
+    # итог книги считается по ЕЁ ставкам и остался прежним, итог программы -- нет
+    assert "книга Excel посчитает итог без НДС 4 000 000,00" in totals
+    assert context["estimate"]["total_wo_vat"] != Decimal("4000000.00")
+    assert plain(money(context["estimate"]["total_wo_vat"])) in totals
+    out = fill_workbook(TEMPLATE, load_cellmap(CELLMAP), context, tmp_path / "s.xlsx")
+    assert evaluate(load_workbook(out)[SHEET], "D26") == Decimal("4000000")
+
+
+@pytest.mark.parametrize("field, value, program", [
+    ("insurance_rate", "0.31", "4016715.00"),
+    ("overhead_rate", "0.10", "4103634.00"),
+], ids=["страховые 31 %", "накладные 10 %"])
+def test_changed_rate_splits_the_two_papers_by_thousands(repo, field, value,
+                                                         program):
+    # шестнадцать тысяч рублей разницы в двух бумагах одного пакета -- крупнее
+    # всего, что сторож ловил раньше, и раньше он об этом молчал
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT)
+    repo.save_settings(replace(repo.get_settings(), **{field: Decimal(value)}))
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    assert context["estimate"]["total_wo_vat"] == Decimal(program)
+    assert len(context["warnings"]) == 2
+    assert plain(money(Decimal(program))) in plain(context["warnings"][0])
+    assert "об этом отдельное предупреждение" in context["warnings"][0]
+
+
+def test_rates_that_match_the_settings_say_nothing_about_rates(repo):
+    # сигнал, который горит всегда, через неделю перестают читать
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT)
+    settings = repo.get_settings()
+    assert (settings.insurance_rate, settings.injury_rate, settings.overhead_rate,
+            settings.profit_rate) == (Decimal("0.30"), Decimal("0.002"),
+                                      Decimal("0.05"), Decimal("0.10"))
+    assert build_context(tid, repo, document=DOC_ESTIMATE)["warnings"] == []
+
+
+def test_a_cellmap_without_rates_still_takes_them_from_the_settings(repo):
+    # карта Роснефти раздела rates не знает: поведение прежнее, ничего не меняется
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR)
+    repo.save_settings(replace(repo.get_settings(),
+                               insurance_rate=Decimal("0.31")))
+    move_to_rosneft(repo, tid)
+    assert build_context(tid, repo, document="ТКП по форме заказчика"
+                         )["warnings"] == []
+
+
+# Данные, на которых видна вся арифметика книги разом: материалы, субподряд и
+# три строки ФОТ, причём сырые произведения не ложатся в копейку (1,5 x 1234,57
+# = 1851,855; 1,5 x 70 000,41 = 105 000,615; 25,5 x 420,33 = 10 718,415).
+BOOK_MATERIALS = [("инвентарь, оборудование", "1.5", "1234.57"),
+                  ("расходные материалы", "2", "890.40")]
+BOOK_SUBCONTRACT = [("исследования и измерения", "1.5", "70000.41"),
+                    ("фоновые концентрации", "2", "35000.20")]
+
+
+def book_labor(rate):
+    return [("Эколог-проектировщик", 4, "25.5", "270"),
+            ("Начальник отдела проектирования", 1, "25.5", "420.33"),
+            ("Инженер-эколог", 2, "25.5", rate)]
+
+
+def raw_sum(rows) -> Decimal:
+    """Сумма сырых произведений количества на цену -- так считает книга."""
+    return sum((Decimal(q) * Decimal(p) for _, q, p in rows), Decimal(0))
+
+
+@pytest.mark.parametrize("rate, total", [
+    # Ставка третьей строки ФОТ подобрана так, чтобы итог книги стоял у границы
+    # рубля: тогда лишнее или пропущенное округление внутри workbook_total
+    # меняет D26 на рубль, и подмену видно. Что ловит каждый случай:
+    ("152.18", "265339"),   # ROUND у накладных (D24): без него книга дала бы 265 340
+    ("165.61", "266369"),   # ROUND у прибыли (D25): без него -- 266 370
+    ("155.27", "265575"),   # ФОТ (D16) книга НЕ округляет: иначе -- 265 576
+    ("183.76", "267760"),   # всё сразу, включая неокруглённый субподряд (D21)
+])
+def test_workbook_total_reproduces_the_formulas_of_the_real_book(
+        repo, tmp_path, rate, total):
+    """Итог workbook_total равен D26 настоящей книги, вычисленной по её формулам."""
+    labor = book_labor(rate)
+    tid = make_custom_tender(repo, labor=labor, materials=BOOK_MATERIALS,
+                             subcontract=BOOK_SUBCONTRACT)
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    out = fill_workbook(TEMPLATE, load_cellmap(CELLMAP), context,
+                        tmp_path / "book.xlsx")
+    ws = load_workbook(out)[SHEET]
+    # сверка не на нулях и не на пустых подтаблицах
+    assert evaluate(ws, "D13") == Decimal("3632.655")       # материалы
+    assert evaluate(ws, "D21") == Decimal("175001.015")     # субподряд
+    assert evaluate(ws, "D16") > 0 and len(labor) == 3      # три строки ФОТ
+    book = evaluate(ws, "D26")
+    assert book == Decimal(total)
+    assert workbook_total(
+        [LaborLine(post, people, Decimal(hours), Decimal(money_rate))
+         for post, people, hours, money_rate in labor],
+        raw_sum(BOOK_MATERIALS), raw_sum(BOOK_SUBCONTRACT),
+        repo.get_settings()) == book
+    # почему эти данные: неокруглённый итог книги стоит у самой границы рубля
+    # (не дальше пяти копеек от неё), и лишнее или пропущенное округление
+    # внутри статей меняет D26 на целый рубль
+    raw_total = sum(evaluate(ws, a) for a in ("D11", "D23", "D24", "D25"))
+    assert abs(abs(raw_total - book) - Decimal("0.5")) < Decimal("0.05")
+
+
+def test_the_warning_prints_the_contexts_own_estimate_as_the_programs_total(repo):
+    # «программа» в предупреждении -- ровно тот итог без НДС, который контекст
+    # отдаёт документам Word, а не пересчитанный заново по сырым трудозатратам:
+    # две строки по 25,5 x 181,21 = 4 620,855 печатаются по 4 620,86, и сумма
+    # напечатанных (9 241,72) больше округлённой суммы сырых (9 241,71)
+    tid = make_custom_tender(repo, labor=[("Эколог", 1, "25.5", "181.21"),
+                                          ("Эколог-2", 1, "25.5", "181.21")])
+    repo.save_settings(replace(repo.get_settings(), total_rounding_digits=2))
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    (text,) = context["warnings"]
+    program = context["estimate"]["total_wo_vat"]
+    assert program == Decimal("13897.80")
+    assert f"«Коммерческое предложение» -- {money(program)}." in text
+    assert "13 897,79" not in plain(text)      # итог по сырым трудозатратам
+
+
+def test_rounding_setting_is_named_as_the_cause_instead_of_the_rouble_boundary(repo):
+    # при округлении итога до копеек причина расхождения -- сама настройка,
+    # а не граница рубля: книга округляет итог до рублей (D88 пуста) всегда
+    tid = make_custom_tender(repo, labor=[("Эколог", 1, "1", "1002.45")])
+    repo.save_settings(replace(repo.get_settings(), total_rounding_digits=2))
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    (text,) = context["warnings"]
+    text = plain(text)
+    assert "итог без НДС 1 507,00" in text and "1 507,50" in text
+    assert "«Округление итога без НДС, знаков после запятой», сейчас 2" in text
+    assert "на границе рубля" not in text
+
+
+def test_warning_names_the_rows_and_the_insurance_when_both_split_the_totals(
+        repo, tmp_path):
+    # строка материалов с долей копейки И итог у границы рубля из-за страховых:
+    # назвать одну причину -- отправить человека чинить не то
+    tid = make_custom_tender(repo, labor=[("Эколог", 1, "120", "155.37")],
+                             materials=[("расходные материалы", "1.5", "1234.57")])
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    (text,) = context["warnings"]
+    text = plain(text)
+    assert "итог без НДС 29 889,00" in text and "29 890,00" in text
+    assert "«расходные материалы» (материалы)" in text
+    assert "Кроме того, книга Excel не округляет страховые взносы" in text
+    # строка ФОТ ровная (120 ч x 155,37 = 18 644,40): о ней речи нет
+    assert "(трудозатраты)" not in text
+    out = fill_workbook(TEMPLATE, load_cellmap(CELLMAP), context, tmp_path / "b.xlsx")
+    assert evaluate(load_workbook(out)[SHEET], "D26") == Decimal("29889")
 
 
 @pytest.mark.parametrize("rate", ["1002.45", "1000", "1000.60", "270", "181.26",

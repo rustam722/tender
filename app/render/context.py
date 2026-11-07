@@ -45,7 +45,8 @@
                        (пропавший опыт, документ без назначенной раскладки;
                        для документа с картой ячеек -- итог без НДС в книге
                        заказчика (app.calc.workbook_total) расходится с итогом
-                       программы, или есть строки с долей копейки)
+                       программы, есть строки с долей копейки, или ставка
+                       в книге не та, что в настройках программы)
 
 Деньги в клетках таблиц. Раскладки (задача 7) ничего не форматируют, поэтому
 перед build_rows каждое Decimal-поле записи заменяется своим текстом через
@@ -70,7 +71,9 @@ from app.models import (
     CustomerProfile, DocSpec, LotItem, Organization, TenderCostItem, TenderLaborRow,
 )
 from app.render.layouts import TableLayout, build_rows, load_layout
-from app.render.xlsx_render import CellMapError, load_cellmap
+from app.render.xlsx_render import (
+    RATE_FIELDS, CellMapError, load_cellmap, read_rates,
+)
 from app.repo import Repo
 
 
@@ -257,40 +260,92 @@ def _exact(value: Decimal) -> str:
     return text.translate({ord(","): NBSP, ord("."): ","})
 
 
-def _inexact_rows(label: str, factors: list[tuple[str, tuple[Decimal, ...]]]
-                  ) -> list[str]:
+def _inexact_rows(kind: str, factors: list[tuple[str, tuple[Decimal, ...]]]
+                  ) -> list[tuple[str, str]]:
     """Строки, где произведение множителей не ложится в копейку ровно: что
-    получилось в книге и что напечатано в документе."""
+    получилось в книге и что напечатано в документе.
+
+    Возвращает пары «вид строки, текст»: вид -- ключ списка (materials,
+    subcontract, labor), а не слово из собранного текста. Искать его потом
+    в тексте нельзя: должность «Инженер (материалы)» получала из-за этого
+    совет про количество и цену вместо численности, часов и ставки."""
     found = []
     for name, numbers in factors:
         product = numbers[0]
         for number in numbers[1:]:
             product *= number
         if product != _round(product):
-            found.append(
-                f"строка «{name}» ({label}): "
+            found.append((
+                kind,
+                f"строка «{name}» ({_KINDS[kind]}): "
                 f"{' × '.join(_exact(n) for n in numbers)} = {_exact(product)}, "
-                f"в документе напечатано {money(_round(product))}")
+                f"в документе напечатано {money(_round(product))}"))
     return found
+
+
+def _printed(labor: list[dict], materials: list[dict], subcontract: list[dict]):
+    """Напечатанные (округлённые) строки как множители калькуляции: ФОТ --
+    строками «1 чел. * сумма строки * 1 руб.» (estimate округляет ФОТ сам, и от
+    сырых произведений сумма расходилась бы с напечатанными строками),
+    материалы и субподряд -- суммами напечатанных сумм строк."""
+    return ([LaborLine(row["post"], 1, row["amount_value"], Decimal("1"))
+             for row in labor],
+            sum((row["amount_value"] for row in materials), _ZERO),
+            sum((row["amount_value"] for row in subcontract), _ZERO))
 
 
 def _estimate_rows(labor: list[dict], materials: list[dict],
                    subcontract: list[dict], settings) -> Estimate:
-    """Калькуляция по напечатанным (округлённым) строкам. ФОТ идёт строками
-    «1 чел. * сумма строки * 1 руб.»: estimate округляет ФОТ сам, и от сырых
-    произведений сумма расходилась бы с напечатанными строками."""
-    return estimate(
-        [LaborLine(row["post"], 1, row["amount_value"], Decimal("1"))
-         for row in labor],
-        sum((row["amount_value"] for row in materials), _ZERO),
-        sum((row["amount_value"] for row in subcontract), _ZERO),
-        settings)
+    """Калькуляция по напечатанным (округлённым) строкам."""
+    return estimate(*_printed(labor, materials, subcontract), settings)
 
 
 _KINDS = {"materials": "материалы", "subcontract": "субподряд",
           "labor": "трудозатраты"}
-_FIX = {"материалы": "количество или цену", "субподряд": "количество или цену",
-        "трудозатраты": "численность, часы или ставку"}
+_FIX = {"materials": "количество или цену", "subcontract": "количество или цену",
+        "labor": "численность, часы или ставку"}
+_RATE_NAMES = {"insurance": "страховых взносов",
+               "injury": "взносов на травматизм",
+               "overhead": "накладных расходов",
+               "profit": "прибыли"}
+# Причина, которая остаётся, когда строки напечатаны ровно и ставки совпадают.
+_INSURANCE_CAUSE = (
+    "книга Excel не округляет страховые взносы и округляет итог до целых "
+    "рублей, а программа округляет страховые до копеек, поэтому на границе "
+    "рубля итоги расходятся. Исправить это нельзя, предупреждение только "
+    "сообщает.")
+
+
+def _rounding_cause(digits: int) -> str:
+    """Почему итоги округлены по-разному. Книга всегда округляет до целых рублей
+    (D88 формы остаётся пустой), а программа -- по настройке; при digits != 0
+    причина -- сама настройка, и называть границу рубля было бы неправдой."""
+    if digits == 0:
+        return _INSURANCE_CAUSE
+    return ("книга Excel округляет итог без НДС до целых рублей (клетка D88 "
+            "формы остаётся пустой), а программа -- по настройке «Округление "
+            f"итога без НДС, знаков после запятой», сейчас {digits}. Поставьте "
+            "в настройках 0, чтобы итоги округлялись одинаково.")
+
+
+def _rate_warnings(document: str, book_rates: dict[str, Decimal],
+                   settings) -> list[str]:
+    """Ставки книги против ставок настроек -- причина, которую можно исправить.
+
+    Книга считает по своим ставкам, что бы ни стояло в настройках: поменяли
+    страховые с 30 % на 31 % -- и две бумаги одного пакета разойдутся на
+    тысячи рублей. Пустой список, если карта не говорит, где ставки книги,
+    или они совпадают с настройками."""
+    found = []
+    for key, value in book_rates.items():
+        ours = getattr(settings, RATE_FIELDS[key])
+        if value != ours:
+            found.append(
+                f"В книге «{document}» ставка {_RATE_NAMES[key]} "
+                f"{percent(value)} %, а в настройках программы "
+                f"{percent(ours)} %. Книга посчитает по своей. Исправьте "
+                "ставку в настройках или в самом шаблоне книги.")
+    return found
 
 
 def _workbook_sums_warnings(document: str, spec: DocSpec | None, labor, materials,
@@ -306,33 +361,51 @@ def _workbook_sums_warnings(document: str, spec: DocSpec | None, labor, material
     книги не сойдётся с напечатанными над ним строками.
     Отказ был бы неправ: цена бывает из прайса заказчика, а страховые человек
     не исправит; предупреждение сообщает, а не требует. Смотрим только те
-    списки, которые карта этого документа действительно отправляет в книгу."""
+    списки, которые карта этого документа действительно отправляет в книгу.
+
+    Причин расхождения три, и каждая называется отдельно, когда она есть:
+    строки с долей копейки, разное округление итога (страховые и D88) и разные
+    ставки в книге и в настройках. Назвать одну, пока действуют и другие, --
+    отправить человека чинить не то."""
     if not (spec and spec.cellmap):
         return []
     try:
-        sources = {b.source for b in
-                   load_cellmap(Path(config.CELLMAPS_DIR) / spec.cellmap).rows}
+        cell_map = load_cellmap(Path(config.CELLMAPS_DIR) / spec.cellmap)
+        # Ставки книги лежат в самой книге; где именно -- говорит карта.
+        book_rates = (read_rates(Path(config.TEMPLATES_DOCS_DIR) / spec.template,
+                                 cell_map)
+                      if spec.template.lower().endswith(".xlsx") else {})
     except CellMapError:
         return []          # пропавшую или битую карту назовёт сборка пакета
+    sources = {b.source for b in cell_map.rows}
     labor = labor if "labor" in sources else []
     materials = materials if "materials" in sources else []
     subcontract = subcontract if "subcontract" in sources else []
 
-    program = _estimate_rows(labor_rows(labor), _cost_rows(materials),
-                             _cost_rows(subcontract), settings).total_wo_vat
+    rate_notes = _rate_warnings(document, book_rates, settings)
+    # Книга считает по СВОИМ ставкам: подставляем их, иначе сторож сравнивает
+    # наши ставки сами с собой и расхождения в тысячи рублей не видит.
+    book_settings = replace(settings, **{RATE_FIELDS[key]: value
+                                         for key, value in book_rates.items()})
+    printed = _printed(labor_rows(labor), _cost_rows(materials),
+                       _cost_rows(subcontract))
+    program = estimate(*printed, settings).total_wo_vat
     book = workbook_total(
         [LaborLine(r.post, r.headcount, r.hours, r.rate) for r in labor],
         sum((i.quantity * i.price for i in materials), _ZERO),
-        sum((i.quantity * i.price for i in subcontract), _ZERO), settings)
-    rows = (_inexact_rows(_KINDS["materials"], [
+        sum((i.quantity * i.price for i in subcontract), _ZERO), book_settings)
+    # Та же арифметика книги, но на напечатанных строках и на НАШИХ ставках:
+    # что останется, то и есть расхождение от округления итога.
+    rounding_differs = workbook_total(*printed, settings) != program
+    rows = (_inexact_rows("materials", [
                 (i.name, (i.quantity, i.price)) for i in materials])
-            + _inexact_rows(_KINDS["subcontract"], [
+            + _inexact_rows("subcontract", [
                 (i.name, (i.quantity, i.price)) for i in subcontract])
-            + _inexact_rows(_KINDS["labor"], [
+            + _inexact_rows("labor", [
                 (r.post, (Decimal(r.headcount), r.hours, r.rate))
                 for r in labor]))
     if book == program and not rows:
-        return []
+        return rate_notes
 
     if book != program:
         text = (f"В «{document}» книга Excel посчитает итог без НДС "
@@ -342,21 +415,24 @@ def _workbook_sums_warnings(document: str, spec: DocSpec | None, labor, material
         text = (f"В «{document}» итог без НДС в книге Excel и в программе "
                 f"совпадёт ({money(program)}), но подытоги книги не сойдутся "
                 "с напечатанными над ними строками.")
+    causes = []
     if rows:
-        kinds = [k for k in _FIX if any(f"({k})" in r for r in rows)]
-        fix = "; ".join(f"{_FIX[k]} ({k})" for k in kinds)
-        text += (" Книга складывает неокруглённые произведения строк, а "
-                 "программа и документы Word -- напечатанные строки: "
-                 + "; ".join(rows) + ". Если эти цифры не из прайса заказчика, "
-                 f"исправьте {fix} так, чтобы произведение было целым числом "
-                 "копеек.")
-    else:
-        text += (" Строк с долей копейки нет: книга Excel не округляет "
-                 "страховые взносы и округляет итог до целых рублей, а "
-                 "программа округляет страховые до копеек, поэтому на границе "
-                 "рубля итоги расходятся. Исправить это нельзя, предупреждение "
-                 "только сообщает.")
-    return [text]
+        kinds = [k for k in _FIX if any(kind == k for kind, _ in rows)]
+        fix = "; ".join(f"{_FIX[k]} ({_KINDS[k]})" for k in kinds)
+        causes.append(
+            "Книга складывает неокруглённые произведения строк, а программа и "
+            "документы Word -- напечатанные строки: "
+            + "; ".join(t for _, t in rows)
+            + ". Если эти цифры не из прайса заказчика, исправьте "
+            f"{fix} так, чтобы произведение было целым числом копеек.")
+    if rounding_differs:
+        head = "Кроме того, " if causes else "Строк с долей копейки нет: "
+        causes.append(head + _rounding_cause(settings.total_rounding_digits))
+    if rate_notes:
+        causes.append("И ещё: ставки в книге и в настройках программы разные, "
+                      "книга считает по своим -- об этом отдельное "
+                      "предупреждение.")
+    return [" ".join([text] + causes)] + rate_notes
 
 
 def labor_rows(rows: list[TenderLaborRow]) -> list[dict]:
