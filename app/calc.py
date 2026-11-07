@@ -86,6 +86,40 @@ def estimate(labor: list[LaborLine], materials: Decimal, subcontract: Decimal,
                     total_wo_vat=total, vat=vat, total_with_vat=total + vat)
 
 
+def workbook_total(labor: list[LaborLine], materials: Decimal, subcontract: Decimal,
+                   settings: OrgSettings, digits: int = 0) -> Decimal:
+    """Итог без НДС так, как его посчитает книга КП.xlsx: без округления статей,
+    с округлением только там, где в книге стоит ROUND. Для сравнения с
+    `estimate()`: программа округляет каждую статью до копеек (доктрина
+    напечатанной строки), книга -- нет, и на границе рубля итоги расходятся.
+
+    Формулы книги (адреса ячеек листа «Лист1»):
+
+        D16 = F54 = SUM(E*D*C)          ФОТ, сумма НЕокруглённых произведений
+        D17 = D16*C17, D18 = D16*C18    страховые и травматизм, без округления
+        D15 = SUM(D16:D18)
+        D21 = G54                       субподряд, сумма неокруглённых E*F
+        D23 = D15 + D21                 (D19, D20, D22 -- литерал 0)
+        D24 = ROUND(D15*C24, 2)         накладные
+        D25 = ROUND((D23+D24)*C25, 2)   прибыль; материалы в базу не входят
+        D26 = ROUND(D11+D23+D24+D25, D88)
+
+    `labor` -- строки как их вводит человек (сырые множители), `materials` и
+    `subcontract` -- суммы сырых произведений количества на цену. Ставки берутся
+    из `settings`: книга хранит их в своих клетках C17, C18, C24, C25, и они
+    совпадают с настройками, пока их не правили. `digits` -- D88: пустая клетка
+    значит ROUND(..., 0), то есть целые рубли (форма заполняется без D88)."""
+    fot = sum((Decimal(x.headcount) * x.hours * x.rate for x in labor),
+              Decimal("0"))
+    labor_cost = fot + fot * settings.insurance_rate + fot * settings.injury_rate
+    direct = labor_cost + subcontract                           # D23
+    overhead = _money(labor_cost * settings.overhead_rate)      # D24
+    profit = _money((direct + overhead) * settings.profit_rate)  # D25
+    total = (materials + direct + overhead + profit).quantize(
+        Decimal(1).scaleb(-digits), rounding=ROUND_HALF_UP)
+    return _money(total)
+
+
 class TargetTooLow(ValueError):
     """Целевая цена не оставляет денег на работу (или работы в расчёте нет)."""
 

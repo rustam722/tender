@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from app.calc import Estimate, LaborLine, estimate, money_total
+from app.calc import Estimate, LaborLine, estimate, money_total, workbook_total
 from app.models import OrgSettings
 
 DEFAULTS = OrgSettings(
@@ -253,3 +253,47 @@ def test_money_total_of_nothing_is_zero_with_kopecks():
 def test_money_total_rounds_half_up_like_the_rest_of_the_calculator():
     assert money_total([Decimal("0.125"), Decimal("0.135")]) == Decimal("0.27")   # 0,13 + 0,14
     assert str(money_total([Decimal("5700000")])) == "5700000.00"
+
+
+# ---- итог так, как его посчитает книга (workbook_total) -------------------------------
+
+def test_workbook_total_equals_estimate_on_the_arktikgaz_data():
+    # настоящие данные поданной заявки: обе арифметики дают ровно 4 000 000
+    book = workbook_total(ARKTIK, Decimal("41686"), Decimal("1620000"), DEFAULTS)
+    assert book == Decimal("4000000.00") == arktik().total_wo_vat
+
+
+def test_workbook_does_not_round_insurance_but_the_program_does():
+    # 1 чел. * 1 ч * 1002,45: страховые 302,7399 -- программа печатает 302,74,
+    # книга держит 302,7399; на границе рубля итоги расходятся
+    labor = [LaborLine("Эколог", 1, Decimal("1"), Decimal("1002.45"))]
+    assert workbook_total(labor, Decimal("0"), Decimal("0"), DEFAULTS) == Decimal("1507")
+    assert estimate(labor, Decimal("0"), Decimal("0"), DEFAULTS).total_wo_vat == Decimal("1508")
+    # без округления итога видна причина: 1507,49 против 1507,50
+    kop = replace(DEFAULTS, total_rounding_digits=2)
+    assert workbook_total(labor, Decimal("0"), Decimal("0"), kop, digits=2) == Decimal("1507.49")
+    assert estimate(labor, Decimal("0"), Decimal("0"), kop).total_wo_vat == Decimal("1507.50")
+
+
+def test_workbook_total_rounds_overhead_and_profit_like_the_book():
+    # D24 и D25 округляются (ROUND(..., 2)), всё остальное -- сырая арифметика;
+    # ФОТ 1000: страховые 302; накладные 65,10; прибыль (1302 + 65,10) * 0,1 = 136,71
+    labor = [LaborLine("Эколог", 1, Decimal("1"), Decimal("1000"))]
+    kop = replace(DEFAULTS, total_rounding_digits=2)
+    assert workbook_total(labor, Decimal("0"), Decimal("0"), kop, digits=2) == Decimal("1503.81")
+
+
+def test_workbook_total_keeps_materials_out_of_the_profit_base():
+    only_materials = workbook_total([], Decimal("1000"), Decimal("0"), DEFAULTS)
+    assert only_materials == Decimal("1000")           # ни накладных, ни прибыли
+    with_sub = workbook_total([], Decimal("0"), Decimal("1000"), DEFAULTS)
+    assert with_sub == Decimal("1100")                 # прибыль 10 % от субподряда
+
+
+def test_workbook_total_empty_cell_d88_means_whole_roubles():
+    labor = [LaborLine("Эколог", 1, Decimal("1"), Decimal("1000.60"))]
+    zero = Decimal("0")
+    assert workbook_total(labor, zero, zero, DEFAULTS) == Decimal("1505")
+    # 1302,7812 + накладные 65,14 + прибыль 136,79 = 1504,71
+    assert workbook_total(labor, zero, zero, DEFAULTS, digits=2) == Decimal("1504.71")
+    assert workbook_total(labor, zero, zero, DEFAULTS, digits=-3) == Decimal("2000")

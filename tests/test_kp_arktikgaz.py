@@ -1,15 +1,18 @@
 """Калькуляция к КП Арктикгаза: настоящий шаблон из templates_docs/ и его карта.
 
 Книга считает итоги формулами сама, поэтому проверка идёт так: заполняем книгу
-из настоящей базы, вычисляем её формулы здесь же (мини-вычислитель ниже) и
-сверяем итог книги с калькулятором программы. Расхождение значило бы, что КП
-уйдёт заказчику с ценой, которой в программе нет.
+из настоящей базы и вычисляем её формулы здесь же (мини-вычислитель ниже).
+Результат сверяется с калькулятором программы -- но сходятся они не всегда.
+Книга складывает неокруглённое и не округляет страховые взносы; программа
+округляет каждую статью до копеек. Поэтому:
 
-Данные тестов -- дробные количества и часы (1,5 ед., 25,5 ч), но с произведениями
-в целую копейку: на них книга и программа обязаны сойтись. Данные, где
-произведение даёт долю копейки, они расходятся (книга складывает неокруглённое,
-программа -- напечатанные строки); для них сборка выдаёт предупреждение, и это
-проверено отдельно ниже.
+  * на данных, где произведения ложатся в копейку и итог не стоит на границе
+    рубля (данные Арктикгаза, дробные 1,5 ед. и 25,5 ч с ровными копейками),
+    итоги книги и программы равны -- это проверено;
+  * на данных с долей копейки в строке или на границе рубля (1 чел. x 1 ч x
+    1002,45) итоги расходятся, и это закреплено тестами, как и предупреждение
+    сборки, которое о таких данных говорит;
+  * `workbook_total` из app.calc сверяется здесь с формулами самой книги.
 """
 import re
 from decimal import ROUND_HALF_UP, Decimal
@@ -19,6 +22,7 @@ import pytest
 from openpyxl import load_workbook
 
 from app import db
+from app.calc import LaborLine, workbook_total
 from app.models import Tender, TenderCostItem, TenderLaborRow
 from app.render.context import build_context
 from app.render.package import build_package
@@ -74,14 +78,10 @@ def repo(tmp_path):
     conn.close()
 
 
-def make_tender(repo, *, materials=2, labor=2, subcontract=3,
-                quantity="1.5", price="1234.56", hours="25.5",
-                rate="181.20") -> int:
+def make_custom_tender(repo, *, labor=(), materials=(), subcontract=()) -> int:
     """Тендер Арктикгаза из справочников, которые наполняет seed.
-
-    Множители дробные, но произведения ложатся в копейку ровно:
-    1,5 * 1234,56 = 1851,84; 25,5 * 181,20 = 4620,60. Данные с долей копейки --
-    параметрами (price="1234.57")."""
+    labor -- (должность, человек, часов, ставка); materials и subcontract --
+    (название, количество, цена)."""
     seed(repo)
     me = repo.find_organization_by_inn("5904188041")
     customer = next(p.customer_id for p in repo.list_customer_profiles()
@@ -91,19 +91,42 @@ def make_tender(repo, *, materials=2, labor=2, subcontract=3,
         object_address="Ямало-Ненецкий АО, Тазовский район",
         payment_terms="60 дней с даты подписания акта",
         deadline="в течение 90 дней"))
-    for n in range(1, labor + 1):
+    for n, (post, people, hours, rate) in enumerate(labor, start=1):
         repo.save_tender_labor(TenderLaborRow(
-            tender_id=tid, position=n, post=f"Должность {n}", headcount=n,
+            tender_id=tid, position=n, post=post, headcount=people,
             hours=Decimal(hours), rate=Decimal(rate)))
-    for kind, count, unit_price in (("materials", materials, price),
-                                    ("subcontract", subcontract, "70000.40")):
-        for n in range(1, count + 1):
+    for kind, rows in (("materials", materials), ("subcontract", subcontract)):
+        for n, (name, quantity, price) in enumerate(rows, start=1):
             repo.save_tender_cost_item(TenderCostItem(
-                tender_id=tid, kind=kind, position=n, name=f"{kind} {n}",
-                unit="шт.", quantity=Decimal(quantity),
-                price=Decimal(unit_price),
+                tender_id=tid, kind=kind, position=n, name=name, unit="шт.",
+                quantity=Decimal(quantity), price=Decimal(price),
                 note="содержание" if kind == "subcontract" else ""))
     return tid
+
+
+# настоящие данные поданной заявки Арктикгаза: итог без НДС ровно 4 000 000
+ARKTIK_LABOR = [("Эколог-проектировщик", 4, "1200", "270"),
+                ("Начальник отдела проектирования", 1, "360", "420")]
+ARKTIK_MATERIALS = [("инвентарь, оборудование", "1", "24000"),
+                    ("расходные материалы", "1", "17686")]
+ARKTIK_SUBCONTRACT = [("исследования и измерения", "1", "1500000"),
+                      ("фоновые концентрации", "1", "70000"),
+                      ("экспертиза", "1", "50000")]
+
+
+def make_tender(repo, *, materials=2, labor=2, subcontract=3,
+                quantity="1.5", price="1234.56", hours="25.5",
+                rate="181.20") -> int:
+    """Сгенерированный тендер. Множители дробные, но произведения ложатся в
+    копейку ровно: 1,5 * 1234,56 = 1851,84; 25,5 * 181,20 = 4620,60. Данные с
+    долей копейки -- параметрами (price="1234.57")."""
+    return make_custom_tender(
+        repo,
+        labor=[(f"Должность {n}", n, hours, rate) for n in range(1, labor + 1)],
+        materials=[(f"materials {n}", quantity, price)
+                   for n in range(1, materials + 1)],
+        subcontract=[(f"subcontract {n}", quantity, "70000.40")
+                     for n in range(1, subcontract + 1)])
 
 
 def fill(repo, tmp_path, **sizes):
@@ -116,11 +139,13 @@ def fill(repo, tmp_path, **sizes):
 
 # ---- шаблон чист ------------------------------------------------------------------
 
-# каждая клетка, которую в поданной заявке занимали данные прошлого тендера
+# каждая клетка, в которой в поданной заявке стояли данные прошлого тендера
+# (клетки, пустые и в исходной книге, сюда не входят: они ничего не проверяют)
 CLEARED = (["A4", "A5", "A6", "A7", "D2", "A69", "E72"]
-           + [f"{c}{r}" for r in (35, 36, 40) for c in "BCDE"]
+           + ["B35", "C35", "D35", "E35", "B36", "C36", "D36", "E36", "B40"]
            + [f"{c}{r}" for r in (48, 49) for c in "BCDE"]
-           + [f"{c}{r}" for r in (60, 61, 62) for c in "BCDEF"])
+           + ["B60", "D60", "E60", "F60", "B61", "C61", "D61", "E61", "F61",
+              "B62", "D62", "E62", "F62"])
 
 
 def test_template_holds_no_data_of_the_submitted_bid():
@@ -224,7 +249,7 @@ def test_fractions_of_a_kopeck_make_the_workbook_and_the_program_differ(
                        price="1234.57")
     assert evaluate(ws, "D13") == Decimal("7407.42")
     assert context["estimate"]["materials"] == Decimal("7407.44")
-    assert len(context["warnings"]) == 4
+    assert len(context["warnings"]) == 1       # одно на документ, с четырьмя строками
 
 
 # ---- ёмкость: лишняя позиция -- отказ, а не тихо заниженная цена --------------------
@@ -266,56 +291,105 @@ def test_cellmap_capacities_are_derived_from_the_workbook_formulas():
     assert "D88" not in cell_map.cells          # решение контроллера
 
 
-# ---- предупреждение: доли копейки при заполнении книги ------------------------------
+# ---- предупреждение: разойдутся ли две бумаги ---------------------------------------
 
 def warnings_of(repo, document=DOC_ESTIMATE, **sizes):
     tid = make_tender(repo, **sizes)
     return build_context(tid, repo, document=document)["warnings"]
 
 
-def test_no_warning_on_whole_kopeck_products(repo):
-    # настоящие данные Арктикгаза: целые часы, копеечные цены; и дробные
-    # множители, если произведение ровное
+def custom_warnings(repo, **lists):
+    tid = make_custom_tender(repo, **lists)
+    return build_context(tid, repo, document=DOC_ESTIMATE)["warnings"]
+
+
+def plain(text: str) -> str:
+    return text.replace(NBSP, " ")
+
+
+def test_no_warning_on_the_real_arktikgaz_data(repo, tmp_path):
+    # итог книги и программы -- ровно 4 000 000: предупреждения быть не должно.
+    # Этот тест не менее важен положительных: сигнал, который горит всегда,
+    # через неделю перестают читать
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT)
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    assert context["warnings"] == []
+    assert context["estimate"]["total_wo_vat"] == Decimal("4000000.00")
+    out = fill_workbook(TEMPLATE, load_cellmap(CELLMAP), context, tmp_path / "a.xlsx")
+    assert evaluate(load_workbook(out)[SHEET], "D26") == Decimal("4000000")
+
+
+def test_no_warning_on_whole_kopeck_products_away_from_the_rouble_boundary(repo):
     assert warnings_of(repo) == []
     assert warnings_of(repo, quantity="1", hours="1200", rate="270",
                        price="24000") == []
 
 
+def test_warns_with_both_totals_when_insurance_rounding_splits_them(repo, tmp_path):
+    # случай ревьюера: 1 чел. x 1 ч x 1002,45, произведение ровное, долей копейки
+    # нет, а книга и программа разошлись на рубль (страховые 302,7399)
+    tid = make_custom_tender(repo, labor=[("Эколог", 1, "1", "1002.45")])
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    (text,) = context["warnings"]
+    text = plain(text)
+    assert "«Калькуляция к КП»" in text
+    assert "итог без НДС 1 507,00" in text and "1 508,00" in text
+    assert "Строк с долей копейки нет" in text
+    assert "не округляет страховые" in text and "Исправить это нельзя" in text
+    # и это не домысел: книга действительно даёт 1507, а программа 1508
+    out = fill_workbook(TEMPLATE, load_cellmap(CELLMAP), context, tmp_path / "r.xlsx")
+    assert evaluate(load_workbook(out)[SHEET], "D26") == Decimal("1507")
+    assert context["estimate"]["total_wo_vat"] == Decimal("1508.00")
+
+
 def test_warns_about_material_row_with_half_a_kopeck(repo):
-    found = warnings_of(repo, materials=1, quantity="1.5", price="1234.57")
-    assert len(found) == 1
-    text = found[0]
-    assert "«Калькуляция к КП»" in text and "«materials 1»" in text
-    assert "1,5 × 1 234,57 = 1 851,855" in text.replace(NBSP, " ")
-    assert "Исправьте количество или цену" in text
+    (text,) = custom_warnings(repo, materials=[("расходные материалы", "1.5", "1234.57")])
+    text = plain(text)
+    assert "«Калькуляция к КП»" in text and "«расходные материалы» (материалы)" in text
+    assert "1,5 × 1 234,57 = 1 851,855" in text
+    assert "в документе напечатано 1 851,86" in text       # то, что видит человек
+    assert "количество или цену" in text and "численность" not in text
 
 
-def test_warns_about_labor_row_with_fractional_kopecks(repo):
-    found = warnings_of(repo, labor=1, hours="25.7", rate="181.26")
-    assert len(found) == 1
-    assert "«Должность 1»" in found[0] and "трудозатраты" in found[0]
-    assert "1 × 25,7 × 181,26 = 4 658,382" in found[0].replace(NBSP, " ")
+def test_warns_about_labor_row_and_suggests_all_three_factors(repo):
+    (text,) = custom_warnings(repo, labor=[("Эколог", 1, "25.7", "181.26")])
+    text = plain(text)
+    assert "«Эколог» (трудозатраты)" in text
+    assert "1 × 25,7 × 181,26 = 4 658,382" in text
+    assert "численность, часы или ставку" in text and "количество или цену" not in text
+
+
+def test_warns_about_a_row_even_when_the_totals_coincide(repo):
+    # четыре строки 4 x 1,5 x 1234,57: итоги до рубля одинаковы (7 407), но
+    # подытог книги 7 407,42 не сойдётся с четырьмя напечатанными по 1 851,86
+    (text,) = custom_warnings(repo, materials=[(f"м{n}", "1.5", "1234.57")
+                                               for n in range(1, 5)])
+    text = plain(text)
+    assert "итог без НДС в книге Excel и в программе совпадёт (7 407,00)" in text
+    assert "подытоги книги не сойдутся" in text
+    for n in range(1, 5):
+        assert f"«м{n}» (материалы)" in text
 
 
 def test_warns_about_subcontract_row_by_name(repo):
-    tid = make_tender(repo)
-    repo.save_tender_cost_item(TenderCostItem(
-        tender_id=tid, kind="subcontract", position=9, name="экспертиза",
-        quantity=Decimal("0.5"), price=Decimal("0.01")))
-    found = build_context(tid, repo, document=DOC_ESTIMATE)["warnings"]
-    assert len(found) == 1 and "«экспертиза»" in found[0]
-    assert "субподряд" in found[0]
+    (text,) = custom_warnings(repo, subcontract=[("экспертиза", "0.5", "0.01")])
+    assert "«экспертиза» (субподряд)" in plain(text)
 
 
-def test_warning_names_every_offending_row(repo):
-    found = warnings_of(repo, materials=3, labor=1, quantity="1.5",
-                        price="1234.57", hours="25.7", rate="181.26")
-    assert len(found) == 4          # три материала и одна строка ФОТ
+def test_one_warning_names_every_offending_row(repo):
+    (text,) = warnings_of(repo, materials=3, labor=1, quantity="1.5",
+                          price="1234.57", hours="25.7", rate="181.26")
+    for n in (1, 2, 3):
+        assert f"«materials {n}»" in text
+    assert "«Должность 1»" in text
 
 
 def test_no_warning_for_a_document_without_a_cellmap(repo):
-    # те же дроби, но документ собирается Word: там всё и так сходится
-    tid = make_tender(repo, materials=1, quantity="1.5", price="1234.57")
+    # те же данные, что дают предупреждение, но документ собирается Word
+    tid = make_custom_tender(repo, labor=[("Эколог", 1, "1", "1002.45")],
+                             materials=[("м", "1.5", "1234.57")])
+    assert build_context(tid, repo, document=DOC_ESTIMATE)["warnings"]
     assert build_context(tid, repo, document="Коммерческое предложение"
                          )["warnings"] == []
     assert build_context(tid, repo)["warnings"] == []
@@ -324,13 +398,30 @@ def test_no_warning_for_a_document_without_a_cellmap(repo):
 def test_no_warning_about_lists_the_workbook_does_not_receive(repo):
     # ТКП Роснефти пишет в книгу только позиции лота: материалы и ФОТ тендера
     # в ней не участвуют, предупреждать о них было бы враньём
-    tid = make_tender(repo, materials=1, quantity="1.5", price="1234.57")
+    tid = make_custom_tender(repo, labor=[("Эколог", 1, "1", "1002.45")],
+                             materials=[("м", "1.5", "1234.57")])
     tender = repo.get_tender(tid)
     tender.customer_id = next(p.customer_id for p in repo.list_customer_profiles()
                               if "ТКП по форме заказчика" in p.docs)
     repo.save_tender(tender)
     assert build_context(tid, repo, document="ТКП по форме заказчика"
                          )["warnings"] == []
+
+
+@pytest.mark.parametrize("rate", ["1002.45", "1000", "1000.60", "270", "181.26",
+                                  "999.99", "1234.56", "0.01"])
+def test_warning_fires_exactly_when_the_papers_differ(repo, tmp_path, rate):
+    # условие прямое: итоги книги (вычислены по её формулам) и программы
+    # расходятся тогда и только тогда, когда есть предупреждение без строк
+    tid = make_custom_tender(repo, labor=[("Эколог", 1, "1", rate)])
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    out = fill_workbook(TEMPLATE, load_cellmap(CELLMAP), context, tmp_path / "x.xlsx")
+    book = evaluate(load_workbook(out)[SHEET], "D26")
+    differ = book != context["estimate"]["total_wo_vat"]
+    assert bool(context["warnings"]) == differ, (rate, book)
+    assert workbook_total(
+        [LaborLine("Эколог", 1, Decimal("1"), Decimal(rate))], Decimal(0),
+        Decimal(0), repo.get_settings()) == book
 
 
 # ---- сквозная сборка: профиль -> пакет -> файл ----------------------------------------
