@@ -1,0 +1,48 @@
+{
+  "sheet": "Лист1",
+  "cells": {
+    "D2": "{org.short_name}\nЮридический адрес: {org.legal_address}\nПочтовый адрес: {org.postal_address}\n{org.email}, {org.website}\nтел. {org.phones}",
+    "A4": "Наименование заказчика: {customer.short_name}",
+    "A5": "Местоположение объекта: {tender.object_address}",
+    "A6": "Условия оплаты: {tender.payment_terms}",
+    "A7": "Срок исполнения: {tender.deadline}",
+    "A69": "{org.head_position} {org.head_name}",
+    "E72": "Дата: {today}г."
+  },
+  "rows": [
+    {
+      "first_row": 35,
+      "last_row": 38,
+      "source": "materials",
+      "columns": {
+        "B": "{row.name}",
+        "C": "{row.unit}",
+        "D": "{row.quantity}",
+        "E": "{row.price_value}"
+      }
+    },
+    {
+      "first_row": 48,
+      "last_row": 53,
+      "source": "labor",
+      "columns": {
+        "B": "{row.post}",
+        "C": "{row.headcount}",
+        "D": "{row.hours}",
+        "E": "{row.rate_value}"
+      }
+    },
+    {
+      "first_row": 60,
+      "last_row": 62,
+      "source": "subcontract",
+      "columns": {
+        "B": "{row.name}",
+        "C": "{row.note}",
+        "D": "{row.unit}",
+        "E": "{row.quantity}",
+        "F": "{row.price_value}"
+      }
+    }
+  ]
+}

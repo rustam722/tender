@@ -7,7 +7,9 @@ from pathlib import Path
 import pytest
 
 from app import db
-from app.models import ROLE_CUSTOMER, ROLE_PARTICIPANT
+from app.models import ROLE_CUSTOMER, ROLE_PARTICIPANT, LotItem, Tender
+from app.render.context import build_context
+from app.render.docx_render import render_docx
 from app.render.context import DOCUMENTS, TABLE_DOCUMENTS
 from app.repo import Repo
 from scripts import seed as seed_module
@@ -145,8 +147,10 @@ def test_missing_template_fails_in_russian(repo, tmp_path, monkeypatch):
 
 def test_missing_cellmap_fails_in_russian(repo, tmp_path, monkeypatch):
     monkeypatch.setattr(seed_module, "CELLMAPS_DIR", tmp_path / "нет")
-    with pytest.raises(SeedError, match="карт"):
+    with pytest.raises(SeedError, match="Не найдена карта ячеек") as caught:
         seed(repo)
+    assert "шаблон" not in str(caught.value)        # ловим карту, а не шаблон
+    assert counts(repo)["profiles"] == 0
 
 
 # ---- сторож: в шаблонах нет подписи и печати -----------------------------------
@@ -205,3 +209,27 @@ def test_signature_guard_also_reads_workbooks(tmp_path):
     with zipfile.ZipFile(book, "w") as archive:
         archive.writestr("xl/media/image1.png", "печать".encode())
     assert "xl/media/image1.png" in _images_outside_whitelist(tmp_path)[0]
+
+
+def test_every_seeded_word_template_renders_with_a_real_context(repo, tmp_path):
+    """Шаблоны после правки (убрана подпись, итоги КП) по-прежнему собираются."""
+    seed(repo)
+    me = repo.find_organization_by_inn("5904188041")
+    rendered = []
+    for profile in repo.list_customer_profiles():
+        tid = repo.save_tender(Tender(customer_id=profile.customer_id,
+                                      participant_id=me.id))
+        repo.save_lot_item(LotItem(tender_id=tid, position=1, name="Услуга",
+                                   price=Decimal("1000.00")))
+        for name in profile.documents:
+            template = profile.docs[name].template or f"{name}.docx"
+            if not template.endswith(".docx"):
+                continue
+            context = build_context(tid, repo, document=name)
+            out = render_docx(seed_module.TEMPLATES_DIR / template, context,
+                              tmp_path / f"{len(rendered)}.docx")
+            assert out.is_file()
+            rendered.append(template)
+    assert "Письмо о крупности сделки.docx" in rendered
+    assert "Справка о кадровых ресурсах.docx" in rendered
+    assert "Коммерческое предложение.docx" in rendered
