@@ -36,15 +36,13 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.config import BASE_DIR
+from app import config
 from app.render.context import build_context
 from app.render.docx_render import TemplateError, render_docx
 from app.render.layouts import LayoutError
 from app.render.xlsx_render import CellMapError, fill_workbook, load_cellmap
 from app.repo import Repo
 
-TEMPLATES_DOCS_DIR = BASE_DIR / "templates_docs"
-CELLMAPS_DIR = BASE_DIR / "cellmaps"
 
 MAX_NAME_LENGTH = 255       # предел имени файла в NTFS, в знаках UTF-16
 MAX_PATH_LENGTH = 259       # MAX_PATH Windows без завершающего нуля: дальше
@@ -182,7 +180,7 @@ def _target(out_dir: Path, document: str, prefix: str, extension: str) -> Path:
 
 def _template_path(document: str, template: str) -> Path:
     name = template or f"{document}.docx"
-    path = TEMPLATES_DOCS_DIR / name
+    path = config.TEMPLATES_DOCS_DIR / name
     if path.suffix.lower() not in _SUPPORTED:
         raise _Refusal(
             f"Шаблон «{name}» имеет тип «{path.suffix or 'без расширения'}»: "
@@ -190,7 +188,7 @@ def _template_path(document: str, template: str) -> Path:
             "шаблона в профиле заказчика.")
     if not path.is_file():
         raise _Refusal(
-            f"Шаблон «{name}» не найден в папке {TEMPLATES_DOCS_DIR.name}. "
+            f"Шаблон «{name}» не найден в папке {config.TEMPLATES_DOCS_DIR.name}. "
             "Положите файл с этим именем в папку или укажите другой шаблон "
             "в профиле заказчика.")
     return path
@@ -225,10 +223,10 @@ def _plan_one(document: str, spec, out_dir: Path,
             raise _Refusal(
                 f"Для книги «{template.name}» в профиле заказчика не указана "
                 "карта ячеек. Добавьте её в описание документа.")
-        if not (CELLMAPS_DIR / spec.cellmap).is_file():
+        if not (config.CELLMAPS_DIR / spec.cellmap).is_file():
             raise _Refusal(
                 f"Карта ячеек {spec.cellmap} не найдена в папке "
-                f"{CELLMAPS_DIR.name}. Проверьте имя файла в профиле заказчика.")
+                f"{config.CELLMAPS_DIR.name}. Проверьте имя файла в профиле заказчика.")
     taken.add(target.name.casefold())
     return template, target
 
@@ -269,7 +267,7 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
     try:
         try:
             if template.suffix.lower() == ".xlsx":
-                fill_workbook(template, load_cellmap(CELLMAPS_DIR / spec.cellmap),
+                fill_workbook(template, load_cellmap(config.CELLMAPS_DIR / spec.cellmap),
                               context, work)
             else:
                 render_docx(template, context, work)
@@ -297,10 +295,10 @@ def _prepare(tender_id: int, documents: list[str], out_dir: Path, repo: Repo):
     tender = repo.get_tender(tender_id)
     profile = (repo.find_customer_profile(tender.customer_id)
                if tender.customer_id is not None else None)
-    if documents and not TEMPLATES_DOCS_DIR.is_dir():
+    if documents and not config.TEMPLATES_DOCS_DIR.is_dir():
         # одна причина на весь пакет -- одно сообщение, а не по строке на документ
         raise PackageError(
-            f"Папка шаблонов «{TEMPLATES_DOCS_DIR}» не найдена: без неё не "
+            f"Папка шаблонов «{config.TEMPLATES_DOCS_DIR}» не найдена: без неё не "
             "собрать ни один документ. Проверьте, что папка templates_docs "
             "лежит рядом с программой и в ней есть шаблоны.")
     return profile, Path(os.path.abspath(out_dir))

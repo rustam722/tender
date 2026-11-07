@@ -17,7 +17,7 @@ from pathlib import Path
 import docx
 import pytest
 
-from app import db
+from app import config, db
 from app.config import BASE_DIR
 from app.inn.fns import CaptchaRequired, InnNotFound, SourceUnavailable
 from app.models import ROLE_CUSTOMER, Organization
@@ -52,8 +52,8 @@ def dirs(tmp_path, monkeypatch):
     cellmaps = tmp_path / "cellmaps"
     templates.mkdir()
     cellmaps.mkdir()
-    monkeypatch.setattr(package_module, "TEMPLATES_DOCS_DIR", templates)
-    monkeypatch.setattr(package_module, "CELLMAPS_DIR", cellmaps)
+    monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR", templates)
+    monkeypatch.setattr(config, "CELLMAPS_DIR", cellmaps)
     return templates, cellmaps
 
 
@@ -858,7 +858,7 @@ def test_unusable_output_folder_is_a_russian_400(client, tmp_path, dirs):
 
 
 def test_build_without_templates_folder_is_a_russian_400(client, tmp_path, monkeypatch):
-    monkeypatch.setattr(package_module, "TEMPLATES_DOCS_DIR", tmp_path / "нет такой")
+    monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR", tmp_path / "нет такой")
     tender = make_tender(client)
     body = refused(client.post(f"/api/tenders/{tender['id']}/build", json={
         "documents": ["Декларация"], "output_dir": str(tmp_path / "o")}))

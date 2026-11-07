@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app import db
+from app import config, db
 from app.models import ROLE_CUSTOMER, ROLE_PARTICIPANT, LotItem, Tender
 from app.render.context import DOCUMENTS, TABLE_DOCUMENTS, build_context
 from app.render.docx_render import render_docx
@@ -76,11 +76,11 @@ def test_every_seeded_profile_has_existing_template_files(repo):
         for name, spec in profile.docs.items():
             assert name in DOCUMENTS, f"{name!r} -- не каноническое имя"
             template = spec.template or f"{name}.docx"
-            assert (seed_module.TEMPLATES_DIR / template).is_file(), template
+            assert (config.TEMPLATES_DOCS_DIR / template).is_file(), template
             if spec.cellmap:
-                assert (seed_module.CELLMAPS_DIR / spec.cellmap).is_file()
+                assert (config.CELLMAPS_DIR / spec.cellmap).is_file()
             if spec.layout:
-                assert (seed_module.LAYOUTS_DIR / spec.layout).is_file()
+                assert (config.LAYOUTS_DIR / spec.layout).is_file()
 
 
 def test_profile_documents_are_canonical_and_described(repo):
@@ -132,20 +132,20 @@ def test_seed_does_not_overwrite_user_edits(repo):
 
 
 def test_missing_layout_file_fails_in_russian(repo, tmp_path, monkeypatch):
-    monkeypatch.setattr(seed_module, "LAYOUTS_DIR", tmp_path / "нет")
+    monkeypatch.setattr(config, "LAYOUTS_DIR", tmp_path / "нет")
     with pytest.raises(SeedError, match="раскладки"):
         seed(repo)
     assert counts(repo)["profiles"] == 0
 
 
 def test_missing_template_fails_in_russian(repo, tmp_path, monkeypatch):
-    monkeypatch.setattr(seed_module, "TEMPLATES_DIR", tmp_path / "нет")
+    monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR", tmp_path / "нет")
     with pytest.raises(SeedError, match="шаблон"):
         seed(repo)
 
 
 def test_missing_cellmap_fails_in_russian(repo, tmp_path, monkeypatch):
-    monkeypatch.setattr(seed_module, "CELLMAPS_DIR", tmp_path / "нет")
+    monkeypatch.setattr(config, "CELLMAPS_DIR", tmp_path / "нет")
     with pytest.raises(SeedError, match="Не найдена карта ячеек") as caught:
         seed(repo)
     assert "шаблон" not in str(caught.value)        # ловим карту, а не шаблон
@@ -213,8 +213,8 @@ def _images_outside_whitelist(templates_dir) -> list[str]:
 
 
 def test_templates_carry_no_signature_or_stamp_images():
-    assert not _images_outside_whitelist(seed_module.TEMPLATES_DIR), \
-        "\n".join(_images_outside_whitelist(seed_module.TEMPLATES_DIR))
+    assert not _images_outside_whitelist(config.TEMPLATES_DOCS_DIR), \
+        "\n".join(_images_outside_whitelist(config.TEMPLATES_DOCS_DIR))
 
 
 def test_signature_guard_catches_a_scan_and_names_the_part(tmp_path):
@@ -252,7 +252,7 @@ def test_every_seeded_word_template_renders_with_a_real_context(repo, tmp_path):
             if not template.endswith(".docx"):
                 continue
             context = build_context(tid, repo, document=name)
-            out = render_docx(seed_module.TEMPLATES_DIR / template, context,
+            out = render_docx(config.TEMPLATES_DOCS_DIR / template, context,
                               tmp_path / f"{len(rendered)}.docx")
             assert out.is_file()
             rendered.append(template)

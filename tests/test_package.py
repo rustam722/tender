@@ -12,7 +12,7 @@ import docx
 import pytest
 from openpyxl import load_workbook
 
-from app import db
+from app import config, db
 from app.models import (
     ROLE_CUSTOMER, ROLE_PARTICIPANT, Asset, CustomerProfile, DocSpec,
     ExperienceRecord, LotItem, Organization, Tender,
@@ -69,8 +69,8 @@ def dirs(tmp_path, monkeypatch):
     cellmaps = tmp_path / "cellmaps"
     templates.mkdir()
     cellmaps.mkdir()
-    monkeypatch.setattr(package_module, "TEMPLATES_DOCS_DIR", templates)
-    monkeypatch.setattr(package_module, "CELLMAPS_DIR", cellmaps)
+    monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR", templates)
+    monkeypatch.setattr(config, "CELLMAPS_DIR", cellmaps)
     return templates, cellmaps
 
 
@@ -816,9 +816,9 @@ def test_overwrite_true_replaces_an_excel_form_too(repo, dirs, tmp_path):
 
 def test_missing_templates_folder_is_one_error_not_one_skip_per_document(
         repo, tmp_path, monkeypatch):
-    monkeypatch.setattr(package_module, "TEMPLATES_DOCS_DIR",
+    monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR",
                         tmp_path / "нет_такой_папки")
-    monkeypatch.setattr(package_module, "CELLMAPS_DIR", tmp_path / "cellmaps")
+    monkeypatch.setattr(config, "CELLMAPS_DIR", tmp_path / "cellmaps")
     tid = make_tender(repo, documents=[DECLARATION, MTR])
     out = tmp_path / "out"
     with pytest.raises(PackageError) as caught:
@@ -832,7 +832,7 @@ def test_templates_folder_that_is_a_file_is_the_same_single_error(
         repo, tmp_path, monkeypatch):
     blocker = tmp_path / "templates_docs"
     blocker.write_text("x", encoding="utf-8")
-    monkeypatch.setattr(package_module, "TEMPLATES_DOCS_DIR", blocker)
+    monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR", blocker)
     tid = make_tender(repo, documents=[DECLARATION])
     with pytest.raises(PackageError):
         build_package(tid, [DECLARATION], tmp_path / "out", repo)
@@ -840,7 +840,7 @@ def test_templates_folder_that_is_a_file_is_the_same_single_error(
 
 def test_missing_templates_folder_with_nothing_to_build_is_not_an_error(
         repo, tmp_path, monkeypatch):
-    monkeypatch.setattr(package_module, "TEMPLATES_DOCS_DIR", tmp_path / "нет")
+    monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR", tmp_path / "нет")
     tid = make_tender(repo)
     result = build_package(tid, [], tmp_path / "out", repo)
     assert result == PackageResult(written=[], skipped=[])
@@ -951,7 +951,7 @@ def test_planned_files_unknown_tender_is_lookup_error(repo, dirs, tmp_path):
 
 def test_planned_files_missing_templates_folder_is_package_error(
         repo, tmp_path, monkeypatch):
-    monkeypatch.setattr(package_module, "TEMPLATES_DOCS_DIR", tmp_path / "нет")
+    monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR", tmp_path / "нет")
     tid = make_tender(repo, documents=[DECLARATION])
     with pytest.raises(PackageError):
         planned_files(tid, [DECLARATION], tmp_path / "out", repo)

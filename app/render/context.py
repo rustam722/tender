@@ -63,8 +63,8 @@ from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
+from app import config
 from app.calc import LaborLine, estimate, money_total
-from app.config import BASE_DIR
 from app.models import (
     COST_MATERIALS, COST_SUBCONTRACT, ROLE_CUSTOMER, ROLE_PARTICIPANT,
     CustomerProfile, DocSpec, LotItem, Organization, TenderCostItem, TenderLaborRow,
@@ -73,8 +73,6 @@ from app.render.layouts import TableLayout, build_rows, load_layout
 from app.render.xlsx_render import CellMapError, load_cellmap
 from app.repo import Repo
 
-LAYOUTS_DIR = BASE_DIR / "layouts"
-CELLMAPS_DIR = BASE_DIR / "cellmaps"
 
 NBSP = " "
 _KOPECK = Decimal("0.01")
@@ -214,12 +212,12 @@ def _layouts(profile: CustomerProfile | None,
     Какому справочнику служит файл, говорит он сам (поле source): один контекст
     собирается под один документ, поэтому двух раскладок на один источник
     не бывает. Документ без раскладки в профиле остаётся на умолчаниях."""
-    layouts = {source: load_layout(Path(LAYOUTS_DIR) / name)
+    layouts = {source: load_layout(Path(config.LAYOUTS_DIR) / name)
                for source, name in _DEFAULT_LAYOUTS.items()}
     spec = _doc_spec(profile, document)
     name = spec.layout if spec else ""
     if name:
-        chosen = load_layout(Path(LAYOUTS_DIR) / name)
+        chosen = load_layout(Path(config.LAYOUTS_DIR) / name)
         layouts[chosen.source] = chosen
     return layouts
 
@@ -290,7 +288,7 @@ def _workbook_sums_warnings(document: str, spec: DocSpec | None, labor, material
         return []
     try:
         sources = {b.source for b in
-                   load_cellmap(Path(CELLMAPS_DIR) / spec.cellmap).rows}
+                   load_cellmap(Path(config.CELLMAPS_DIR) / spec.cellmap).rows}
     except CellMapError:
         return []          # пропавшую или битую карту назовёт сборка пакета
     details = []

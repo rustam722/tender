@@ -34,6 +34,7 @@ import docx
 import pytest
 from werkzeug.serving import make_server
 
+from app import config
 from app.config import BASE_DIR
 from app.models import CustomerProfile, DocSpec
 from app.render import package as package_module
@@ -211,8 +212,8 @@ def live_server(tmp_path, monkeypatch):
     """Настоящий сервер на свободном порту, настоящая база, шаблон и профиль."""
     templates = tmp_path / "templates_docs"
     templates.mkdir()
-    monkeypatch.setattr(package_module, "TEMPLATES_DOCS_DIR", templates)
-    monkeypatch.setattr(package_module, "CELLMAPS_DIR", tmp_path / "cellmaps")
+    monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR", templates)
+    monkeypatch.setattr(config, "CELLMAPS_DIR", tmp_path / "cellmaps")
     for name in ("Справка о МТР", "Декларация соответствия"):
         document = docx.Document()
         document.add_paragraph(f"{name}: {{{{ tender.subject }}}}")

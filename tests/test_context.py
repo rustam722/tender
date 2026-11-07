@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from app import db
+from app import config, db
 from app.calc import LaborLine, estimate
 from app.models import (
     ROLE_CUSTOMER, ROLE_PARTICIPANT, Asset, CustomerProfile, DocSpec, Employee,
@@ -653,7 +653,7 @@ def test_new_customer_layout_needs_only_a_layout_file(repo, tmp_path, monkeypatc
         '{"source": "assets", "numbered": false, "columns": ['
         '{"header": "Что", "parts": ["name"]}, {"header": "Где", "parts": ["location"]}]}',
         encoding="utf-8")
-    monkeypatch.setattr(ctx_module, "LAYOUTS_DIR", tmp_path)
+    monkeypatch.setattr(config, "LAYOUTS_DIR", tmp_path)
     customer = repo.save_organization(Organization(role=ROLE_CUSTOMER))
     repo.save_customer_profile(CustomerProfile(
         customer_id=customer,
@@ -662,7 +662,7 @@ def test_new_customer_layout_needs_only_a_layout_file(repo, tmp_path, monkeypatc
     # остальные источники берут умолчания из той же папки: кладём и их
     for name in ctx_module._DEFAULT_LAYOUTS.values():
         (tmp_path / name).write_text(
-            (ctx_module.BASE_DIR / "layouts" / name).read_text(encoding="utf-8"),
+            (config.BASE_DIR / "layouts" / name).read_text(encoding="utf-8"),
             encoding="utf-8")
     tid = add_tender(repo, customer, None)
     ctx = build_context(tid, repo, document="Перечень техники")

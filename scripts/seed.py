@@ -33,14 +33,14 @@ if __package__ in (None, ""):          # запуск файлом: найти �
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import db
+from app import config
 from app.config import DB_PATH
 from app.models import (
     ROLE_CUSTOMER, ROLE_PARTICIPANT, Asset, CustomerProfile, DocSpec, Employee,
     ExperienceRecord, Organization, Service,
 )
-from app.render.context import DOCUMENTS, LAYOUTS_DIR
+from app.render.context import DOCUMENTS
 from app.render.layouts import LayoutError, load_layout
-from app.render.package import CELLMAPS_DIR, TEMPLATES_DOCS_DIR as TEMPLATES_DIR
 from app.render.xlsx_render import CellMapError, load_cellmap
 from app.repo import Repo
 
@@ -343,26 +343,26 @@ def _check_files(profiles) -> None:
                     "документов пакета.")
         for name, spec in docs.items():
             template = spec.template or f"{name}.docx"
-            if not (Path(TEMPLATES_DIR) / template).is_file():
+            if not (Path(config.TEMPLATES_DOCS_DIR) / template).is_file():
                 raise SeedError(
                     f"Не найден шаблон «{template}» для документа «{name}»: "
-                    f"положите файл в папку {Path(TEMPLATES_DIR).name}.")
+                    f"положите файл в папку {Path(config.TEMPLATES_DOCS_DIR).name}.")
             if spec.cellmap:
-                path = Path(CELLMAPS_DIR) / spec.cellmap
+                path = Path(config.CELLMAPS_DIR) / spec.cellmap
                 if not path.is_file():
                     raise SeedError(
                         f"Не найдена карта ячеек «{spec.cellmap}» для документа "
-                        f"«{name}»: положите файл в папку {Path(CELLMAPS_DIR).name}.")
+                        f"«{name}»: положите файл в папку {Path(config.CELLMAPS_DIR).name}.")
                 try:
                     load_cellmap(path)
                 except CellMapError as exc:
                     raise SeedError(str(exc)) from exc
             if spec.layout:
-                path = Path(LAYOUTS_DIR) / spec.layout
+                path = Path(config.LAYOUTS_DIR) / spec.layout
                 if not path.is_file():
                     raise SeedError(
                         f"Не найден файл раскладки «{spec.layout}» для документа "
-                        f"«{name}»: положите файл в папку {Path(LAYOUTS_DIR).name}.")
+                        f"«{name}»: положите файл в папку {Path(config.LAYOUTS_DIR).name}.")
                 try:
                     load_layout(path)
                 except LayoutError as exc:
