@@ -275,12 +275,21 @@ def test_workbook_does_not_round_insurance_but_the_program_does():
     assert estimate(labor, Decimal("0"), Decimal("0"), kop).total_wo_vat == Decimal("1507.50")
 
 
-def test_workbook_total_rounds_overhead_and_profit_like_the_book():
-    # D24 и D25 округляются (ROUND(..., 2)), всё остальное -- сырая арифметика;
-    # ФОТ 1000: страховые 302; накладные 65,10; прибыль (1302 + 65,10) * 0,1 = 136,71
-    labor = [LaborLine("Эколог", 1, Decimal("1"), Decimal("1000"))]
+@pytest.mark.parametrize("rate, total", [
+    # D24 и D25 округляются (ROUND(..., 2)), всё остальное -- сырая арифметика.
+    # Ставки подобраны так, чтобы округление было видно, и в обе стороны:
+    # 992,87 -> расходы на ОТ 1292,71674, накладные 64,6358370 -> 64,64,
+    #           прибыль 135,7356740 -> 135,74; без ROUND вышло бы 1493,09;
+    # 992,20 -> накладные 64,592220 -> 64,59, прибыль 135,643440 -> 135,64;
+    #           без ROUND вышло бы 1492,08.
+    ("992.87", "1493.10"),
+    ("992.20", "1492.07"),
+])
+def test_workbook_total_rounds_overhead_and_profit_like_the_book(rate, total):
+    labor = [LaborLine("Эколог", 1, Decimal("1"), Decimal(rate))]
     kop = replace(DEFAULTS, total_rounding_digits=2)
-    assert workbook_total(labor, Decimal("0"), Decimal("0"), kop, digits=2) == Decimal("1503.81")
+    assert workbook_total(labor, Decimal("0"), Decimal("0"), kop,
+                          digits=2) == Decimal(total)
 
 
 def test_workbook_total_keeps_materials_out_of_the_profit_base():
