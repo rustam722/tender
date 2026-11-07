@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from app import config, db
-from app.models import ROLE_CUSTOMER, ROLE_PARTICIPANT, LotItem, Tender
+from app.models import ROLE_PARTICIPANT, LotItem, Tender
 from app.render.context import DOCUMENTS, TABLE_DOCUMENTS, build_context
 from app.render.docx_render import render_docx
 from app.repo import Repo

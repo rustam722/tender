@@ -22,13 +22,11 @@
 
 Нет Node -- слои 2 и 3 пропускаются (с причиной), а не считаются зелёными.
 """
-import json
 import os
 import re
 import shutil
 import subprocess
 import threading
-from pathlib import Path
 
 import docx
 import pytest
@@ -36,8 +34,6 @@ from werkzeug.serving import make_server
 
 from app import config
 from app.config import BASE_DIR
-from app.models import CustomerProfile, DocSpec
-from app.repo import Repo
 from app.web import create_app
 
 STATIC = BASE_DIR / "app" / "web" / "static"
