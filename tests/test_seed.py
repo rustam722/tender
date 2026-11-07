@@ -1,5 +1,8 @@
 """Наполнение справочников (задача 14): данные берутся из поданных заявок."""
+import hashlib
+import zipfile
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -144,3 +147,61 @@ def test_missing_cellmap_fails_in_russian(repo, tmp_path, monkeypatch):
     monkeypatch.setattr(seed_module, "CELLMAPS_DIR", tmp_path / "нет")
     with pytest.raises(SeedError, match="карт"):
         seed(repo)
+
+
+# ---- сторож: в шаблонах нет подписи и печати -----------------------------------
+
+# Фирменный бланк «Техносферы» (логотип) в двух вариантах: .jpg и .jpeg. Белый
+# список -- хеши, а не имена: «image2.png» ничего не говорит, хеш отличает
+# одобренный логотип от скана подписи с печатью.
+APPROVED_IMAGES = {
+    "3f50c493245a6839e5e8f77dc8e2f76b2974782eb7028f5478bb9d9cf35d1a40":
+        "логотип (image1.jpg)",
+    "dd65e0bf7ff2277b8225252dae28322c8d807a4e9bbdf2875e42837a151ff8eb":
+        "логотип (image1.jpeg)",
+}
+
+
+def _images_outside_whitelist(templates_dir) -> list[str]:
+    problems = []
+    for path in sorted(Path(templates_dir).glob("*")):
+        if path.suffix.lower() not in (".docx", ".xlsx") or path.name.startswith("~$"):
+            continue
+        with zipfile.ZipFile(path) as archive:
+            for part in archive.namelist():
+                if "/media/" not in part:
+                    continue
+                digest = hashlib.sha256(archive.read(part)).hexdigest()
+                if digest not in APPROVED_IMAGES:
+                    problems.append(
+                        f"В шаблоне «{path.name}» картинка {part}, которой нет в "
+                        "белом списке. Если это подпись или печать -- уберите её: "
+                        "программа отдаёт документы с пустыми подписными блоками. "
+                        "Если это новая часть бланка -- добавьте её хеш в белый "
+                        f"список осознанно (sha256 {digest}).")
+    return problems
+
+
+def test_templates_carry_no_signature_or_stamp_images():
+    assert not _images_outside_whitelist(seed_module.TEMPLATES_DIR), \
+        "\n".join(_images_outside_whitelist(seed_module.TEMPLATES_DIR))
+
+
+def test_signature_guard_catches_a_scan_and_names_the_part(tmp_path):
+    # сторож, который никогда не срабатывает, ничего не стережёт
+    template = tmp_path / "Справка с печатью.docx"
+    with zipfile.ZipFile(template, "w") as archive:
+        archive.writestr("word/document.xml", "<w:document/>")
+        archive.writestr("word/media/image2.png", "скан подписи и печати".encode())
+    problems = _images_outside_whitelist(tmp_path)
+    assert len(problems) == 1
+    assert "«Справка с печатью.docx»" in problems[0]
+    assert "word/media/image2.png" in problems[0]
+    assert "подпись или печать" in problems[0]
+
+
+def test_signature_guard_also_reads_workbooks(tmp_path):
+    book = tmp_path / "Форма.xlsx"
+    with zipfile.ZipFile(book, "w") as archive:
+        archive.writestr("xl/media/image1.png", "печать".encode())
+    assert "xl/media/image1.png" in _images_outside_whitelist(tmp_path)[0]
