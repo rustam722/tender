@@ -1,4 +1,5 @@
 from datetime import date
+from pathlib import Path
 from decimal import Decimal
 
 import pytest
@@ -24,7 +25,7 @@ DOC_MTR = "Справка о МТР"
 TOP_LEVEL_KEYS = {
     "org", "customer", "tender", "items", "estimate", "labor", "employees",
     "assets", "experience", "declaration_text", "conditions", "today", "money",
-    "materials", "subcontract", "date_ru", "date_long", "warnings",
+    "money_total", "materials", "subcontract", "date_ru", "date_long", "warnings",
 }
 
 # КП Арктикгаза: «Эколог-проектировщик, 4 чел.» при одном экологе в штате
@@ -727,3 +728,58 @@ def test_labor_rows_builder_is_public_and_takes_stored_rows():
                                       rate=Decimal("270"))])
     assert rows[0]["amount_value"] == Decimal("6750.00")
     assert rows[0]["amount"] == f"6{NBSP}750,00"
+
+
+# ---- итоги КП сходятся с напечатанными строками --------------------------------
+
+KP_TEMPLATE = (Path(__file__).parent.parent / "templates_docs"
+               / "Коммерческое предложение.docx")
+
+
+def _printed(text: str) -> Decimal:
+    return Decimal(text.replace(NBSP, "").replace(" ", "").replace(",", "."))
+
+
+def test_money_total_sums_printed_lines_not_raw_values(repo):
+    # три цены по 0,005 печатаются «0,01»; итог -- 0,03, а не 0,02 от сырых
+    tid = repo.save_tender(Tender())
+    for n in (1, 2, 3):
+        repo.save_lot_item(LotItem(tender_id=tid, position=n, name=f"П{n}",
+                                   price=Decimal("0.005")))
+    ctx = build_context(tid, repo)
+    prices = [r["price_value"] for r in ctx["items"]]
+    assert [ctx["money"](p) for p in prices] == ["0,01"] * 3
+    assert ctx["money_total"](prices) == Decimal("0.03")
+    assert ctx["money_total"](r["price_value"] for r in ctx["items"]) == Decimal("0.03")
+    assert ctx["money"](sum(prices)) == "0,02"          # ловушка, из-за которой всё
+
+
+def test_kp_template_totals_are_built_from_printed_lines():
+    import zipfile
+    xml = zipfile.ZipFile(KP_TEMPLATE).read("word/document.xml").decode("utf-8")
+    assert "money(items | sum(" not in xml
+    assert "money(it.price_value + it.vat_value)" not in xml
+    assert "money_total(" in xml
+
+
+def test_kp_document_total_equals_sum_of_printed_rows(repo, tmp_path):
+    import docx
+    from app.render.docx_render import render_docx
+    me = repo.save_organization(Organization(
+        role=ROLE_PARTICIPANT, inn="5904188041", short_name="ООО «Техносфера»",
+        head_name="Рабичко Елена Михайловна"))
+    tid = repo.save_tender(Tender(participant_id=me))
+    for n in (1, 2, 3):
+        repo.save_lot_item(LotItem(tender_id=tid, position=n, name=f"П{n}",
+                                   price=Decimal("0.005")))
+    ctx = build_context(tid, repo)
+    out = render_docx(KP_TEMPLATE, ctx, tmp_path / "kp.docx")
+    rows = [[c.text.strip() for c in row.cells]
+            for t in docx.Document(str(out)).tables for row in t.rows]
+    lines = [r for r in rows if r[1] in ("П1", "П2", "П3")]
+    total = next(r for r in rows if r[1] == "Итого")
+    assert len(lines) == 3
+    for column in (3, 4, 5):          # НДС, цена, всего с НДС
+        assert _printed(total[column]) == sum(_printed(r[column]) for r in lines)
+    assert _printed(total[5]) == _printed(total[3]) + _printed(total[4])
+    assert _printed(total[4]) == Decimal("0.03")

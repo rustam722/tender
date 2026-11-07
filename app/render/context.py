@@ -36,6 +36,9 @@
     conditions         ответы по условиям сделки: условие -> ответ
     today              дата сборки, «ДД.ММ.ГГГГ»
     money              функция: Decimal -> «5 985 000,00»
+    money_total        функция: список Decimal -> Decimal, сумма строк, каждая из
+                       которых округлена до копеек так, как напечатана; для
+                       итогов под столбцами (app.calc.money_total)
     date_ru, date_long функции: ISO-строка -> «24.10.2025» и «24» октября 2025 г.;
                        пустая строка -> пустая строка
     warnings           list[str]: что пропущено или подставлено по умолчанию
@@ -57,7 +60,7 @@ from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
-from app.calc import LaborLine, estimate
+from app.calc import LaborLine, estimate, money_total
 from app.config import BASE_DIR
 from app.models import (
     COST_MATERIALS, COST_SUBCONTRACT, ROLE_CUSTOMER, ROLE_PARTICIPANT,
@@ -350,6 +353,7 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
         "conditions": dict(tender.deal_answers),
         "today": _today().strftime("%d.%m.%Y"),
         "money": money,
+        "money_total": money_total,
         "date_ru": date_ru,
         "date_long": date_long,
         "warnings": warnings,
