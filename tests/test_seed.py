@@ -8,9 +8,8 @@ import pytest
 
 from app import db
 from app.models import ROLE_CUSTOMER, ROLE_PARTICIPANT, LotItem, Tender
-from app.render.context import build_context
+from app.render.context import DOCUMENTS, TABLE_DOCUMENTS, build_context
 from app.render.docx_render import render_docx
-from app.render.context import DOCUMENTS, TABLE_DOCUMENTS
 from app.repo import Repo
 from scripts import seed as seed_module
 from scripts.seed import SeedError, seed
@@ -166,14 +165,41 @@ APPROVED_IMAGES = {
 }
 
 
+# Шаблоном может быть и книга с макросами, и заготовка Word (.dotx): все они --
+# архивы с картинками внутри. Старые двоичные .doc/.xls сторож прочесть не может,
+# поэтому такой шаблон тоже отвергается.
+TEMPLATE_SUFFIXES = {".docx", ".docm", ".dotx", ".dotm", ".xlsx", ".xlsm",
+                     ".xltx", ".xltm"}
+LEGACY_SUFFIXES = {".doc", ".dot", ".xls", ".xlt"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".jpe", ".gif", ".bmp", ".tif", ".tiff",
+                  ".emf", ".wmf", ".wdp", ".jxr", ".svg", ".webp", ".ico"}
+
+
+def _is_picture(part: str) -> bool:
+    """Картинка по месту (media, embeddings) или по расширению где угодно:
+    миниатюра docProps/thumbnail.jpeg несёт первую страницу подписанного
+    документа и в media не лежит."""
+    suffix = "." + part.rsplit(".", 1)[-1].lower() if "." in part else ""
+    return ("/media/" in part or "/embeddings/" in part
+            or suffix in IMAGE_SUFFIXES)
+
+
 def _images_outside_whitelist(templates_dir) -> list[str]:
     problems = []
     for path in sorted(Path(templates_dir).glob("*")):
-        if path.suffix.lower() not in (".docx", ".xlsx") or path.name.startswith("~$"):
+        suffix = path.suffix.lower()
+        if path.name.startswith("~$"):
+            continue
+        if suffix in LEGACY_SUFFIXES:
+            problems.append(
+                f"Шаблон «{path.name}» в старом двоичном формате: картинки в нём "
+                "проверить нельзя. Сохраните его как .docx или .xlsx.")
+            continue
+        if suffix not in TEMPLATE_SUFFIXES:
             continue
         with zipfile.ZipFile(path) as archive:
             for part in archive.namelist():
-                if "/media/" not in part:
+                if not _is_picture(part):
                     continue
                 digest = hashlib.sha256(archive.read(part)).hexdigest()
                 if digest not in APPROVED_IMAGES:
@@ -233,3 +259,24 @@ def test_every_seeded_word_template_renders_with_a_real_context(repo, tmp_path):
     assert "Письмо о крупности сделки.docx" in rendered
     assert "Справка о кадровых ресурсах.docx" in rendered
     assert "Коммерческое предложение.docx" in rendered
+
+
+@pytest.mark.parametrize("name, part", [
+    ("Заготовка.dotx", "word/media/image2.png"),
+    ("С макросом.docm", "word/media/image2.png"),
+    ("Книга.xlsm", "xl/media/image1.png"),
+    ("Миниатюра.docx", "docProps/thumbnail.jpeg"),         # не в media
+    ("Рисунок.docx", "word/embeddings/oleObject1.bin"),
+    ("Запасной.docx", "word/hdphoto1.wdp"),
+])
+def test_signature_guard_covers_other_formats_and_places(tmp_path, name, part):
+    with zipfile.ZipFile(tmp_path / name, "w") as archive:
+        archive.writestr(part, "скан".encode())
+    problems = _images_outside_whitelist(tmp_path)
+    assert len(problems) == 1 and part in problems[0] and name in problems[0]
+
+
+def test_signature_guard_rejects_legacy_binary_formats(tmp_path):
+    (tmp_path / "Старый.doc").write_bytes(bytes.fromhex("d0cf11e0"))
+    problems = _images_outside_whitelist(tmp_path)
+    assert len(problems) == 1 and "старом двоичном формате" in problems[0]

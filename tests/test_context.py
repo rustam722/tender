@@ -771,7 +771,7 @@ def test_kp_document_total_equals_sum_of_printed_rows(repo, tmp_path):
     tid = repo.save_tender(Tender(participant_id=me))
     for n in (1, 2, 3):
         repo.save_lot_item(LotItem(tender_id=tid, position=n, name=f"П{n}",
-                                   price=Decimal("0.005")))
+                                   price=Decimal("0.105")))
     ctx = build_context(tid, repo)
     out = render_docx(KP_TEMPLATE, ctx, tmp_path / "kp.docx")
     rows = [[c.text.strip() for c in row.cells]
@@ -782,4 +782,10 @@ def test_kp_document_total_equals_sum_of_printed_rows(repo, tmp_path):
     for column in (3, 4, 5):          # НДС, цена, всего с НДС
         assert _printed(total[column]) == sum(_printed(r[column]) for r in lines)
     assert _printed(total[5]) == _printed(total[3]) + _printed(total[4])
-    assert _printed(total[4]) == Decimal("0.03")
+    # обе колонки непустые и обе ловушечные: цена 0,105 печатается «0,11»
+    # (сырая сумма 0,315 дала бы 0,32), НДС 0,00525 -- «0,01» (сырая 0,01575 -- 0,02)
+    assert [r[4] for r in lines] == ["0,11"] * 3
+    assert [r[3] for r in lines] == ["0,01"] * 3
+    assert _printed(total[4]) == Decimal("0.33")
+    assert _printed(total[3]) == Decimal("0.03")
+    assert _printed(total[5]) == Decimal("0.36")
