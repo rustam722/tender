@@ -1864,3 +1864,116 @@ def test_solve_counts_the_fot_the_way_the_document_prints_it(client):
     assert body["estimate"] == direct["estimate"]
     assert body["difference_value"] == "0.00"
     assert body["difference"] == "0,00"
+
+
+# ---- двойник тендера по номеру закупки ---------------------------------------------------
+
+def _tender_with_number(client, number, **fields):
+    """Ответ на сохранение тендера с номером закупки. Заказчик и участник те же,
+    что у make_tender, но создаются каждый раз заново: двойника ищет номер, а не заказчик."""
+    me = create(client, "organizations", role="participant", short_name="ООО «Техносфера»")
+    customer = fields.pop("customer", None) or create(
+        client, "organizations", role="customer", short_name="МУП «Полигон»")
+    return client.post("/api/tenders", json={
+        "participant_id": me["id"], "customer_id": customer["id"],
+        "subject": fields.pop("subject", "Разработка КЭР"), "purchase_number": number, **fields})
+
+
+def test_a_tender_whose_number_already_exists_is_named_in_the_warning(client):
+    first = ok(_tender_with_number(client, "32616547309", subject="Разработка КЭР для полигона"), 201)
+    customer = create(client, "organizations", role="customer", short_name="ПМУП «Автоспецтранс»")
+    second = ok(_tender_with_number(client, "32616547309", subject="Отчёт по НДВ",
+                                    customer=customer), 201)
+
+    warning = second["warning"]
+    assert CYRILLIC.search(warning) and not any(m in warning for m in TRACEBACK_MARKERS)
+    # названо то, чем двойник отличается: какая запись, предмет и заказчик ПЕРВОГО тендера,
+    # а не второго, который человек только что сохранил
+    assert "32616547309" in warning
+    assert f"запись № {first['id']}" in warning
+    assert "Разработка КЭР для полигона" in warning and "МУП «Полигон»" in warning
+    assert "Отчёт по НДВ" not in warning and "Автоспецтранс" not in warning
+    # имена полей -- из словаря модели, а не свои
+    assert "Номер закупки" in warning and "Предмет закупки" in warning and "Заказчик" in warning
+    assert second["id"] != first["id"] and "warning" not in first
+
+
+def test_a_twin_number_is_a_warning_and_never_a_refusal(client):
+    ok(_tender_with_number(client, "N-1"), 201)
+    second = _tender_with_number(client, "N-1")
+    assert second.status_code == 201                       # сохранён, как есть
+    assert len(ok(client.get("/api/tenders"))) == 2        # и лежит в базе, а не отброшен
+
+
+def test_a_number_that_nobody_else_has_gets_no_warning(client):
+    ok(_tender_with_number(client, "N-1"), 201)
+    other = ok(_tender_with_number(client, "N-2"), 201)
+    assert "warning" not in other
+
+
+def test_saving_a_tender_again_does_not_make_it_its_own_twin(client):
+    first = ok(_tender_with_number(client, "N-1"), 201)
+    again = ok(client.post("/api/tenders", json={"id": first["id"], "subject": "Другой предмет"}))
+    assert again["subject"] == "Другой предмет" and "warning" not in again
+
+
+def test_tenders_without_a_number_are_not_twins_of_each_other(client):
+    ok(_tender_with_number(client, ""), 201)
+    second = ok(_tender_with_number(client, ""), 201)
+    third = ok(_tender_with_number(client, "   "), 201)        # одни пробелы -- тоже «без номера»
+    assert "warning" not in second and "warning" not in third
+
+
+def test_a_number_that_differs_only_by_spaces_or_case_is_still_a_twin(client):
+    first = ok(_tender_with_number(client, "ЭА-77"), 201)
+    second = ok(_tender_with_number(client, "  эа-77 "), 201)
+    assert f"запись № {first['id']}" in second["warning"]
+
+
+def test_every_other_tender_with_the_number_is_named(client):
+    first = ok(_tender_with_number(client, "N-9"), 201)
+    second = ok(_tender_with_number(client, "N-9"), 201)
+    third = ok(_tender_with_number(client, "N-9"), 201)
+    warning = third["warning"]
+    assert f"запись № {first['id']}" in warning and f"запись № {second['id']}" in warning
+    assert f"запись № {third['id']}" not in warning
+
+
+def test_changing_the_number_to_a_free_one_drops_the_warning(client):
+    ok(_tender_with_number(client, "N-1"), 201)
+    twin = ok(_tender_with_number(client, "N-1"), 201)
+    fixed = ok(client.post("/api/tenders", json={"id": twin["id"], "purchase_number": "N-1-2"}))
+    assert "warning" not in fixed
+
+
+def test_a_twin_without_customer_or_subject_is_still_described(client):
+    me = create(client, "organizations", role="participant", short_name="Я")
+    bare = create(client, "tenders", participant_id=me["id"], purchase_number="N-5")
+    second = ok(_tender_with_number(client, "N-5"), 201)
+    assert f"запись № {bare['id']}" in second["warning"]
+    assert "None" not in second["warning"]
+
+
+def test_a_failure_while_looking_for_twins_does_not_fail_a_saved_tender(client, monkeypatch):
+    def broken(self):
+        raise RuntimeError("сломалось")
+
+    monkeypatch.setattr(Repo, "list_tenders", broken)
+    saved = _tender_with_number(client, "N-1")
+    assert saved.status_code == 201 and "warning" not in saved.get_json()
+    monkeypatch.undo()
+    assert len(ok(client.get("/api/tenders"))) == 1        # запись есть: повторять сохранение не надо
+
+
+def test_the_database_does_not_forbid_two_tenders_with_one_number(tmp_path):
+    """Переподача после отмены закупки законна: уникального индекса по номеру нет."""
+    from app.models import Tender
+    conn = db.connect(tmp_path / "x.db")
+    db.migrate(conn)
+    repo = Repo(conn)
+    repo.save_tender(Tender(purchase_number="N-1"))
+    repo.save_tender(Tender(purchase_number="N-1"))
+    try:
+        assert len(repo.list_tenders()) == 2
+    finally:
+        conn.close()

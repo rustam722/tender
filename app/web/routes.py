@@ -292,11 +292,27 @@ def _save(entity: Entity, tender_id: int | None = None):
     saved = _find(entity, repo, saved_id, tender_id)
     if tender_id is None:
         body = present(entity, saved)
+        warning = _notice_after_write(entity, repo, saved)
+        if warning:
+            body["warning"] = warning
     else:       # у строки есть сумма или НДС: их знает только расчёт
         body = _row_after_write(entity, repo, saved, tender_id)
     response = jsonify(body)
     response.status_code = 200 if existing is not None else 201
     return response
+
+
+def _notice_after_write(entity: Entity, repo: Repo, saved) -> str | None:
+    """Предупреждение к уже сохранённой записи (у тендера -- «такой номер закупки уже
+    есть»). Запись зафиксирована, поэтому сбой при его поиске -- не ошибка запроса:
+    человек повторил бы сохранение и получил второй тендер. Без предупреждения -- не страшно."""
+    if entity.notice is None:
+        return None
+    try:
+        return entity.notice(saved, repo)
+    except Exception:
+        current_app.logger.exception("Не удалось проверить запись после сохранения")
+        return None
 
 
 WRITTEN_BUT_NOT_RECALCULATED = ("Запись сохранена, но пересчитать суммы не удалось. "

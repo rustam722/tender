@@ -72,6 +72,7 @@ class Entity:
     in_use: str = ""
     parent: str = ""
     check: typing.Callable | None = None     # (obj, repo) -> None или ApiError
+    notice: typing.Callable | None = None    # (сохранённая запись, repo) -> None или предупреждение
 
 
 def _one_profile_per_customer(profile, repo):
@@ -83,6 +84,47 @@ def _one_profile_per_customer(profile, repo):
     if found is not None and found.id != profile.id:
         raise ApiError("У этого заказчика уже есть профиль. Откройте его и измените, "
                        "а не создавайте второй.", path=["customer_id"])
+
+
+def _purchase_number(tender) -> str:
+    """Номер закупки как его сравнивает человек: пробелы по краям и регистр не в счёт."""
+    return (tender.purchase_number or "").strip().casefold()
+
+
+def _twin_description(twin, repo) -> str:
+    """Двойник так, чтобы человек понял, какой это: номер записи, предмет и заказчик
+    (теми же именами полей, что на экране)."""
+    customer = "не указан"
+    if twin.customer_id is not None:
+        try:
+            org = repo.get_organization(twin.customer_id)
+            customer = org.short_name or org.full_name or customer
+        except LookupError:
+            pass
+    return (f"запись № {twin.id} ({TENDER_LABELS['subject']} — «{twin.subject or 'не указан'}», "
+            f"{TENDER_LABELS['customer_id']} — {customer})")
+
+
+def twin_tenders_notice(tender, repo) -> str | None:
+    """Предупреждение, если номер закупки сохранённого тендера уже есть у другого.
+
+    Именно предупреждение, не отказ: после отмены закупки её переподают под тем же
+    номером, и второй тендер с ним законен. Тендер без номера двойником не считается:
+    в начале работы номера нет почти у всех, и «уже есть тендер без номера» было бы
+    шумом."""
+    number = _purchase_number(tender)
+    if not number:
+        return None
+    twins = [other for other in repo.list_tenders()
+             if other.id != tender.id and _purchase_number(other) == number]
+    if not twins:
+        return None
+    where = "у другого тендера" if len(twins) == 1 else "у других тендеров"
+    return (f"{TENDER_LABELS['purchase_number']} {tender.purchase_number.strip()} уже записан "
+            f"{where}: " + "; ".join(_twin_description(twin, repo) for twin in twins) + ". "
+            "Этот тендер сохранён. Если это переподача после отмены закупки, оставьте как есть; "
+            "если случайный двойник, откройте один из них и удалите лишний, иначе пакет "
+            "можно собрать не из того тендера.")
 
 
 _ROLES = ("participant", "customer")
@@ -148,7 +190,8 @@ TENDERS = Entity(
           "participant_id": ("Участник", "get_organization"),
           "service_id": ("Услуга", "get_service")},
     dates=("purchase_date", "doc_date"), dirs=("output_dir",),
-    money=("price_wo_vat",), percents=("vat_rate",))
+    money=("price_wo_vat",), percents=("vat_rate",),
+    notice=twin_tenders_notice)
 
 LOT_ITEMS = Entity(
     "items", LotItem, "Позиция лота",
