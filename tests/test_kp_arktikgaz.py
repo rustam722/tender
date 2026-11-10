@@ -94,8 +94,14 @@ def make_custom_tender(repo, *, labor=(), materials=(), subcontract=(),
     me = repo.find_organization_by_inn("5904188041")
     customer = next(p.customer_id for p in repo.list_customer_profiles()
                     if DOC_ESTIMATE in p.docs)
+    # Поля закупки заполнены все: их печатают документы Word (декларация), и
+    # на пустой графе сборка теперь предупреждает -- заявку из-за такой графы
+    # отклоняют. Пустые графы проверяются своими тестами, а не этим.
     tid = repo.save_tender(Tender(
         customer_id=customer, participant_id=me.id,
+        purchase_number="32514010203", purchase_date="2025-10-01",
+        method="запрос предложений в электронной форме",
+        subject="Разработка КЭР",
         object_address="Ямало-Ненецкий АО, Тазовский район",
         payment_terms="60 дней с даты подписания акта",
         deadline="в течение 90 дней"))
@@ -970,7 +976,205 @@ def test_a_commercial_offer_without_lot_items_is_skipped_not_written_at_zero(
 
 
 def test_one_lot_item_is_enough_to_let_the_offer_through(repo, tmp_path):
-    # обратная сторона: отказ держится на пустоте списка, а не на чём-то ещё
+    # обратная сторона: напечатанная цена не ноль -- документ проходит
     result = two_papers(repo, tmp_path, "4000000", documents=(DOC_KP,))
     assert result.skipped == []
     assert [p.name for p in result.written] == [f"{DOC_KP}.docx"]
+
+
+def test_an_offer_whose_lot_items_are_all_priced_at_zero_is_skipped_too(
+        repo, tmp_path):
+    """Соседняя дверь к тому же нулю: позиции есть, а цены у них нулевые.
+
+    Цена позиции лота по умолчанию ноль, и позиции вставляют списком из
+    таблицы заказчика без цен. Отказ держится на НАПЕЧАТАННОЙ цене, а не на
+    длине списка, поэтому закрыты обе двери."""
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT,
+                             lot=[("Разработка КЭР", "0"), ("Экспертиза", "0")])
+    result = build_package(tid, [DOC_KP, DOC_ESTIMATE], tmp_path / "out", repo)
+    (document, reason), = result.skipped
+    assert document == DOC_KP
+    assert "нулевой цене" in reason and "0,00" in reason
+    assert "Traceback" not in reason and "Error" not in reason
+    # остальные документы пакета собраны, и нулевого КП в папке нет
+    assert [p.name for p in result.written] == [f"{DOC_ESTIMATE}.xlsx"]
+    assert [p.name for p in (tmp_path / "out").iterdir()] == [f"{DOC_ESTIMATE}.xlsx"]
+
+
+def test_a_single_priced_item_among_zeroes_lets_the_offer_through(repo, tmp_path):
+    """Обратная сторона отказа по нулю: нулевая цена ОТДЕЛЬНОЙ позиции законна
+    (позиция «в составе работ»), пока напечатанный итог не ноль. Итог читается
+    из готового файла."""
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT,
+                             lot=[("Разработка КЭР", "0"),
+                                  ("Экспертиза", "4000000")])
+    result = build_package(tid, [DOC_KP], tmp_path / "out", repo)
+    assert result.skipped == []
+    assert [p.name for p in result.written] == [f"{DOC_KP}.docx"]
+    assert kp_total(result.written[0]) == "4 000 000,00"
+
+
+# ---- бумага, оставшаяся в папке: её цена тоже сверяется --------------------------
+
+# Дыра на пути пропуска. Человек правит позиции лота и пересобирает пакет, а
+# калькуляция остаётся прежней, потому что «файл уже есть». В папке две бумаги
+# с разными ценами, а предупреждений не было ни одного: цена снятого документа
+# в сверку не попадала вовсе.
+
+def package_wide(result):
+    return [text for document, text in result.warnings if document == PACKAGE_WIDE]
+
+
+def names(directory: Path) -> list[str]:
+    return sorted(p.name for p in directory.iterdir())
+
+
+def test_a_document_left_in_the_folder_joins_the_price_comparison(repo, tmp_path):
+    out = tmp_path / "out"
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT,
+                             lot=[("Разработка КЭР", "3950000")])
+    first = build_package(tid, [DOC_ESTIMATE], out, repo)
+    assert [p.name for p in first.written] == [f"{DOC_ESTIMATE}.xlsx"]
+    assert package_wide(first) == []
+
+    result = build_package(tid, [DOC_ESTIMATE, DOC_KP], out, repo)
+    assert [d for d, _ in result.skipped] == [DOC_ESTIMATE]      # файл уже есть
+    assert names(out) == sorted([f"{DOC_ESTIMATE}.xlsx", f"{DOC_KP}.docx"])
+    (text,) = package_wide(result)
+    text = plain(text)
+    # напечатано сейчас -- это КП; калькуляция названа тем, что она есть
+    assert f"«{DOC_KP}» -- 3 950 000,00" in text
+    assert "не пересобрала" in text and "по нынешним данным" in text
+    assert f"«{DOC_ESTIMATE}» -- 4 000 000,00" in text
+    # про файл, который сборка не трогала, нельзя сказать «печатает»: цена
+    # в нём прежняя, а 4 000 000 -- то, что он напечатал БЫ сейчас
+    assert "Документы пакета печатают разную цену" not in text
+    assert "разрешив замену существующих файлов" in text
+
+
+def test_the_same_price_in_a_left_document_says_nothing(repo, tmp_path):
+    # обратная сторона: цена одна на всю папку -- молчание, хотя один
+    # документ и не пересобран
+    out = tmp_path / "out"
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT,
+                             lot=[("Разработка КЭР", "4000000")])
+    build_package(tid, [DOC_ESTIMATE], out, repo)
+    result = build_package(tid, [DOC_ESTIMATE, DOC_KP], out, repo)
+    assert [d for d, _ in result.skipped] == [DOC_ESTIMATE]
+    assert [p.name for p in result.written] == [f"{DOC_KP}.docx"]
+    assert package_wide(result) == []
+
+
+def test_the_comparison_does_not_name_a_paper_that_was_never_printed(
+        repo, tmp_path, monkeypatch):
+    """Зеркало главной находки: цена попадает в сверку только после того, как
+    файл лёг в папку под своим именем. Шаблон КП испорчен -- в папке одна
+    калькуляция, и назвать цену КП напечатанной значило бы соврать о бумаге,
+    которой нет."""
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT,
+                             lot=[("Разработка КЭР", "3950000")])
+    # папка шаблонов подменяется после наполнения справочников: наполнение
+    # проверяет, что каждый шаблон профилей на месте
+    templates = tmp_path / "templates"
+    templates.mkdir()
+    shutil.copy(TEMPLATE, templates / TEMPLATE.name)
+    (templates / f"{DOC_KP}.docx").write_bytes(b"not a zip")
+    monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR", templates)
+    out = tmp_path / "out"
+    result = build_package(tid, [DOC_KP, DOC_ESTIMATE], out, repo)
+    (document, reason), = result.skipped
+    assert document == DOC_KP and "повреждён" in reason
+    assert names(out) == [f"{DOC_ESTIMATE}.xlsx"]
+    assert package_wide(result) == []
+
+
+def test_the_price_of_a_left_document_is_the_one_its_context_would_print(repo):
+    """Цена снятого документа считается без контекста -- и обязана совпадать
+    с тем, что напечатал бы контекст. Два разных счёта разошлись бы молча."""
+    from app.render.context import printed_price
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT,
+                             lot=[("Разработка КЭР", "3950000")])
+    for document, cellmap in ((DOC_ESTIMATE, CELLMAP), (DOC_KP, None)):
+        cell_map = load_cellmap(cellmap) if cellmap else None
+        context = build_context(tid, repo, document=document)
+        assert printed_price(tid, repo, document, cell_map) \
+            == context["printed_price_wo_vat"], document
+    assert printed_price(tid, repo, DOC_KP, None) == Decimal("3950000.00")
+    assert printed_price(tid, repo, DOC_ESTIMATE, load_cellmap(CELLMAP)) \
+        == Decimal("4000000.00")
+    # документ без цены в сверке не участвует
+    assert printed_price(tid, repo, DOC_DECLARATION, None) is None
+
+
+# ---- докстринг карты: пример должен работать, а не учить неверному ---------------
+
+def test_the_optional_cell_example_from_the_docstring_fills_a_real_cell(
+        repo, tmp_path):
+    """Докстринг xlsx_render -- то, по чему карту правит не программист.
+    Клетка из его примера обязана заполняться настоящим контекстом: карта,
+    собранная по документированному примеру, не должна получать отказ
+    «в данных нет значения». Документация, которая учит неверному, хуже
+    отсутствующей."""
+    from app.render import xlsx_render
+    from app.render.xlsx_render import CellMap
+    found = re.search(r'"D88":\s*(\{.*\})', xlsx_render.__doc__)
+    assert found, "в докстринге больше нет примера необязательной клетки"
+    example = json.loads(found.group(1))
+    tid = make_custom_tender(repo, labor=[("Эколог", 1, "1", "1002.45")])
+    repo.save_settings(replace(repo.get_settings(), total_rounding_digits=2))
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    cell_map = CellMap(sheet=SHEET, cells={"D88": example["value"]},
+                       optional={"D88"} if example.get("optional") else set())
+    out = fill_workbook(TEMPLATE, cell_map, context, tmp_path / "example.xlsx")
+    assert load_workbook(out)[SHEET]["D88"].value == 2
+
+
+# ---- клетка округления -- клетка, а не упоминание в тексте -----------------------
+
+def cellmap_with_rounding_in_text(folder: Path) -> Path:
+    """Карта, которая разрядность округления УПОМИНАЕТ в текстовой клетке, а
+    клетку округления книги (D88) не пишет. Книга остаётся на целых рублях:
+    из текста «Округление: 2 знаков» формула ROUND разрядности не возьмёт."""
+    data = json.loads(CELLMAP.read_text(encoding="utf-8"))
+    del data["cells"]["D88"]
+    data["cells"]["A8"] = "Округление итога: {rounding} знаков"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / CELLMAP.name
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_a_rounding_mentioned_in_a_text_cell_is_not_the_rounding_cell(
+        repo, tmp_path, monkeypatch):
+    # Сторож смотрел на наличие пути «rounding» в ЛЮБОЙ клетке карты -- и на
+    # такой карте решил бы, что книга округляет итог как программа. Причина
+    # расхождения была бы названа неверно, то есть человека отправили бы
+    # чинить не то.
+    tid = make_custom_tender(repo, labor=[("Эколог", 1, "1", "1002.45")])
+    path = cellmap_with_rounding_in_text(tmp_path / "cellmaps")
+    monkeypatch.setattr(config, "CELLMAPS_DIR", path.parent)
+    repo.save_settings(replace(repo.get_settings(), total_rounding_digits=2))
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    (text,) = context["warnings"]
+    text = plain(text)
+    # книга на целых рублях: 1 507 против 1 507,50 у программы
+    assert "итог без НДС 1 507,00" in text and "1 507,50" in text
+    assert ("«Округление итога без НДС, знаков после запятой», "
+            "сейчас 2") in text
+    assert "на границе округления" not in text      # причина не та
+
+
+def test_the_real_map_still_writes_the_rounding_cell(repo, tmp_path):
+    # обратная сторона: настоящая карта пишет D88 отдельной клеткой из одного
+    # «{rounding}» -- и причина расхождения остаётся страховыми, а не настройкой
+    context, ws = with_rounding(repo, 2, tmp_path)
+    assert ws["D88"].value == 2
+    (text,) = context["warnings"]
+    assert "на границе округления" in plain(text)
+    assert "Округление итога без НДС" not in text

@@ -40,7 +40,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app import config
-from app.render.context import ContextError, build_context, money
+from app.render.context import (
+    CUSTOMER_FORM_DOCUMENTS, ContextError, blank_fields_warning, build_context,
+    money, printed_price,
+)
 from app.render.docx_render import TemplateError, render_docx
 from app.render.layouts import LayoutError
 from app.render.xlsx_render import CellMapError, fill_workbook, load_cellmap
@@ -188,7 +191,38 @@ def _target(out_dir: Path, document: str, prefix: str, extension: str) -> Path:
     return out_dir / (safe_filename(prefix + document, room) + extension)
 
 
-def _template_path(document: str, template: str) -> Path:
+def _forms_of_other_customers(document: str, repo: Repo) -> str:
+    """Подсказка к отказу: в чьих профилях такая форма уже назначена.
+
+    Видно по самим профилям, и это прямо говорит, откуда взять файл. Ни у кого
+    не назначена -- молчим: пустая подсказка хуже отсутствующей."""
+    found = []
+    for profile in repo.list_customer_profiles():
+        spec = profile.docs.get(document)
+        if not (spec and spec.template) or profile.customer_id is None:
+            continue
+        try:
+            org = repo.get_organization(profile.customer_id)
+        except LookupError:
+            continue                    # профиль без заказчика -- не подсказка
+        found.append(f"{org.short_name} -- «{spec.template}»")
+    if not found:
+        return ""
+    return (" Такой же документ назначен в профилях: " + "; ".join(found) + ".")
+
+
+def _template_path(document: str, template: str, repo: Repo) -> Path:
+    # Документ по форме заказчика без назначенной формы: общего бланка у него
+    # нет, и звать человека положить «<документ>.docx» в папку -- посылать его
+    # делать бессмысленное.
+    if not template and document in CUSTOMER_FORM_DOCUMENTS:
+        raise _Refusal(
+            f"«{document}» собирается по форме заказчика, а в профиле этого "
+            "заказчика форма для него не назначена. Своего бланка у такого "
+            "документа нет: форма у каждого заказчика своя. Укажите файл "
+            "формы в описании документа в профиле заказчика или снимите "
+            "галочку с документа в составе пакета."
+            + _forms_of_other_customers(document, repo))
     name = template or f"{document}.docx"
     path = config.TEMPLATES_DOCS_DIR / name
     if path.suffix.lower() not in _SUPPORTED:
@@ -204,13 +238,14 @@ def _template_path(document: str, template: str) -> Path:
     return path
 
 
-def _plan_one(document: str, spec, out_dir: Path,
-              taken: set[str]) -> tuple[Path, Path]:
+def _plan_one(document: str, spec, out_dir: Path, taken: set[str],
+              repo: Repo) -> tuple[Path, Path]:
     """Шаблон и итоговый путь документа, либо _Refusal, если документ заведомо
     не будет записан. Общий шаг для planned_files и build_package: путь, о
     котором спросил экран, и путь, который запишет сборка, считаются одним кодом.
-    Занятое имя вносится в `taken`."""
-    template = _template_path(document, spec.template if spec else "")
+    Занятое имя вносится в `taken`. `repo` -- только для подсказки в отказе
+    (в чьих профилях назначена форма этого документа)."""
+    template = _template_path(document, spec.template if spec else "", repo)
     target = _target(out_dir, document, spec.prefix if spec else "",
                      template.suffix.lower())
     if os.path.dirname(os.path.abspath(target)) != str(out_dir):
@@ -251,27 +286,79 @@ def _move_refusal(target: Path, replacing: bool) -> str:
             "программе, и соберите заново.")
 
 
-def _price_warnings(prices: dict[str, object]) -> list[tuple[str, str]]:
-    """Разошлись ли цены, которые документы пакета НАПЕЧАТАЮТ.
+def _listing(prices: dict[str, object]) -> str:
+    return "; ".join(f"«{d}» -- {money(p)}" for d, p in prices.items())
+
+
+def _price_warnings(printed: dict[str, object],
+                    left: dict[str, object]) -> list[tuple[str, str]]:
+    """Разошлись ли цены бумаг, которые лежат в папке пакета.
 
     Сравнивается не то, что посчитала одна подсистема, а то, что каждый
-    документ выведет на бумагу: «Коммерческое предложение» печатает сумму
+    документ выводит на бумагу: «Коммерческое предложение» печатает сумму
     напечатанных строк позиций лота, книга калькуляции -- итог расчёта. Эти
     два числа человек вводит в разных местах карточки, и до этой сверки их
     не сравнивал никто: пакет уходил в комиссию с двумя разными ценами.
 
-    Документы без цены (декларация, справки) не участвуют. Одна цена на весь
-    пакет или один документ с ценой -- молчание: сигнал, который горит всегда,
-    через неделю перестают читать."""
-    priced = {d: p for d, p in prices.items() if p is not None}
-    if len(set(priced.values())) < 2:
+    `printed` -- документы, записанные этой сборкой: их цена напечатана сейчас.
+    `left` -- документы, которые сборка не пересобрала, а файл их в папке
+    остался (чаще всего «файл уже есть, замена не разрешена»): их цена --
+    то, что документ напечатал БЫ по нынешним данным, а в самом файле стоит
+    прежняя. Эти два случая нельзя называть одним словом: сказать про старый
+    файл «печатает X» -- соврать о бумаге, которой никто не печатал.
+
+    Документы без цены (декларация, справки) не участвуют. Одна цена на всю
+    папку -- молчание: сигнал, который горит всегда, через неделю перестают
+    читать."""
+    printed = {d: p for d, p in printed.items() if p is not None}
+    left = {d: p for d, p in left.items() if p is not None}
+    if len(set(printed.values()) | set(left.values())) < 2:
         return []
-    listing = "; ".join(f"«{d}» -- {money(p)}" for d, p in priced.items())
-    return [(PACKAGE_WIDE,
-             "Документы пакета печатают разную цену без НДС: "
-             f"{listing}. Одна заявка с двумя ценами -- повод отклонить её. "
-             "Сверьте позиции лота и калькулятор на карточке тендера "
-             "и соберите пакет заново.")]
+    parts = []
+    if len(set(printed.values())) > 1:
+        parts.append("Документы пакета печатают разную цену без НДС: "
+                     f"{_listing(printed)}.")
+    elif printed:
+        parts.append("Цена в папке пакета не одна. Записано этой сборкой: "
+                     f"{_listing(printed)}.")
+    if left:
+        parts.append(
+            "В папке остались документы с ценой, которые сборка не "
+            "пересобрала; в файле стоит прежняя цена, а по нынешним данным "
+            f"напечатали бы: {_listing(left)}.")
+    parts.append("Одна заявка с двумя ценами -- повод отклонить её. Сверьте "
+                 "позиции лота и калькулятор на карточке тендера и соберите "
+                 "пакет заново"
+                 + (", разрешив замену существующих файлов." if left else "."))
+    return [(PACKAGE_WIDE, " ".join(parts))]
+
+
+def _left_in_folder(tender_id: int, document: str, spec, out_dir: Path,
+                    repo: Repo, written: list[Path]) -> object:
+    """Цена не пересобранного документа, файл которого лежит в папке; None --
+    сверять нечего.
+
+    Документ, снятый со сборки, уходит в `skipped`, но его файл в папке
+    остаётся и в заявку попадёт вместе с остальными. Поэтому цена считается и
+    для него -- из тендера, без контекста и без открытия книги.
+
+    None, когда сверять нечего: пути файла мы не знаем (нет шаблона, слишком
+    длинный путь), файла в папке нет, цены документ не печатает или его
+    карта ячеек испорчена. Файл, записанный этой же сборкой, тоже не считается
+    оставшимся: при совпадении имён в папке лежит бумага другого документа, и
+    называть её этим именем было бы неправдой."""
+    try:
+        _, target = _plan_one(document, spec, out_dir, set(), repo)
+    except _Refusal:
+        return None
+    if not target.is_file() or target in written:
+        return None
+    try:
+        cell_map = (load_cellmap(config.CELLMAPS_DIR / spec.cellmap)
+                    if spec and spec.cellmap else None)
+        return printed_price(tender_id, repo, document, cell_map)
+    except (CellMapError, LookupError):
+        return None
 
 
 def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
@@ -280,7 +367,7 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
                overwrite: bool, experience_ids) -> Path:
     """Собирает один документ; при отказе поднимает исключение. Нового файла
     после отказа не остаётся, а прежний (при overwrite) остаётся целым."""
-    template, target = _plan_one(document, spec, out_dir, taken)
+    template, target = _plan_one(document, spec, out_dir, taken, repo)
     replacing = target.exists()
     if replacing and not overwrite:
         raise _Refusal(
@@ -291,7 +378,6 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
     context = build_context(tender_id, repo, document=document,
                            experience_ids=experience_ids)
     warnings.extend((document, text) for text in context["warnings"])
-    prices[document] = context["printed_price_wo_vat"]
     # Единый путь записи: документ всегда пишется под временным именем рядом с
     # целью и становится настоящим файлом одним действием. Так оборванная или
     # неудавшаяся запись оставляет только `~pkg-…`, который уберёт подметание,
@@ -299,13 +385,14 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
     # готов. rename не затирает чужой файл, появившийся за это время;
     # replace -- только при разрешённой замене.
     work = _temp_path(target)
+    blanks: list[str] = []
     try:
         try:
             if template.suffix.lower() == ".xlsx":
                 fill_workbook(template, load_cellmap(config.CELLMAPS_DIR / spec.cellmap),
                               context, work)
             else:
-                render_docx(template, context, work)
+                render_docx(template, context, work, blanks)
         except (TemplateError, CellMapError) as exc:
             # Модули рендера честно называют тот путь, который им дали, то есть
             # временный. Пользователь такого файла не видел: подменяется только
@@ -321,6 +408,13 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
         except OSError:
             pass        # настоящая причина важнее; остаток подметёт следующая сборка
         raise
+    # Дальше -- только то, что верно про файл, уже лежащий в папке под своим
+    # именем: его цена и его пустые графы. До переноса говорить об этом рано --
+    # «напечатано» о бумаге, которой в папке нет, уже один раз было неправдой.
+    prices[document] = context["printed_price_wo_vat"]
+    blank_note = blank_fields_warning(document, blanks)
+    if blank_note:
+        warnings.append((document, blank_note))
     return target
 
 
@@ -363,7 +457,7 @@ def planned_files(tender_id: int, documents: list[str], out_dir: Path,
         seen.add(document)
         spec = profile.docs.get(document) if profile else None
         try:
-            _, target = _plan_one(document, spec, out_dir, taken)
+            _, target = _plan_one(document, spec, out_dir, taken, repo)
         except _Refusal:
             continue
         plan.append((document, target))
@@ -402,7 +496,8 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
     result = PackageResult()
     seen: set[str] = set()
     taken: set[str] = set()
-    prices: dict[str, object] = {}      # документ -> цена, которую он напечатает
+    prices: dict[str, object] = {}      # документ -> цена, которую он НАПЕЧАТАЛ
+    skipped: list[tuple[str, object]] = []      # документ -> его описание в профиле
     for document in documents:
         if document in seen:
             result.skipped.append((document, (
@@ -416,13 +511,22 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
                               experience_ids)
         except _Refusal as exc:
             result.skipped.append((document, str(exc)))
+            skipped.append((document, spec))
         except (TemplateError, CellMapError, LayoutError, ContextError) as exc:
             result.skipped.append((document, str(exc)))
+            skipped.append((document, spec))
         except Exception as exc:
             result.skipped.append((document, (
                 f"Документ не собран из-за непредвиденной ошибки "
                 f"({type(exc).__name__}). Остальные документы пакета не затронуты.")))
+            skipped.append((document, spec))
         else:
             result.written.append(path)
-    result.warnings.extend(_price_warnings(prices))
+    # Снятый со сборки документ мог остаться в папке файлом от прежнего раза --
+    # и уйдёт в заявку вместе с остальными. Его цена считается здесь, когда
+    # известно, что записано этой сборкой.
+    left = {document: _left_in_folder(tender_id, document, spec, out_dir, repo,
+                                      result.written)
+            for document, spec in skipped}
+    result.warnings.extend(_price_warnings(prices, left))
     return result

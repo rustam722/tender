@@ -21,7 +21,8 @@ from app.models import (
 from app.render import package as package_module
 from app.render.context import build_context
 from app.render.package import (
-    PackageError, PackageResult, build_package, planned_files, safe_filename,
+    PACKAGE_WIDE, PackageError, PackageResult, build_package, planned_files,
+    safe_filename,
 )
 from app.render.xlsx_render import CellMapError
 from app.repo import Repo
@@ -735,7 +736,7 @@ def test_half_written_file_of_a_failed_document_is_removed(
     make_template(templates / f"{DECLARATION}.docx", "x")
     tid = make_tender(repo, documents=[DECLARATION])
 
-    def crash_after_writing(template, context, out):
+    def crash_after_writing(template, context, out, blanks=None):
         Path(out).write_bytes(b"half")
         raise package_module.TemplateError("Не удалось сохранить.")
 
@@ -819,7 +820,7 @@ def test_overwrite_true_keeps_the_old_file_when_saving_breaks_halfway(
     existing = out / f"{DECLARATION}.docx"
     existing.write_bytes(b"old")
 
-    def crash_after_writing(template, context, target):
+    def crash_after_writing(template, context, target, blanks=None):
         Path(target).write_bytes(b"half")
         raise package_module.TemplateError("Не удалось сохранить.")
 
@@ -1091,7 +1092,7 @@ def test_failure_to_remove_the_temp_file_does_not_hide_the_real_reason(
     out.mkdir()
     (out / f"{DECLARATION}.docx").write_bytes(b"old")
 
-    def crash_after_writing(template, context, target):
+    def crash_after_writing(template, context, target, blanks=None):
         Path(target).write_bytes(b"half")
         raise package_module.TemplateError("Настоящая причина сбоя.")
 
@@ -1226,9 +1227,9 @@ def test_every_document_is_written_under_a_temp_name_first(
     seen = []
     real = package_module.render_docx
 
-    def spy(template, context, target):
+    def spy(template, context, target, blanks=None):
         seen.append(Path(target).name)
-        return real(template, context, target)
+        return real(template, context, target, blanks)
 
     monkeypatch.setattr(package_module, "render_docx", spy)
     result = build_package(tid, [DECLARATION, MTR], out, repo, overwrite=True)
@@ -1245,7 +1246,7 @@ def test_failed_new_document_never_leaves_a_half_file_under_the_real_name(
     tid = make_tender(repo, documents=[DECLARATION])
     out = tmp_path / "out"
 
-    def crash_after_writing(template, context, target):
+    def crash_after_writing(template, context, target, blanks=None):
         Path(target).write_bytes(b"half")
         raise package_module.TemplateError("Настоящая причина сбоя.")
 
@@ -1299,8 +1300,8 @@ def test_a_file_that_appears_meanwhile_is_not_clobbered_when_not_overwriting(
     out = tmp_path / "out"
     real = package_module.render_docx
 
-    def render_then_user_saves_theirs(template, context, target):
-        real(template, context, target)
+    def render_then_user_saves_theirs(template, context, target, blanks=None):
+        real(template, context, target, blanks)
         (Path(target).parent / f"{DECLARATION}.docx").write_bytes(b"theirs")
         return target
 
@@ -1410,7 +1411,7 @@ def test_only_the_file_name_is_replaced_in_a_refusal_not_the_whole_text(
     make_template(templates / f"{DECLARATION}.docx", "x")
     tid = make_tender(repo, documents=[DECLARATION])
 
-    def fails(template, context, target):
+    def fails(template, context, target, blanks=None):
         raise package_module.TemplateError(
             f"Не удалось сохранить «{Path(target).name}»: причина как есть. "
             "Другой текст не трогать.")
@@ -1420,3 +1421,126 @@ def test_only_the_file_name_is_replaced_in_a_refusal_not_the_whole_text(
     assert result.skipped[0][1] == (
         f"Не удалось сохранить «{DECLARATION}.docx»: причина как есть. "
         "Другой текст не трогать.")
+
+
+# ---- документ по форме заказчика: отказ не зовёт создавать бланк, которого нет ----
+
+# В списке документов пакета два сорта имён. Семь -- наши собственные бланки,
+# у них есть общий шаблон «<документ>.docx» в templates_docs. Три собираются
+# по форме заказчика, и общего бланка у них нет: «Калькуляция к КП» существует
+# только как книга Арктикгаза, «ТКП по форме заказчика» -- только как книга
+# Роснефти. Отказ, который зовёт положить в папку «Калькуляция к КП.docx»,
+# посылает человека создать документ, которого не должно существовать.
+
+ESTIMATE = "Калькуляция к КП"
+
+
+def test_a_customer_form_without_a_form_in_the_profile_says_so(repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION, ESTIMATE])
+    result = build_package(tid, [DECLARATION, ESTIMATE], tmp_path / "out", repo)
+    assert [p.name for p in result.written] == [f"{DECLARATION}.docx"]
+    (document, reason), = result.skipped
+    assert document == ESTIMATE
+    assert "по форме заказчика" in reason and "не назначена" in reason
+    assert "профиле заказчика" in reason and "снимите галочку" in reason
+    # того, чего быть не должно, отказ не требует: ни файла с таким именем,
+    # ни папки шаблонов
+    assert f"{ESTIMATE}.docx" not in reason
+    assert "Положите файл" not in reason and "templates_docs" not in reason
+    assert "не найден" not in reason
+
+
+def test_a_missing_blank_of_our_own_still_asks_for_the_file(repo, dirs, tmp_path):
+    # обратная сторона: у нашего бланка общий шаблон есть, и «положите файл
+    # с этим именем в папку» -- верный совет именно для этого случая
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION, MTR])
+    result = build_package(tid, [DECLARATION, MTR], tmp_path / "out", repo)
+    (document, reason), = result.skipped
+    assert document == MTR
+    assert f"{MTR}.docx" in reason and "Положите файл" in reason
+    assert "templates_docs" in reason and "не найден" in reason
+    assert "по форме заказчика" not in reason
+
+
+def test_the_refusal_names_the_customers_whose_form_is_already_set(
+        repo, dirs, tmp_path):
+    # подсказка, откуда взять форму: видно по профилям других заказчиков
+    templates, cellmaps = dirs
+    shutil.copy(REAL_FORM, templates / "forma_tkp_rosneft_murmansk.xlsx")
+    shutil.copy(ROOT / "cellmaps" / "tkp_rosneft_murmansk.json", cellmaps)
+    rosneft_tender(repo)                       # у Роснефти форма ТКП назначена
+    tid = make_tender(repo, documents=[TKP], customer_name="ПМУП «Автоспецтранс»")
+    result = build_package(tid, [TKP], tmp_path / "out", repo)
+    (_, reason), = result.skipped
+    assert 'АО «НК «Роснефть»' in reason
+    assert "forma_tkp_rosneft_murmansk.xlsx" in reason
+
+
+def test_without_any_such_form_the_refusal_says_nothing_about_other_customers(
+        repo, dirs, tmp_path):
+    # обратная сторона: пустая подсказка хуже отсутствующей
+    tid = make_tender(repo, documents=[TKP])
+    result = build_package(tid, [TKP], tmp_path / "out", repo)
+    (_, reason), = result.skipped
+    assert "назначен в профилях" not in reason
+    assert "по форме заказчика" in reason
+
+
+def test_planned_files_leave_out_a_customer_form_without_a_form(repo, dirs, tmp_path):
+    # экран не обещает файла, которого сборка не запишет
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", "x")
+    tid = make_tender(repo, documents=[DECLARATION, ESTIMATE])
+    plan = planned_files(tid, [DECLARATION, ESTIMATE], tmp_path / "out", repo)
+    assert [doc for doc, _ in plan] == [DECLARATION]
+
+
+def test_the_two_sorts_of_documents_match_what_lies_in_templates_docs():
+    """Признак сорта живёт в данных рядом со списком документов -- и обязан
+    сходиться с папкой шаблонов: у нашего бланка есть общий шаблон
+    «<документ>.docx», у формы заказчика его нет и быть не может."""
+    from app.render.context import CUSTOMER_FORM_DOCUMENTS, DOCUMENTS
+    assert CUSTOMER_FORM_DOCUMENTS <= set(DOCUMENTS)
+    for document in DOCUMENTS:
+        blank = ROOT / "templates_docs" / f"{document}.docx"
+        if document in CUSTOMER_FORM_DOCUMENTS:
+            assert not blank.is_file(), document
+        else:
+            assert blank.is_file(), document
+
+
+def test_a_paper_written_by_another_document_is_not_called_its_own(
+        repo, dirs, tmp_path):
+    """Второй документ снят из-за совпавшего имени -- в папке лежит бумага
+    ПЕРВОГО. Назвать её ценой второго значило бы соврать о бумаге, которой
+    никто не печатал: сверке её отдавать нельзя."""
+    templates, cellmaps = dirs
+    shutil.copy(ROOT / "cellmaps" / "tkp_rosneft_murmansk.json", cellmaps)
+    shutil.copy(ROOT / "cellmaps" / "kp_arktikgaz.json", cellmaps)
+    make_template(templates / "a.docx", "первый")
+    make_template(templates / "b.docx", "второй")
+    docs = {
+        # карта первого шлёт в книгу позиции лота -- цена по ним,
+        "Справка: 1": DocSpec(template="a.docx",
+                              cellmap="tkp_rosneft_murmansk.json"),
+        # карта второго шлёт калькуляцию -- цена другая
+        "Справка? 1": DocSpec(template="b.docx", cellmap="kp_arktikgaz.json"),
+    }
+    tid = make_tender(repo, documents=list(docs), docs=docs,
+                      deal_answers={c: "подтверждаю" for c in CONDITIONS})
+    repo.save_lot_item(LotItem(tender_id=tid, position=1, name="П",
+                               price=Decimal("1000.00")))
+    repo.save_tender_labor(TenderLaborRow(
+        tender_id=tid, position=1, post="Эколог", headcount=1,
+        hours=Decimal("10"), rate=Decimal("270")))
+    out = tmp_path / "out"
+    result = build_package(tid, list(docs), out, repo)
+
+    assert [p.name for p in result.written] == ["Справка 1.docx"]
+    assert [d for d, _ in result.skipped] == ["Справка? 1"]
+    assert names(out) == ["Справка 1.docx"]
+    assert [w for w in result.warnings if w[0] == PACKAGE_WIDE] == []

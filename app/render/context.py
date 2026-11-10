@@ -77,11 +77,14 @@ from pathlib import Path
 from app import config
 from app.calc import Estimate, LaborLine, estimate, money_total, workbook_total
 from app.models import (
-    COST_MATERIALS, COST_SUBCONTRACT, ROLE_CUSTOMER, ROLE_PARTICIPANT,
+    COST_MATERIALS, COST_SUBCONTRACT, ORGANIZATION_LABELS, ROLE_CUSTOMER,
+    ROLE_PARTICIPANT, TENDER_LABELS,
     CustomerProfile, DocSpec, LotItem, Organization, TenderCostItem, TenderLaborRow,
 )
 from app.render.layouts import TableLayout, build_rows, load_layout
-from app.render.xlsx_render import RATE_FIELDS, cell_paths, load_cellmap, read_rates
+from app.render.xlsx_render import (
+    RATE_FIELDS, load_cellmap, lone_path, read_rates, required_cell_paths,
+)
 from app.repo import Repo
 
 
@@ -111,6 +114,26 @@ DOCUMENTS = (
     "Справка об опыте",
     "Анкета участника",
 )
+
+# Документы, которые собираются ПО ФОРМЕ ЗАКАЗЧИКА: общего бланка у них нет и
+# быть не может. «Калькуляция к КП» существует только как книга Арктикгаза,
+# «ТКП по форме заказчика» -- только как книга Роснефти, «Анкета участника» --
+# пока ни у кого (у нового заказчика эта форма называется «Заявка на участие»).
+# Форму такому документу назначает профиль заказчика; без неё собирать нечего,
+# а совет «положите в папку файл «Калькуляция к КП.docx»» зовёт человека
+# создать документ, которого не должно существовать: это книга Excel
+# конкретного заказчика, а не наш бланк Word.
+#
+# Признак живёт здесь, рядом со списком документов, а не угадывается по
+# расширению и не выводится из того, нашёлся ли файл: у остальных семи
+# документов есть наш собственный бланк «<документ>.docx» в templates_docs,
+# и это закреплено тестом с обеих сторон -- у формы заказчика такого бланка
+# нет, у своего бланка он есть.
+CUSTOMER_FORM_DOCUMENTS = frozenset({
+    "Калькуляция к КП",
+    "ТКП по форме заказчика",
+    "Анкета участника",
+})
 
 # Документы, несущие табличную справку, -- имена из списка документов
 # раздела 8 описания; они же ключи CustomerProfile.documents и .docs.
@@ -163,17 +186,27 @@ def _parse_date(value: str) -> date | None:
 
 
 def date_ru(value: str) -> str:
-    """2025-10-24 -> 24.10.2025."""
+    """2025-10-24 -> 24.10.2025; пустая дата отдаётся как пришла.
+
+    Как пришла, а не пустой строкой: на отрисовке Word пустое значение несёт
+    с собой имя своего поля (app.render.Blank), и «{{ date_ru(tender.doc_date) }}»
+    на пустой дате должно попасть в предупреждение о пустых графах, а не
+    потерять пометку по дороге. Для всех остальных это та же пустая строка."""
     parsed = _parse_date(value)
-    return parsed.strftime("%d.%m.%Y") if parsed else ""
+    return parsed.strftime("%d.%m.%Y") if parsed else _empty(value)
 
 
 def date_long(value: str) -> str:
-    """2025-10-24 -> «24» октября 2025 г.; день без ведущего нуля."""
+    """2025-10-24 -> «24» октября 2025 г.; день без ведущего нуля.
+    Пустая дата отдаётся как пришла -- см. date_ru."""
     parsed = _parse_date(value)
     if not parsed:
-        return ""
+        return _empty(value)
     return f"«{parsed.day}» {_MONTHS_GENITIVE[parsed.month - 1]} {parsed.year} г."
+
+
+def _empty(value: object) -> str:
+    return value if isinstance(value, str) else ""
 
 
 def _today() -> date:
@@ -416,7 +449,12 @@ def _workbook_sums_warnings(document: str, spec: DocSpec | None, cell_map,
     # Клетка округления итога (D88 формы КП): карта, которая её пишет, ставит
     # туда нашу настройку -- значит книга округлит итог так же, как программа.
     # Карта, которая её не пишет, оставляет книгу на целых рублях.
-    writes_rounding = _ROUNDING in cell_paths(cell_map)
+    # Пишет -- это отдельная клетка из одного «{rounding}»: только из неё книга
+    # возьмёт разрядность числом. Упоминание пути в тексте («Округление:
+    # {rounding} знаков») книгу не меняет, и принимать его за клетку округления
+    # значило бы назвать человеку неверную причину расхождения итогов.
+    writes_rounding = any(lone_path(expr) == _ROUNDING
+                          for expr in cell_map.cells.values())
     digits = settings.total_rounding_digits if writes_rounding else 0
 
     rate_notes = _rate_warnings(document, book_rates, settings)
@@ -533,9 +571,59 @@ def required_conditions(cell_map) -> list[str]:
     отвечает на них участник. Ключи -- дословные, с двоеточием на конце у
     шестерых и без него у седьмого: угадывать их человек не должен, поэтому
     список отдаётся экрану (ручка /api/tenders/<id>/conditions) и сборке,
-    которая называет все недостающие разом."""
-    return [path[len(_CONDITIONS):] for path in cell_paths(cell_map)
+    которая называет все недостающие разом.
+
+    Берутся только обязательные одиночные клетки карты: условие, поставленное
+    в блок строк или в клетку с `optional`, книга пустым примет, и отказывать
+    в сборке из-за него значило бы требовать того, чего форма не требует."""
+    return [path[len(_CONDITIONS):] for path in required_cell_paths(cell_map)
             if path.startswith(_CONDITIONS)]
+
+
+# Откуда человек правит поле контекста и как это поле подписано в программе.
+# Имена берутся из app.models -- те же, что стоят подписями на экранах: графа
+# в предупреждении называется так же, как поле, которое её заполняет.
+_FIELD_SOURCES = (
+    ("org.", ORGANIZATION_LABELS, "справочник «Организации», своя фирма"),
+    ("customer.", ORGANIZATION_LABELS, "справочник «Организации», заказчик"),
+    ("tender.", TENDER_LABELS, "карточка тендера"),
+)
+
+
+def blank_fields_warning(document: str, paths: list[str]) -> str:
+    """Графы документа Word, напечатанные пустыми, -- одним предупреждением.
+
+    `paths` -- пути полей, которые собрала отрисовка (`render_docx(blanks=...)`);
+    пусто -- пустая строка, и предупреждения не будет.
+
+    Предупреждение, а не отказ: часть пустот законна, и отказ на законной
+    пустоте человек научится обходить -- а обходить его он будет и там, где
+    пустота настоящая. Законная пустота отмечается в шаблоне (`|optional`),
+    и тогда здесь о ней не скажут.
+
+    Поля называются по-русски и с местом, где их заполняют: «пусто
+    org.bank_name» человеку, который правит справочник «Организации», ничего
+    не говорит. Поле без известного имени называется своим путём как есть --
+    лучше путь, чем молчание о напечатанной пустоте.
+    """
+    if not paths:
+        return ""
+    groups: dict[str, list[str]] = {}
+    for path in paths:
+        place, name = "", path
+        for prefix, labels, where in _FIELD_SOURCES:
+            if path.startswith(prefix) and path[len(prefix):] in labels:
+                place, name = where, labels[path[len(prefix):]]
+                break
+        groups.setdefault(place, []).append(name)
+    listing = "; ".join(", ".join(names) + (f" ({place})" if place else "")
+                        for place, names in groups.items())
+    return (f"В документе «{document}» остались пустые графы: {listing}. "
+            "Из-за пустой графы заявку отклоняют, и узнать об этом человек "
+            "может уже от закупочной комиссии: заполните поля и соберите "
+            "пакет заново. Если графа должна остаться пустой, отметьте её "
+            "в шаблоне фильтром optional: "
+            + "{{ org.website|optional }}.")
 
 
 class ContextError(Exception):
@@ -567,6 +655,38 @@ def _lot_price(items: list[dict]) -> Decimal:
     return money_total([row["price_value"] for row in items])
 
 
+def printed_price(tender_id: int, repo: Repo, document: str,
+                  cell_map) -> Decimal | None:
+    """Цена без НДС, которую документ НАПЕЧАТАЛ БЫ по нынешним данным; None --
+    цены он не печатает.
+
+    То же число, что `printed_price_wo_vat` контекста, но считается без
+    контекста: ни шаблон, ни книга заказчика, ни раскладки таблиц для него не
+    нужны -- цена это функция тендера и того, откуда документ её берёт.
+
+    Нужно сборке для документа, который она НЕ собрала: файл уже лежал в папке
+    и не перезаписан, шаблона нет, имя совпало. Цена такого документа в сверку
+    не попадала вовсе, и в папке спокойно оставались две бумаги с разными
+    ценами без единого предупреждения. Число, посчитанное здесь, -- это то,
+    что документ напечатал БЫ сейчас, а не то, что стоит в старом файле:
+    текст предупреждения обязан говорить именно так.
+    """
+    source = _price_source(document, cell_map)
+    if source is None:
+        return None
+    tender = repo.get_tender(tender_id)
+    participant, _ = _organization(repo, tender.participant_id, ROLE_PARTICIPANT)
+    settings = repo.get_settings()
+    rate = _vat_rate(tender, participant, settings)
+    if source == _LOT_SOURCE:
+        return _lot_price(_lot_rows(repo.list_lot_items(tender_id), rate))
+    return _estimate_rows(
+        labor_rows(repo.list_tender_labor(tender_id)),
+        _cost_rows(repo.list_tender_cost_items(tender_id, COST_MATERIALS)),
+        _cost_rows(repo.list_tender_cost_items(tender_id, COST_SUBCONTRACT)),
+        replace(settings, vat_rate=rate)).total_wo_vat
+
+
 def _printed_price(document: str, cell_map, items: list[dict],
                    calc: Estimate) -> Decimal | None:
     """Цена без НДС, которую напечатает ИМЕННО ЭТОТ документ, или None, если
@@ -590,8 +710,9 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
 
     С `document`, у которого в профиле есть карта ячеек, может поднять
     `CellMapError`: карту не разобрать или ставку из клетки не прочитать.
-    С `document` может поднять `ContextError`: нет позиций лота, а документ
-    печатает цену по ним (вышел бы на 0,00), или форма заказчика требует
+    С `document` может поднять `ContextError`: документ печатает цену по
+    позициям лота, а она выходит 0,00 (позиций нет вовсе или все они по
+    нулевой цене), или форма заказчика требует
     ответов по условиям сделки, а их нет (тогда называются все недостающие
     разом). Сборка пакета превращает и то и другое в пропуск одного документа
     с причиной.
@@ -656,15 +777,25 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
                 + ", ".join(f"«{name}»" for name in missing)
                 + ". Впишите ответы в таблицу «Ответы по условиям сделки» на "
                 "карточке тендера -- условия этой формы там уже перечислены.")
-    # Документ, который печатает цену по позициям лота, без позиций напечатает
-    # 0,00 -- и встанет в список «Записано» как ни в чём не бывало. Коммерческое
-    # предложение на ноль рублей -- не документ: отказ, как у пустой обязательной
-    # клетки в книге Excel. Без имени документа (экраны) отказа быть не может.
-    if document and not items and _price_source(document, cell_map) == _LOT_SOURCE:
+    # Документ, который печатает цену по позициям лота, напечатает ровно то,
+    # что сложится из их цен, -- и на нуле встанет в список «Записано» как ни
+    # в чём не бывало. Коммерческое предложение на ноль рублей -- не документ:
+    # отказ, как у пустой обязательной клетки в книге Excel.
+    #
+    # Отказ держится на НАПЕЧАТАННОЙ цене, а не на длине списка: пустой список
+    # -- лишь одна дверь к нулю, а вторая -- позиции с нулевой ценой (цена
+    # позиции по умолчанию ноль, и позиции вставляют списком из таблицы
+    # заказчика без цен). Обе двери закрывает одно условие.
+    # Без имени документа (экраны) отказа быть не может.
+    printed_price = _printed_price(document or "", cell_map, items, calc)
+    if (document and _price_source(document, cell_map) == _LOT_SOURCE
+            and not printed_price):
+        why = ("в тендере нет ни одной позиции лота" if not items
+               else "все позиции лота стоят по нулевой цене")
         raise ContextError(
-            f"В тендере нет ни одной позиции лота, а «{document}» печатает "
-            "цену по ним: документ вышел бы с итогом 0,00 руб. Добавьте "
-            "позиции лота на карточке тендера и соберите пакет заново.")
+            f"«{document}» печатает цену по позициям лота, а {why}: документ "
+            "вышел бы с итогом 0,00 руб. Укажите позиции лота и их цены "
+            "на карточке тендера и соберите пакет заново.")
     warnings = []
     if (profile and document in TABLE_DOCUMENTS
             and document in profile.documents
@@ -694,8 +825,7 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
         "customer": customer,
         "tender": tender_fields,
         "items": items,
-        "printed_price_wo_vat": _printed_price(document or "", cell_map,
-                                               items, calc),
+        "printed_price_wo_vat": printed_price,
         "estimate": asdict(calc),
         "materials": materials_table,
         "subcontract": subcontract_table,

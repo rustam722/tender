@@ -799,3 +799,82 @@ def test_kp_document_total_equals_sum_of_printed_rows(repo, tmp_path):
     assert _printed(total[4]) == Decimal("0.33")
     assert _printed(total[3]) == Decimal("0.03")
     assert _printed(total[5]) == Decimal("0.36")
+
+
+# ---- имена пустых граф: предупреждение называет поле так, как оно подписано ------
+
+def test_blank_fields_warning_names_the_fields_and_where_they_live():
+    from app.render.context import blank_fields_warning
+    text = blank_fields_warning(
+        "Анкета участника",
+        ["org.bank_name", "org.bank_bik", "tender.deadline",
+         "customer.legal_address"])
+    assert text.startswith("В документе «Анкета участника» остались пустые графы: ")
+    for name in ("Банк", "БИК", "Сроки исполнения", "Юридический адрес"):
+        assert name in text, name
+    # названо и место, где графу заполняют: «пусто org.bank_name» человеку,
+    # который правит справочник, ничего не говорит
+    assert "справочник «Организации», своя фирма" in text
+    assert "справочник «Организации», заказчик" in text
+    assert "карточка тендера" in text
+    assert "org.bank_name" not in text and "tender.deadline" not in text
+    assert "|optional" in text              # как отметить законную пустоту
+
+
+def test_blank_fields_warning_is_silent_when_nothing_was_left_empty():
+    from app.render.context import blank_fields_warning
+    assert blank_fields_warning("Анкета участника", []) == ""
+
+
+def test_a_field_without_a_known_name_is_called_by_its_path():
+    # лучше путь, чем молчание о напечатанной пустоте
+    from app.render.context import blank_fields_warning
+    text = blank_fields_warning("Анкета участника",
+                                ["conditions.Цена и условия:"])
+    assert "conditions.Цена и условия:" in text
+
+
+def test_the_names_of_fields_are_the_ones_the_screens_show():
+    """Имя поля живёт в одном месте на программу: экран и предупреждение
+    о пустых графах берут его из app.models. Два списка имён разошлись бы, и
+    человек увидел бы одно поле под двумя названиями."""
+    from dataclasses import fields as dc_fields
+
+    from app.models import ORGANIZATION_LABELS, TENDER_LABELS
+    from app.web import schema
+    assert schema.ORGANIZATIONS.labels is ORGANIZATION_LABELS
+    assert schema.TENDERS.labels is TENDER_LABELS
+    # ни одно поле не осталось без русского имени (новое поле -- тоже)
+    for model, labels in ((Organization, ORGANIZATION_LABELS),
+                          (Tender, TENDER_LABELS)):
+        assert {f.name for f in dc_fields(model)} - {"id"} == set(labels)
+
+
+# ---- условия сделки: требуются только там, где книга их требует -------------------
+
+def test_a_condition_in_a_row_block_is_not_required_by_the_form():
+    """`required_conditions` берёт условия только из обязательных одиночных
+    клеток: в строке блока пустое значение законно, и отказывать в сборке
+    из-за него значило бы требовать того, чего книга заказчика не требует."""
+    from app.render.context import required_conditions
+    from app.render.xlsx_render import CellMap, RowBlock
+    cell_map = CellMap(
+        sheet="Лист1",
+        cells={"E23": "{conditions.Цена и условия:}",
+               "D88": "{rounding}"},
+        rows=[RowBlock(first_row=9, last_row=19, source="items",
+                       columns={"C": "{row.price_value}",
+                                "D": "{conditions.Срок:}"})])
+    assert required_conditions(cell_map) == ["Цена и условия:"]
+
+
+def test_a_condition_in_an_optional_cell_is_not_required_either():
+    # «может быть пустым» -- это и значит «не требуется»
+    from app.render.context import required_conditions
+    from app.render.xlsx_render import CellMap
+    cell_map = CellMap(
+        sheet="Лист1",
+        cells={"E23": "{conditions.Цена и условия:}",
+               "E24": "{conditions.Факс:}"},
+        optional={"E24"})
+    assert required_conditions(cell_map) == ["Цена и условия:"]
