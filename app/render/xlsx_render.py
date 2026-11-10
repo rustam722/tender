@@ -284,16 +284,23 @@ def _rates(raw: object, name: str) -> dict[str, str]:
 _RATE_RULE = "ставка задаётся долей единицы, от 0 до 1: например, 0,05 для 5 %"
 
 # Что лежит в клетке, когда там не число: сказать это человеку по-русски, иначе
-# он пойдёт искать пустую клетку, а там дата.
-_CELL_KINDS = ((bool, "логическое значение (ДА/НЕТ)"), (datetime, "дата"),
-               (date, "дата"), (time, "время"), (timedelta, "длительность"))
+# он пойдёт искать пустую клетку, а там дата. Падеж винительный: вид клетки
+# подставляется в «содержит не ставку, а ...», и «а дата» читается как обрывок.
+_CELL_KINDS = ((bool, "логическое значение (ДА/НЕТ)"), (datetime, "дату"),
+               (date, "дату"), (time, "время"), (timedelta, "длительность"))
+_UNKNOWN_KIND = "значение, которое числом не является"
+
+# Длиннее этого число в сообщение не пишется развёрнуто: 1E+300 развернулся бы
+# в триста цифр, и причина утонула бы в них.
+_PLAIN_LIMIT = 30
 
 
 def _plain(value: Decimal) -> str:
     """Число как оно есть, для сообщения: 30 -> «30», 0.3 -> «0,3»."""
     if not value.is_finite():
         return str(value)
-    return format(value.normalize(), "f").replace(".", ",")
+    plain = format(value.normalize(), "f").replace(".", ",")
+    return plain if len(plain) <= _PLAIN_LIMIT else str(value.normalize())
 
 
 def _rate_of(value: object, key: str, address: str, book: str) -> Decimal:
@@ -304,12 +311,14 @@ def _rate_of(value: object, key: str, address: str, book: str) -> Decimal:
     больше. И то и другое человек увидит только от проверяющего, поэтому здесь
     отказ, а не догадка."""
     where = f"В книге {book} клетка {address} (ставка «{key}»)"
+    shown = value                      # для сообщения: как в клетке, до правок
     if isinstance(value, str):
         text = value.strip().replace(",", ".")
         if text.startswith("="):
             raise CellMapError(
                 f"{where} занята формулой: ставку оттуда не прочитать. "
                 "Проверьте адрес в карте ячеек.")
+        shown = value.strip()
         value = text
     if value is None or value == "":
         raise CellMapError(
@@ -317,7 +326,7 @@ def _rate_of(value: object, key: str, address: str, book: str) -> Decimal:
             "в карте ячеек или заполните клетку в шаблоне книги.")
     if isinstance(value, bool) or not isinstance(value, (int, float, Decimal, str)):
         kind = next((name for cls, name in _CELL_KINDS if isinstance(value, cls)),
-                    "не число")
+                    _UNKNOWN_KIND)
         raise CellMapError(
             f"{where} содержит не ставку, а {kind}. Проверьте адрес в карте "
             "ячеек или клетку в шаблоне книги.")
@@ -325,7 +334,7 @@ def _rate_of(value: object, key: str, address: str, book: str) -> Decimal:
         rate = Decimal(str(value))
     except InvalidOperation:
         raise CellMapError(
-            f"{where} содержит не число, а «{value}». Проверьте адрес в карте "
+            f"{where} содержит не число, а «{shown}». Проверьте адрес в карте "
             "ячеек или клетку в шаблоне книги.") from None
     # is_finite первым: сравнение Decimal('NaN') с числом само поднимает
     # InvalidOperation, то есть ошибку не по-русски и не для человека

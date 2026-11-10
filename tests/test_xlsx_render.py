@@ -398,6 +398,28 @@ _ENGLISH_LEAK = re.compile(
     r"Error|Errno|Traceback|must be|expected|invalid|NoneType|object of type")
 
 
+def _latin_words(text: str) -> set[str]:
+    """Латинские слова текста -- ими собирается список дозволенных для
+    `assert_russian_reason`: всё, что человек написал в своей карте сам."""
+    return set(re.findall(r"[A-Za-z][A-Za-z_0-9]*", text))
+
+
+# Ключи самой карты: проверка называет их человеку и тогда, когда ключ из файла
+# пропал, -- вывести их из данных нельзя, поэтому они перечислены.
+_MAP_KEYS = {"sheet", "cells", "rows", "first_row", "last_row", "source",
+             "columns", "rates", "value", "optional", "Excel"}
+# Буква колонки и адрес клетки: «A», «B», «C15». Это язык самой книги, а не
+# чужое сообщение, и проверка вправе их называть.
+_ADDRESS = re.compile(r"[A-Z]{1,3}[0-9]*")
+
+
+def map_latin(data: dict, text: str) -> set[str]:
+    """Латинские слова, которым место в причине отказа по карте: ключи карты,
+    всё написанное человеком в ней самой, имя файла и адреса клеток."""
+    return (_latin_words(json.dumps(data)) | _MAP_KEYS | {"map", "json"}
+            | {w for w in _latin_words(text) if _ADDRESS.fullmatch(w)})
+
+
 def assert_russian_reason(text: str, only_latin=None) -> None:
     """Причина -- русская фраза, а не английский обрывок.
 
@@ -410,6 +432,20 @@ def assert_russian_reason(text: str, only_latin=None) -> None:
         strange = {word for word in re.findall(r"[A-Za-z][A-Za-z_0-9]*", text)
                    if word not in only_latin}
         assert not strange, (strange, text)
+
+
+def test_the_rate_rule_is_worded_exactly_as_the_settings_word_it():
+    """Правило ставки сформулировано в двух местах: у карты ячеек книги и у
+    настроек калькуляции. Это сделано нарочно -- человек должен узнавать одно
+    и то же правило, а не разбирать его заново. Но две копии одной фразы
+    расходятся молча, поэтому сверяются не литералы в тесте, а то, что
+    программа говорит человеку с обеих сторон."""
+    from app.render.xlsx_render import _RATE_RULE
+    from app.web.schema import ORGANIZATIONS, ApiError, decimal_value
+    with pytest.raises(ApiError) as caught:
+        decimal_value("30", ORGANIZATIONS, ["settings", "insurance_rate"])
+    assert _RATE_RULE in str(caught.value), (
+        "фраза про долю единицы разошлась с той, что говорят настройки")
 
 
 def test_load_cellmap_reads_the_shape(tmp_path):
@@ -468,8 +504,13 @@ def test_bad_cellmap_is_rejected_with_a_russian_reason(tmp_path, mutate, fragmen
     mutate(data)
     with pytest.raises(CellMapError) as caught:
         load_cellmap(write_map(tmp_path, data))
-    assert fragment in str(caught.value)
-    assert_russian_reason(str(caught.value))
+    text = str(caught.value)
+    assert fragment in text
+    # Строгая проверка, а не мягкая: мягкая здесь всегда истинна, потому что
+    # любое сообщение начинается с «Карта ячеек». Латинские слова в причине
+    # могут быть только из самой карты (её ключи, адреса, выражения) и из имени
+    # файла; любое другое -- обрывок чужого английского сообщения.
+    assert_russian_reason(text, map_latin(data, text))
 
 
 # ---- настоящая форма Роснефти ---------------------------------------------------
@@ -898,7 +939,7 @@ def test_read_rates_without_the_section_does_not_even_open_the_book(tmp_path):
     ("C26", "формул"),                       # клетка занята формулой
     ("A3", "не число"),                      # в клетке текст заказчика
     ("C40", "логическое значение"),          # ДА/НЕТ, а не «пуста»
-    ("C41", "дата"),                         # дата, а не «пуста»
+    ("C41", "а дату"),                       # дата, а не «пуста»; и падеж верный
 ], ids=["пусто", "формула", "текст", "логическое", "дата"])
 def test_read_rates_refuses_a_cell_without_a_rate(rates_form, address, fragment):
     # молча взятая вместо ставки нулевая доля дала бы правдоподобную цену

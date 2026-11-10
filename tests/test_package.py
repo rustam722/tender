@@ -663,10 +663,10 @@ def test_missing_cellmap_file_is_a_russian_skip(repo, dirs, tmp_path):
 
 def test_a_broken_cellmap_is_a_russian_skip_and_not_a_silent_package(
         repo, dirs, tmp_path):
-    # Контекст отказ разбора карты глотает намеренно: ту же карту тем же кодом
-    # читает fill_workbook и отказывается с той же причиной. Без этого теста
-    # обещание «битую карту назовёт сама сборка» держалось бы на комментарии,
-    # а молчащий сторож в этой работе уже случался.
+    # Контекст больше не глотает ничего: отказ разбора карты доходит до сборки,
+    # и она называет его человеку пропуском документа с причиной. Без этого
+    # теста обещание «битую карту назовёт сама сборка» держалось бы на
+    # комментарии, а молчащий сторож в этой работе уже случался.
     templates, cellmaps = dirs
     shutil.copy(REAL_FORM, templates / "forma_tkp_rosneft_murmansk.xlsx")
     (cellmaps / "tkp_rosneft_murmansk.json").write_text(

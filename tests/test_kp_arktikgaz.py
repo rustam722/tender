@@ -16,6 +16,7 @@
 """
 import json
 import re
+import shutil
 from dataclasses import replace
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
@@ -30,12 +31,14 @@ from app.render.context import build_context, money
 from app.render.package import build_package
 from app.render.xlsx_render import CellMapError, fill_workbook, load_cellmap
 from app.repo import Repo
-from scripts.seed import DOC_ESTIMATE, seed
+from scripts.seed import DOC_ESTIMATE, DOC_KP, seed
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "templates_docs" / "Калькуляция к КП Арктикгаз.xlsx"
 CELLMAP = ROOT / "cellmaps" / "kp_arktikgaz.json"
 SHEET = "Лист1"
+# Клетка, где книга держит ставку страховых взносов (C17 = 0,3).
+RATE_CELL = "C17"
 NBSP = " "
 
 
@@ -553,18 +556,23 @@ def test_a_cellmap_without_rates_takes_them_from_the_settings(repo, tmp_path,
 # ---- испорченная клетка ставки: то, что увидит человек -------------------------------
 
 def templates_with_rate_cell(folder: Path, value) -> Path:
-    """Копия шаблона Арктикгаза в своей папке шаблонов, с заданным C17."""
+    """Копия шаблона Арктикгаза в своей папке шаблонов, с заданным C17.
+
+    Рядом кладётся и шаблон коммерческого предложения: пакет из одного
+    документа не показал бы главного -- что испорченная клетка снимает со
+    сборки только свой документ, а остальные человек получает."""
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / TEMPLATE.name
     wb = load_workbook(TEMPLATE)
-    wb[SHEET]["C17"] = value
+    wb[SHEET][RATE_CELL] = value
     wb.save(path)
     wb.close()
+    shutil.copy(TEMPLATE.parent / f"{DOC_KP}.docx", folder / f"{DOC_KP}.docx")
     return path
 
 
 def package_with_rate_cell(repo, tmp_path, value, monkeypatch):
-    """Пакет из одной калькуляции, собранный с заданным значением в C17 и
+    """Пакет из калькуляции и КП, собранный с заданным значением в C17 и
     настройкой страховых 31 %: ставки разошлись, сторожу есть о чём сказать."""
     tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
                              subcontract=ARKTIK_SUBCONTRACT)
@@ -572,7 +580,7 @@ def package_with_rate_cell(repo, tmp_path, value, monkeypatch):
     monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR", path.parent)
     repo.save_settings(replace(repo.get_settings(),
                                insurance_rate=Decimal("0.31")))
-    return build_package(tid, [DOC_ESTIMATE], tmp_path / "out", repo)
+    return build_package(tid, [DOC_ESTIMATE, DOC_KP], tmp_path / "out", repo)
 
 
 @pytest.mark.parametrize("value, fragment", [
@@ -587,22 +595,22 @@ def test_a_broken_rate_cell_skips_the_document_with_a_reason(
     # ставки отключала не только сверку ставок, а всю проверку целиком, и пакет
     # уходил человеку без единого замечания (skipped пуст, warnings пуст).
     result = package_with_rate_cell(repo, tmp_path, value, monkeypatch)
-    assert result.written == []
     (document, reason) = result.skipped[0]
     assert len(result.skipped) == 1 and document == DOC_ESTIMATE
-    assert "C17" in reason and "insurance" in reason and fragment in reason
+    assert RATE_CELL in reason and "insurance" in reason and fragment in reason
     assert "Errno" not in reason and "Traceback" not in reason
-    # и человек не остался с пустой папкой вместо файла и без объяснения
-    assert list((tmp_path / "out").iterdir()) == []
+    # снят со сборки только свой документ: остальные человек получает
+    assert [p.name for p in result.written] == [f"{DOC_KP}.docx"]
+    assert [p.name for p in (tmp_path / "out").iterdir()] == [f"{DOC_KP}.docx"]
 
 
 def test_a_sound_rate_cell_in_the_same_place_builds_and_warns_twice(
         repo, tmp_path, monkeypatch):
-    # обратная сторона того же теста: клетка цела -- документ собран, и сторож
-    # говорит оба предупреждения (итоги и сама ставка)
+    # обратная сторона того же теста: клетка цела -- собраны оба документа,
+    # и сторож говорит оба предупреждения (итоги и сама ставка)
     result = package_with_rate_cell(repo, tmp_path, 0.3, monkeypatch)
     assert result.skipped == []
-    assert [p.suffix for p in result.written] == [".xlsx"]
+    assert [p.suffix for p in result.written] == [".xlsx", ".docx"]
     assert [d for d, _ in result.warnings] == [DOC_ESTIMATE, DOC_ESTIMATE]
     totals, note = (plain(t) for _, t in result.warnings)
     assert "книга Excel посчитает итог без НДС 4 000 000,00" in totals
