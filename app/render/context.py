@@ -77,7 +77,7 @@ from app.models import (
     CustomerProfile, DocSpec, LotItem, Organization, TenderCostItem, TenderLaborRow,
 )
 from app.render.layouts import TableLayout, build_rows, load_layout
-from app.render.xlsx_render import RATE_FIELDS, load_cellmap, read_rates
+from app.render.xlsx_render import RATE_FIELDS, cell_paths, load_cellmap, read_rates
 from app.repo import Repo
 
 
@@ -495,6 +495,20 @@ _ESTIMATE_SOURCES = frozenset({"labor", "materials", "subcontract"})
 
 
 _ESTIMATE_SOURCE = "estimate"
+_CONDITIONS = "conditions."
+
+
+def required_conditions(cell_map) -> list[str]:
+    """Условия сделки, ответы на которые форма заказчика требует от участника,
+    в порядке клеток её карты.
+
+    Семь условий формы Роснефти лежат в её собственных клетках E23-E29, и
+    отвечает на них участник. Ключи -- дословные, с двоеточием на конце у
+    шестерых и без него у седьмого: угадывать их человек не должен, поэтому
+    список отдаётся экрану (ручка /api/tenders/<id>/conditions) и сборке,
+    которая называет все недостающие разом."""
+    return [path[len(_CONDITIONS):] for path in cell_paths(cell_map)
+            if path.startswith(_CONDITIONS)]
 
 
 class ContextError(Exception):
@@ -549,9 +563,11 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
 
     С `document`, у которого в профиле есть карта ячеек, может поднять
     `CellMapError`: карту не разобрать или ставку из клетки не прочитать.
-    С `document`, который печатает цену по позициям лота, может поднять
-    `ContextError`: позиций нет, и документ вышел бы на 0,00. Сборка пакета
-    превращает и то и другое в пропуск одного документа с причиной.
+    С `document` может поднять `ContextError`: нет позиций лота, а документ
+    печатает цену по ним (вышел бы на 0,00), или форма заказчика требует
+    ответов по условиям сделки, а их нет (тогда называются все недостающие
+    разом). Сборка пакета превращает и то и другое в пропуск одного документа
+    с причиной.
     Без `document` (экраны) карта не читается вовсе, и этих отказов быть
     не может.
 
@@ -596,6 +612,23 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
     cell_map = (load_cellmap(Path(config.CELLMAPS_DIR) / spec.cellmap)
                 if spec and spec.cellmap else None)
     items = _lot_rows(repo.list_lot_items(tender_id), rate)
+    conditions = dict(tender.deal_answers)
+    # Форма заказчика требует ответов по условиям сделки -- называем ВСЕ
+    # недостающие разом. По одному за попытку человек узнавал о втором только
+    # после того, как починил первое, и семь условий формы Роснефти стоили бы
+    # семи неудачных сборок. Умолчания нет: «подтверждаю», подставленное за
+    # человека, связало бы фирму условием, которого никто не читал, -- так же,
+    # как пустая обязательная клетка, это отказ, а не догадка.
+    if cell_map is not None:
+        missing = [name for name in required_conditions(cell_map)
+                   if not str(conditions.get(name, "")).strip()]
+        if missing:
+            raise ContextError(
+                f"Форма «{document}» требует ответов по условиям сделки, а в "
+                "тендере их нет: "
+                + ", ".join(f"«{name}»" for name in missing)
+                + ". Впишите ответы в таблицу «Ответы по условиям сделки» на "
+                "карточке тендера -- условия этой формы там уже перечислены.")
     # Документ, который печатает цену по позициям лота, без позиций напечатает
     # 0,00 -- и встанет в список «Записано» как ни в чём не бывало. Коммерческое
     # предложение на ноль рублей -- не документ: отказ, как у пустой обязательной
@@ -644,7 +677,7 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
         "assets": _table(layouts["assets"], repo.list_assets()),
         "experience": _table(layouts["experience"], selected),
         "declaration_text": profile.declaration_text if profile else "",
-        "conditions": dict(tender.deal_answers),
+        "conditions": conditions,
         "today": _today().strftime("%d.%m.%Y"),
         "money": money,
         "money_total": money_total,

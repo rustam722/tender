@@ -584,3 +584,33 @@ live('render: build screen -- no stale warning next to a fresh result, and a val
 process.on('exit', () => {
   if (process.env.TENDER_REPORT_REQUESTS) require('node:fs').writeSync(1, `REQUESTS_SENT=${requestsSent}\n`);
 });
+
+live('render: the tender card shows the conditions the customer form requires, not a promise', async () => {
+  const s = await seed('R9');
+  await withPage(async (page) => {
+    // список условий приходит с сервера; здесь он подменён, чтобы проверялась
+    // отрисовка, а не наполнение профиля заказчика
+    page.tweaks.push({ match: isGet(/\/conditions$/), edit: () => ({
+      rows: [
+        { condition: 'Цена и условия:', answer: 'по прилагаемой калькуляции', documents: ['ТКП по форме заказчика'] },
+        { condition: 'Возможность привлечения субподрядчиков/субисполнителей', answer: '', documents: ['ТКП по форме заказчика'] },
+      ],
+      warnings: ['Условия документа «Справка о МТР» прочитать не удалось: карта ячеек испорчена.'],
+    }) });
+    await page.goto(`#/tender/${s.tender.id}`);
+    const text = page.text();
+    assertClean(text, 'условия сделки');
+    assert.ok(text.includes('ТКП по форме заказчика'), 'не названа форма, которая требует условий');
+    assert.ok(text.includes('прочитать не удалось'), 'карта, которую не разобрать, спрятана от человека');
+    assert.ok(!text.includes('остаётся «подтверждаю»'), 'на экране осталось обещание умолчания');
+    // ключи стоят в полях ввода: человек их ВИДИТ и правит, а не угадывает
+    // дословно -- включая седьмое условие, у которого нет двоеточия на конце
+    const keys = page.all((e) => e.tagName === 'INPUT' && e.attributes['aria-label'] === 'Условие');
+    assert.deepEqual(keys.map((e) => e.value),
+      ['Цена и условия:', 'Возможность привлечения субподрядчиков/субисполнителей'],
+      'условия формы на экране не те, что прислал сервер');
+    const answers = page.all((e) => e.tagName === 'INPUT' && e.attributes['aria-label'] === 'Ответ');
+    assert.equal(answers[0].value, 'по прилагаемой калькуляции', 'нынешний ответ не подставлен');
+    assert.equal(answers[1].value, '', 'ответ за человека не придуман');
+  });
+});

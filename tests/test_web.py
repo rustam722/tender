@@ -8,6 +8,7 @@
 import json
 import logging
 import re
+import shutil
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -1745,3 +1746,94 @@ def test_put_labor_after_a_failed_view_is_success_with_a_warning(client, monkeyp
     assert "секрет" not in response.get_data(as_text=True)
     monkeypatch.undo()
     assert len(ok(client.get(f"/api/tenders/{tid}/labor"))["rows"]) == 1      # без дубля
+
+
+# ---- условия сделки: человек не угадывает ключ, а видит его ----------------------
+
+ROSNEFT_CELLMAP = BASE_DIR / "cellmaps" / "tkp_rosneft_murmansk.json"
+TKP = "ТКП по форме заказчика"
+
+
+def tender_with_rosneft_form(client, cellmaps, deal_answers=None):
+    """Тендер, у заказчика которого назначена форма ТКП Роснефти с её картой."""
+    shutil.copy(ROSNEFT_CELLMAP, cellmaps)
+    me = create(client, "organizations", role="participant",
+                short_name="ООО «Техносфера»", inn="5904188041")
+    customer = create(client, "organizations", role="customer",
+                      short_name="АО «НК «Роснефть»", inn="7706107510")
+    create(client, "profiles", customer_id=customer["id"], documents=[TKP],
+           docs={TKP: {"template": "форма.xlsx",
+                       "cellmap": ROSNEFT_CELLMAP.name}})
+    return create(client, "tenders", customer_id=customer["id"],
+                  participant_id=me["id"], subject="Разработка КЭР",
+                  deal_answers=deal_answers or {})
+
+
+def test_conditions_of_the_customers_form_come_from_the_server(client, dirs):
+    # Семь условий формы Роснефти с дословными ключами: у шестерых двоеточие
+    # на конце, у седьмого нет. На экране их не было вовсе, и человек должен
+    # был угадывать их наизусть, чтобы собрать самый дорогой документ пакета.
+    _, cellmaps = dirs
+    tender = tender_with_rosneft_form(
+        client, cellmaps, {"Срок действия договора:": "12 месяцев"})
+    body = ok(client.get(f"/api/tenders/{tender['id']}/conditions"))
+    assert body["warnings"] == []
+    keys = [row["condition"] for row in body["rows"]]
+    assert keys == ["Цена и условия:", "Форма, срок и порядок оплаты:",
+                    "Условия и место оказания услуг:", "Срок оказания услуг:",
+                    "Срок действия коммерческого предложения:",
+                    "Срок действия договора:",
+                    "Возможность привлечения субподрядчиков/субисполнителей"]
+    answered = [row for row in body["rows"]
+                if row["condition"] == "Срок действия договора:"]
+    assert answered[0]["answer"] == "12 месяцев"
+    assert answered[0]["documents"] == [TKP]
+    # у остальных ответа нет -- пустая строка, а не придуманное «подтверждаю»
+    assert [row["answer"] for row in body["rows"]].count("") == 6
+
+
+def test_conditions_are_empty_for_a_customer_without_a_form(client, dirs):
+    tender = make_tender(client)
+    body = ok(client.get(f"/api/tenders/{tender['id']}/conditions"))
+    assert body == {"rows": [], "warnings": []}
+
+
+def test_a_broken_cellmap_is_named_in_the_conditions_not_hidden(client, dirs):
+    # сторож, который молча выключается, хуже отсутствующего: список без одной
+    # формы выглядел бы полным
+    _, cellmaps = dirs
+    tender = tender_with_rosneft_form(client, cellmaps)
+    (cellmaps / ROSNEFT_CELLMAP.name).write_text(
+        '{"sheet": "Лист1", "cells": {"нет такого адреса": "x"}}',
+        encoding="utf-8")
+    body = ok(client.get(f"/api/tenders/{tender['id']}/conditions"))
+    assert body["rows"] == []
+    (warning,) = body["warnings"]
+    assert TKP in warning and "нет такого адреса" in warning
+
+
+def test_the_build_names_every_missing_condition_at_once(client, dirs, tmp_path):
+    # Раньше отказ приходил по одному условию за попытку: человек узнавал
+    # о втором только после того, как починил первое, и семь условий формы
+    # стоили бы семи неудачных сборок.
+    templates, cellmaps = dirs
+    shutil.copy(BASE_DIR / "tests" / "fixtures" / "forma_tkp_rosneft_murmansk.xlsx",
+                templates / "форма.xlsx")
+    tender = tender_with_rosneft_form(
+        client, cellmaps, {"Цена и условия:": "по прилагаемой калькуляции"})
+    create(client, f"tenders/{tender['id']}/items", name="Разработка КЭР",
+           price="100000")
+    body = ok(client.post(f"/api/tenders/{tender['id']}/build", json={
+        "documents": [TKP], "output_dir": str(tmp_path / "out")}))
+    assert body["written"] == []
+    (skip,) = body["skipped"]
+    assert skip["document"] == TKP
+    for missing in ("Форма, срок и порядок оплаты:",
+                    "Условия и место оказания услуг:", "Срок оказания услуг:",
+                    "Срок действия коммерческого предложения:",
+                    "Срок действия договора:",
+                    "Возможность привлечения субподрядчиков/субисполнителей"):
+        assert f"«{missing}»" in skip["reason"], missing
+    # на отвеченное условие не жалуемся
+    assert "«Цена и условия:»" not in skip["reason"]
+    assert "условиям сделки" in skip["reason"]

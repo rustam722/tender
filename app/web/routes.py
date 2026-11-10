@@ -26,6 +26,8 @@ JSON, кроме главной страницы; все отказы -- {"error
     GET/POST/DELETE /api/tenders/<id>/items|labor|costs[/<row_id>]
                                             позиции лота, трудозатраты, материалы и
                                             субподряд (costs?kind=materials|subcontract)
+    GET    /api/tenders/<id>/conditions    условия сделки, которых требуют формы
+                                            заказчика, с нынешними ответами
     GET    /api/inn/<inn>                   черновик карточки и предупреждения
     POST   /api/tenders/<id>/estimate       прямой счёт по сохранённым строкам
     POST   /api/tenders/<id>/solve          подбор часов под цену без НДС (не сохраняет)
@@ -46,11 +48,14 @@ from urllib.parse import urlsplit
 
 from flask import current_app, g, jsonify, render_template, request
 
-from app import db
+from app import config, db
 from app.calc import Estimate, LaborLine, estimate, money_total, price_gap, solve_hours
 from app.inn.lookup import build_draft
-from app.render.context import DOCUMENTS, build_context, labor_rows, money
+from app.render.context import (
+    DOCUMENTS, build_context, labor_rows, money, required_conditions,
+)
 from app.render.package import build_package, planned_files
+from app.render.xlsx_render import CellMapError, load_cellmap
 from app.repo import Repo
 from app.web import errors, schema
 from app.web.errors import ApiError
@@ -381,6 +386,43 @@ def _package_request(tender_id: int, data: dict):
     return repo, documents, out_dir, overwrite, experience_ids
 
 
+def _conditions(tender_id: int):
+    """Условия сделки, ответы на которые требуют формы заказчика этого тендера.
+
+    Семь условий формы Роснефти лежат в её собственных клетках, ключи дословные
+    (у шестерых двоеточие на конце, у седьмого нет), и угадывать их человек не
+    должен: экран показывает список готовым, с нынешними ответами. Умолчания
+    нет -- без ответа документ не собирается, и об этом говорит сборка.
+
+    Карту, которую не разобрать, не проглатываем: она попадает в `warnings`
+    фразой по-русски. Сборка этого документа всё равно отказала бы, и молчать
+    здесь значило бы показать человеку список без одной формы.
+    """
+    repo = get_repo()
+    tender = _tender(tender_id)
+    profile = (repo.find_customer_profile(tender.customer_id)
+               if tender.customer_id is not None else None)
+    answers = tender.deal_answers
+    rows: dict[str, list[str]] = {}         # условие -> документы, что его требуют
+    warnings: list[str] = []
+    for document, spec in (profile.docs.items() if profile else ()):
+        if not spec.cellmap:
+            continue
+        try:
+            cell_map = load_cellmap(config.CELLMAPS_DIR / spec.cellmap)
+        except CellMapError as exc:
+            warnings.append(
+                f"Условия документа «{document}» прочитать не удалось: {exc}")
+            continue
+        for name in required_conditions(cell_map):
+            rows.setdefault(name, []).append(document)
+    return jsonify({
+        "rows": [{"condition": name, "answer": answers.get(name, ""),
+                  "documents": documents}
+                 for name, documents in rows.items()],
+        "warnings": warnings})
+
+
 def _plan(tender_id: int):
     repo, documents, out_dir, _, _ = _package_request(tender_id, json_body())
     files = planned_files(tender_id, documents, out_dir, repo)
@@ -628,6 +670,8 @@ def register(app) -> None:
         app.add_url_rule(f"{base}/<int:row_id>", f"{ent.path}_delete", deleting,
                          methods=["DELETE"])
 
+    app.add_url_rule("/api/tenders/<int:tender_id>/conditions", "conditions",
+                     _conditions, methods=["GET"])
     for name, view in (("estimate", _estimate), ("solve", _solve), ("plan", _plan),
                        ("build", _build)):
         app.add_url_rule(f"/api/tenders/<int:tender_id>/{name}", name, view, methods=["POST"])

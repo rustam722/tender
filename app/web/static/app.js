@@ -950,7 +950,29 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
     /* Экран «Карточка тендера»                                             */
     /* ================================================================== */
 
-    const TENDER_FIELDS = (lookups) => [
+    /* Условия сделки: список приходит с сервера -- его требуют формы заказчика
+     * (клетки E23-E29 формы Роснефти). Ключ человек ВИДИТ, а не угадывает
+     * дословно: сперва требуемые условия в порядке формы, с нынешними ответами,
+     * затем ответы, которых форма не просит. Умолчания нет: «подтверждаю»,
+     * подставленное за человека, связало бы фирму условием, которого никто
+     * не читал, -- без ответа документ не собирается, и об этом говорит сборка. */
+    function conditionPairs(deal, record) {
+      const answers = record.deal_answers || {};
+      const required = (deal.rows || []).map((row) => [row.condition, str(row.answer)]);
+      const names = new Set(required.map(([name]) => name));
+      return [...required, ...Object.entries(answers).filter(([name]) => !names.has(name))];
+    }
+
+    function conditionsHint(deal) {
+      const rows = deal.rows || [];
+      const forms = [...new Set(rows.flatMap((row) => row.documents || []))].join(', ');
+      const head = rows.length
+        ? `Эти условия требует форма заказчика (${forms}): без ответа документ не соберётся. Умолчания нет — ответ за вас никто не подставит.`
+        : 'Формы с условиями сделки у заказчика этого тендера не назначено. Строки можно добавить вручную: их ждут формы вроде Роснефти.';
+      return [head, ...(deal.warnings || [])].join(' ');
+    }
+
+    const TENDER_FIELDS = (lookups, deal) => [
       { group: 'Заказчик и участник' },
       { key: 'customer_id', label: 'Заказчик', kind: 'select', ref: 'customers',
         hint: 'Нет в справочнике? Заведите его по ИНН на экране «Справочники».' },
@@ -977,7 +999,8 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       { key: 'doc_date', label: 'Дата документов', kind: 'date' },
       { custom: (ctx) => pairsEditor({ key: 'deal_answers', label: 'Ответы по условиям сделки (формы вроде Роснефти)',
         left: 'Условие', right: 'Ответ', record: ctx.record,
-        hint: 'Для условий, которых здесь нет, в форме остаётся «подтверждаю».', addText: 'Добавить условие' }) },
+        pairs: conditionPairs(deal, ctx.record),
+        hint: conditionsHint(deal), addText: 'Добавить условие' }) },
     ];
 
     /* Таблица строк тендера (позиции лота, трудозатраты, материалы, субподряд).
@@ -1154,12 +1177,14 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       const [employees] = await Promise.all([api('GET', '/api/employees')]);
       const base = tender ? `/api/tenders/${tender.id}` : '';
       const record = tender || {};
+      /* условия, которых требуют формы заказчика: ключи человек видит готовыми */
+      const deal = tender ? await api('GET', `${base}/conditions`) : { rows: [], warnings: [] };
 
       /* -- шапка -- */
       const headMsg = notice();
       let headDirty = false;
       const dirtyTag = h('span', { class: 'state-tag', text: 'есть несохранённые изменения', hidden: true });
-      const form = buildForm(TENDER_FIELDS(lookups), record, lookups, () => { headDirty = true; dirtyTag.hidden = false; });
+      const form = buildForm(TENDER_FIELDS(lookups, deal), record, lookups, () => { headDirty = true; dirtyTag.hidden = false; });
       ctx.dirty.push(() => headDirty);
       const saveHead = h('button', { type: 'button', class: 'primary', text: isNew ? 'Создать тендер' : 'Сохранить тендер' });
       saveHead.addEventListener('click', async () => {
