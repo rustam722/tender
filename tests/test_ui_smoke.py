@@ -383,19 +383,129 @@ def test_every_visible_string_is_russian():
     assert not english, english
 
 
+def _skip_template(code: str, i: int) -> int:
+    """Индекс сразу за шаблонной строкой, начинающейся на i: с учётом подстановок,
+    вложенных шаблонных строк и обычных строк внутри них."""
+    i += 1
+    while i < len(code):
+        ch = code[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "`":
+            return i + 1
+        if ch == "$" and code[i + 1:i + 2] == "{":
+            depth = 1
+            i += 2
+            while i < len(code) and depth:
+                inner = code[i]
+                if inner in "'\"":
+                    i = _skip_quoted(code, i)
+                    continue
+                if inner == "`":
+                    i = _skip_template(code, i)
+                    continue
+                if inner == "{":
+                    depth += 1
+                elif inner == "}":
+                    depth -= 1
+                i += 1
+            continue
+        i += 1
+    return i
+
+
+def _call_args(code: str, open_paren: int) -> list:
+    """Аргументы вызова, чья открывающая скобка стоит на open_paren: по куску
+    исходного текста на аргумент, со счётом скобок и без заглядывания в строки."""
+    args = []
+    depth = 0
+    start = open_paren + 1
+    i = open_paren
+    while i < len(code):
+        ch = code[i]
+        if ch in "'\"":
+            i = _skip_quoted(code, i)
+            continue
+        if ch == "`":
+            i = _skip_template(code, i)
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append(code[start:i])
+                return args
+        elif ch == "," and depth == 1:
+            args.append(code[start:i])
+            start = i + 1
+        i += 1
+    return args
+
+
+def _open_literals(fragment: str) -> list:
+    """Литералы фрагмента, не спрятанные внутрь вызова или объекта:
+    `isNew ? 'Новый тендер' : 'Шапка тендера'` даёт оба (человек увидит любой),
+    а `h('span', { class: 'sub', text: r.sub })` -- ни одного: там имя тега и
+    название класса, а не текст для человека."""
+    out = []
+    depth = 0
+    i = 0
+    while i < len(fragment):
+        ch = fragment[i]
+        if ch in "'\"`":
+            end = _skip_template(fragment, i) if ch == "`" else _skip_quoted(fragment, i)
+            if depth == 0:
+                out.append(fragment[i + 1:end - 1])
+            i = end
+            continue
+        if ch in "({":
+            depth += 1
+        elif ch in ")}":
+            depth -= 1
+        i += 1
+    return out
+
+
+def _child_literals(code: str) -> list:
+    """Литералы, которые уходят человеку ДЕТЬМИ, а не через `text:`.
+    `h('h2', {}, 'Настройки калькуляции ', tag)` печатает ровно так же, как
+    `text:`, и такой литерал обязан быть русским. Разбор по месту вызова: у `h(`
+    дети начинаются с третьего аргумента (тег и атрибуты -- не текст), у
+    `append(` и `replaceChildren(` -- с первого."""
+    out = []
+    for match in re.finditer(r"(?:\bh|\.append|\.replaceChildren)\s*\(", code):
+        args = _call_args(code, match.end() - 1)
+        for arg in args[2 if match.group(0).startswith("h") else 0:]:
+            out.extend(_open_literals(arg))
+    return out
+
+
 def test_every_literal_text_shown_to_the_user_is_russian():
     """Строже общей проверки выше: любой литерал, который уходит человеку --
     `text: '…'`, `textContent = '…'`, `.show('вид', '…')`, `title:`, `message:`,
-    `placeholder:`, `ok:`/`cancel:` -- содержит кириллицу или вовсе не содержит
-    латинских букв. Односложное «Save» и `text: 'OK'` здесь не проходят."""
+    `placeholder:`, `ok:`/`cancel:`, `'aria-label':` и литерал, переданный ДЕТЯМИ
+    в `h(…)`/`append(…)` -- содержит кириллицу или вовсе не содержит латинских
+    букв. Односложное «Save» и `text: 'OK'` здесь не проходят, и в `aria-label`
+    тоже: программа экранного доступа читает человеку то же самое."""
     code = _code_without_comments()
     shown = []
     patterns = (r"\b(?:text|title|message|placeholder|ok|cancel)\s*[:=]\s*(?:'((?:\\.|[^'\\\n])*)'|\"((?:\\.|[^\"\\\n])*)\"|`((?:\\.|[^`\\])*)`)",
+                r"['\"]aria-label['\"]\s*:\s*(?:'((?:\\.|[^'\\\n])*)'|\"((?:\\.|[^\"\\\n])*)\"|`((?:\\.|[^`\\])*)`)",
                 r"\.show\(\s*'[a-z]+'\s*,\s*(?:'((?:\\.|[^'\\\n])*)'|`((?:\\.|[^`\\])*)`)")
     for pattern in patterns:
         for match in re.finditer(pattern, code):
             shown.extend(g for g in match.groups() if g is not None)
-    assert len(shown) > 80, f"проверка не нашла тексты ({len(shown)}): шаблон устарел"
+    labels = len(shown)
+    children = _child_literals(code)
+    shown.extend(children)
+    assert labels > 80, f"проверка не нашла подписи ({labels}): шаблон устарел"
+    # разбор детей обязан доходить до тех мест, ради которых он написан
+    assert len(children) >= 12, f"проверка не нашла дочерние литералы ({len(children)}): разбор устарел"
+    for anchor in ('Цена без НДС', 'Папка: ', 'Шапка тендера', 'Все организации'):
+        assert anchor in children, f"разбор дочерних литералов не дошёл до «{anchor}»"
+    assert 'Показать' in shown, "подписи aria-label до проверки не доходят"
     english = []
     for literal in shown:
         literal = re.sub(r"\$\{[^}]*\}", " ", literal)

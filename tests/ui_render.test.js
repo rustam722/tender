@@ -185,6 +185,25 @@ function loadPage() {
   return page;
 }
 
+/* Прочерк утверждается в ЗНАЧЕНИИ, а не в строке целиком: подпись и значение --
+ * разные узлы, и `includes('—')` на всей строке зелен и тогда, когда прочерк
+ * попал в подпись, а значение просто пусто. Ровно это и нужно различать. */
+function totalsOf(within) {
+  return within.all((e) => e.className === 'totals').map((line) => ({
+    text: line.textContent,
+    values: line.all((e) => e.tagName === 'STRONG').map((v) => v.textContent),
+  }));
+}
+
+function assertDashes(lines, where) {
+  assert.ok(lines.length, `нет итоговых строк (${where})`);
+  for (const line of lines) {
+    assert.ok(line.values.length, `в итоговой строке нет значения (${where}): ${line.text}`);
+    assert.deepEqual([...new Set(line.values)], [DASH], `значение итога -- не прочерк (${where}): ${line.text}`);
+    assert.match(line.text, /[А-Яа-я].*:/, `итог без подписи -- не отличить от пустой клетки (${where}): ${line.text}`);
+  }
+}
+
 function assertClean(text, where) {
   for (const bad of ['undefined', 'null', 'NaN', '[object']) {
     assert.ok(!text.includes(bad), `«${bad}» на экране (${where}): ${text.slice(Math.max(0, text.indexOf(bad) - 80), text.indexOf(bad) + 80)}`);
@@ -258,14 +277,26 @@ live('render: the tender screen survives answers WITHOUT totals, vat percent and
     page.tweaks.push({ match: isPost(/\/estimate$/), edit: (d) => { delete d.vat_percent; delete d.estimate.vat; delete d.estimate.total_with_vat; return d; } });
     await page.goto(`#/tender/${s.tender.id}`);
     assertClean(page.text(), 'тендер без итогов');
-    const totals = page.all((e) => e.className === 'totals');
+    const totals = totalsOf(page.world.screen);
     assert.equal(totals.length, 4);
-    for (const line of totals) assert.ok(line.textContent.includes(DASH), `в итоговой строке нет прочерка: ${line.textContent}`);
+    assertDashes(totals, 'тендер без итогов');
     const amounts = page.all((e) => e.className.includes('computed'));
-    assert.ok(amounts.length >= 4 && amounts.every((c) => c.textContent === DASH), 'суммы строк без данных -- прочерк, не выдумка');
+    assert.ok(amounts.length >= 6, `клеток сумм строк мало: ${amounts.length}`);
+    for (const cell of amounts) {
+      assert.equal(cell.textContent, DASH, 'сумма строки без данных -- прочерк, не выдумка');
+      assert.ok(cell.className.includes('missing'), 'клетка с прочерком помечена как «значения нет»');
+    }
+    // расчёт: чего сервер не прислал -- прочерк, что прислал -- напечатано как есть
     const estimateRows = page.all((e) => e.tagName === 'TR' && e.parentNode.tagName === 'TBODY' && e.parentNode.parentNode.className === 'estimate-table');
     assert.equal(estimateRows.length, 9);
-    assert.ok(estimateRows.every((tr) => tr.children[1].textContent.trim() !== ''), 'пустая ячейка расчёта вместо прочерка');
+    const cells = new Map(estimateRows.map((tr) => [tr.children[0].textContent, tr.children[1].textContent]));
+    const full = await call('POST', `${s.base}/estimate`, {});
+    assert.equal(cells.get('НДС'), DASH, 'НДС, которого в ответе нет, -- прочерк, а не пустая клетка');
+    assert.equal(cells.get('Итого с НДС'), DASH, 'итог с НДС без данных -- прочерк');
+    assert.equal(cells.get('Итого без НДС'), full.estimate.total_wo_vat, 'присланный итог напечатан как есть');
+    assert.equal(cells.get('Оплата труда (ФОТ)'), full.estimate.labor);
+    assert.equal(cells.get('Страховые взносы'), full.estimate.insurance);
+    for (const [label, value] of cells) assert.ok(value.trim() !== '', `пустая клетка расчёта «${label}» вместо прочерка`);
   });
 });
 
@@ -282,8 +313,10 @@ live('render: saving a labor row answered with a warning keeps what arrived, sho
     const sent = page.log.slice(before);
     assert.deepEqual(sent.map((c) => `${c.method} ${c.url}`), [`POST ${s.base}/labor`], 'ровно одна отправка, без перезапроса и без повторной записи');
     assert.ok(page.text().includes(WARNING));
-    assert.ok(labor.textContent.includes(`ФОТ): ${DASH}`) || labor.textContent.includes(DASH), 'итог под таблицей -- прочерк');
-    assert.equal(page.rows(labor)[0].all((e) => e.className.includes('computed'))[0].textContent, DASH);
+    assertDashes(totalsOf(labor), 'трудозатраты после предупреждения');
+    const computed = page.rows(labor)[0].all((e) => e.className.includes('computed'))[0];
+    assert.equal(computed.textContent, DASH);
+    assert.ok(computed.className.includes('missing'), 'клетка с прочерком помечена как «значения нет»');
     assertClean(page.text(), 'после предупреждения');
     // в базе строка одна, а не две
     assert.equal((await call('GET', `${s.base}/labor`)).rows.length, 2);
@@ -310,7 +343,7 @@ live('render: pasted list answered with a warning (no totals) is shown, and sent
     assert.ok(page.text().includes(WARNING));
     assertClean(page.text(), 'после вставки с предупреждением');
     assert.equal(page.rows(lot).filter((tr) => tr.all((e) => e.tagName === 'INPUT').length === 2).length >= 3, true);
-    assert.ok(lot.all((e) => e.className === 'totals')[0].textContent.includes(DASH));
+    assertDashes(totalsOf(lot), 'лот после вставки с предупреждением');
   });
 });
 
@@ -432,26 +465,32 @@ live('render: leaving the build screen mid-build and coming back keeps the butto
   await withPage(async (page) => {
     await page.goto(`#/build/${s.tender.id}`);
     page.type(page.input('Папка для пакета'), out);
-    let release;
-    page.gates.push({ match: (url) => url.endsWith('/plan'), promise: new Promise((resolve) => { release = resolve; }) });
-    page.button('Собрать пакет').click();                 // сборка идёт: ждёт ответа plan
-    assert.equal(page.button('Идёт сборка… не закрывайте страницу').disabled, true);
+    // снятие замка -- в finally: регресс замка роняет не это утверждение, а всю
+    // проверку по таймауту (около 120 секунд), и о причине падения не говорит
+    let release = () => {};
+    try {
+      page.gates.push({ match: (url) => url.endsWith('/plan'), promise: new Promise((resolve) => { release = resolve; }) });
+      page.button('Собрать пакет').click();                 // сборка идёт: ждёт ответа plan
+      assert.equal(page.button('Идёт сборка… не закрывайте страницу').disabled, true);
 
-    await page.goto(`#/tender/${s.tender.id}`);           // ушли на «Карточку тендера»
-    await page.goto(`#/build/${s.tender.id}`);            // и вернулись: экран собран заново
-    const again = page.button('Идёт сборка… не закрывайте страницу');
-    assert.equal(again.disabled, true, 'после возврата сборка всё ещё идёт, кнопка заблокирована');
-    assert.equal(page.input('Папка для пакета').value, out, 'поле папки восстановлено из идущей сборки, а не пусто');
-    const plansBefore = page.log.filter((c) => c.url.endsWith('/plan')).length;
-    again.click();                                        // даже «силой» вторую не запустить
-    await sleep(30);
-    assert.equal(page.log.filter((c) => c.url.endsWith('/plan')).length, plansBefore);
+      await page.goto(`#/tender/${s.tender.id}`);           // ушли на «Карточку тендера»
+      await page.goto(`#/build/${s.tender.id}`);            // и вернулись: экран собран заново
+      const again = page.button('Идёт сборка… не закрывайте страницу');
+      assert.equal(again.disabled, true, 'после возврата сборка всё ещё идёт, кнопка заблокирована');
+      assert.equal(page.input('Папка для пакета').value, out, 'поле папки восстановлено из идущей сборки, а не пусто');
+      const plansBefore = page.log.filter((c) => c.url.endsWith('/plan')).length;
+      again.click();                                        // даже «силой» вторую не запустить
+      await sleep(30);
+      assert.equal(page.log.filter((c) => c.url.endsWith('/plan')).length, plansBefore);
 
-    release();
-    await page.idle();
-    assert.ok(page.text().includes('Справка о МТР.docx'), 'результат первой сборки виден на новом экране');
-    assert.equal(page.button('Собрать пакет').disabled, false);
-    assert.equal(page.log.filter((c) => c.url.endsWith('/build')).length, 1, 'сборка была одна');
+      release();
+      await page.idle();
+      assert.ok(page.text().includes('Справка о МТР.docx'), 'результат первой сборки виден на новом экране');
+      assert.equal(page.button('Собрать пакет').disabled, false);
+      assert.equal(page.log.filter((c) => c.url.endsWith('/build')).length, 1, 'сборка была одна');
+    } finally {
+      release();
+    }
   });
 });
 
@@ -461,15 +500,84 @@ live('render: a finished build is shown when the user returns to the screen late
   await withPage(async (page) => {
     await page.goto(`#/build/${s.tender.id}`);
     page.type(page.input('Папка для пакета'), out);
-    let release;
-    page.gates.push({ match: (url) => url.endsWith('/plan'), promise: new Promise((resolve) => { release = resolve; }) });
-    page.button('Собрать пакет').click();
-    await page.goto(`#/refs/organizations`);              // ушли совсем
-    release();
-    await page.idle();
+    let release = () => {};
+    try {
+      page.gates.push({ match: (url) => url.endsWith('/plan'), promise: new Promise((resolve) => { release = resolve; }) });
+      page.button('Собрать пакет').click();
+      await page.goto(`#/refs/organizations`);              // ушли совсем
+      release();
+      await page.idle();
+      await page.goto(`#/build/${s.tender.id}`);
+      assert.ok(page.text().includes('Справка о МТР.docx'), 'результат дождался возвращения пользователя');
+      assert.equal(page.button('Собрать пакет').disabled, false);
+    } finally {
+      release();
+    }
+  });
+});
+
+live('render: two overlapping renders of one build screen -- the live screen keeps the button and gets the result', async () => {
+  const s = await seed('R9');
+  const out = path.join(OUT_DIR, 'render-R9');
+  await withPage(async (page) => {
+    let release = () => {};
+    try {
+      // первая отрисовка экрана сборки застревает на списке документов и доходит
+      // до конца ПОЗЖЕ третьей: подключиться к реестру сборок она не должна
+      let seen = 0;
+      page.gates.push({ match: (url, method) => method === 'GET' && url.endsWith('/api/documents') && (seen += 1) === 1,
+        promise: new Promise((resolve) => { release = resolve; }) });
+      page.world.location.hash = `#/build/${s.tender.id}`;
+      await sleep(40);
+      page.world.location.hash = `#/tender/${s.tender.id}`;
+      await sleep(40);
+      await page.goto(`#/build/${s.tender.id}`);            // живой экран -- этот
+      release();
+      await page.idle();                                    // и теперь дошла первая
+
+      page.type(page.input('Папка для пакета'), out);
+      const build = page.button('Собрать пакет');
+      await page.press(build);
+      assert.ok(page.text().includes('Справка о МТР.docx'),
+        'результат нарисован на живом экране, а не в отсоединённом от страницы');
+      assert.equal(page.button('Собрать пакет').disabled, false,
+        'кнопка живого экрана разблокирована, а не ждёт перехода туда и обратно');
+    } finally {
+      release();
+    }
+  });
+});
+
+live('render: build screen -- no stale warning next to a fresh result, and a validation refusal is not replayed', async () => {
+  const s = await seed('R10');
+  const out = path.join(OUT_DIR, 'render-R10');
+  await withPage(async (page) => {
     await page.goto(`#/build/${s.tender.id}`);
-    assert.ok(page.text().includes('Справка о МТР.docx'), 'результат дождался возвращения пользователя');
-    assert.equal(page.button('Собрать пакет').disabled, false);
+    await page.press(page.button('Собрать пакет'));        // папка не заполнена
+    assert.ok(page.text().includes('Укажите папку'), 'отказ назван словами');
+
+    await page.goto(`#/tender/${s.tender.id}`);
+    await page.goto(`#/build/${s.tender.id}`);
+    assert.ok(!page.text().includes('Укажите папку'),
+      'отказ валидации при возврате не переигрывается: человек видел бы жалобу на то, что уже исправил');
+
+    page.type(page.input('Папка для пакета'), out);
+    let release = () => {};
+    try {
+      page.gates.push({ match: (url) => url.endsWith('/plan'), promise: new Promise((resolve) => { release = resolve; }) });
+      page.button('Собрать пакет').click();
+      await sleep(30);
+      page.button('Идёт сборка… не закрывайте страницу').click();   // второй щелчок «силой»
+      await sleep(30);
+      assert.ok(page.text().includes('уже идёт'), 'второй щелчок объяснён предупреждением');
+      release();
+      await page.idle();
+      assert.ok(page.text().includes('Справка о МТР.docx'), 'результат нарисован');
+      assert.ok(!page.text().includes('уже идёт'),
+        'предупреждение прошлого действия не висит рядом со свежим результатом');
+    } finally {
+      release();
+    }
   });
 });
 

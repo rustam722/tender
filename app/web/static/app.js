@@ -194,7 +194,10 @@ function createBuildRegistry() {
       const key = folderKey(folder);
       const index = active.findIndex((entry) => entry.folder === key && same(entry.tenderId, tenderId));
       if (index >= 0) active.splice(index, 1);
-      if (outcome && (outcome.status === 'built' || outcome.status === 'failed')) finished.set(String(tenderId), outcome);
+      /* Помним то, что стоит показать вернувшемуся человеку: собранный пакет и
+       * отказ сервера. Отказ валидации приходит с remember: false -- см. attempt. */
+      if (outcome && outcome.remember !== false
+          && (outcome.status === 'built' || outcome.status === 'failed')) finished.set(String(tenderId), outcome);
       tell(tenderId);
       if (outcome && view && same(view.tenderId, tenderId)) view.show(outcome);
     },
@@ -216,11 +219,14 @@ function createBuilder({ api: call, confirmReplace, registry = buildRegistry }) 
   async function attempt(request) {
     const { tenderId, documents, experienceIds } = request;
     const outputDir = String(request.outputDir || '').trim();
+    /* remember: false -- отказ, который человек исправляет тут же, не доходя до
+     * сервера. Такой отказ реестр не запоминает: переигрывать его при возврате
+     * на экран значит жаловаться на уже исправленное. */
     if (!documents.length) {
-      return { status: 'failed', error: 'Отметьте хотя бы один документ пакета.' };
+      return { status: 'failed', error: 'Отметьте хотя бы один документ пакета.', remember: false };
     }
     if (!outputDir) {
-      return { status: 'failed', error: 'Укажите папку, в которую собирать пакет.' };
+      return { status: 'failed', error: 'Укажите папку, в которую собирать пакет.', remember: false };
     }
     const base = `/api/tenders/${tenderId}`;
     const body = { documents, output_dir: outputDir, experience_ids: experienceIds };
@@ -364,6 +370,12 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
 
     let active = { token: 0, dirty: [] };
     let renderToken = 0;
+    /* Экран жив, пока его отрисовка -- последняя. Две отрисовки одного экрана
+     * накладываются (быстрый переход туда и обратно, пока первая ждёт сервер), и
+     * старшая не должна подключаться к реестру сборок: результат ушёл бы в
+     * отсоединённый DOM, а кнопка на живом экране осталась бы заблокированной
+     * до следующего перехода. */
+    const isCurrentRender = (ctx) => ctx.token === renderToken;
     let shownHash = location.hash;
     let revertingHash = false;
 
@@ -1604,6 +1616,8 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         if (busy) { msg.clear(); resultBox.replaceChildren(); }
       }
       function showOutcome(outcome) {
+        msg.clear();              // предупреждение прошлого действия не висит рядом со свежим результатом
+        resultBox.replaceChildren();
         if (outcome.status === 'failed') msg.show('error', outcome.error);
         else if (outcome.status === 'cancelled') msg.show('warning', 'Сборка отменена: файлы в папке не тронуты.');
         else if (outcome.status === 'built') drawResult(outcome);
@@ -1642,7 +1656,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
           h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Папка, в которую собрать пакет' }), folder,
             h('span', { class: 'hint', text: 'Полный путь на этом компьютере, например C:\\Тендеры\\Коряжма. Браузер не умеет выбирать папку, поэтому путь вводится текстом (его можно скопировать из проводника). Папка запоминается в тендере после первой сборки.' })),
           h('div', { class: 'actions' }, buildButton), msg.el, resultBox)));
-      buildRegistry.attach(tender.id, { setBusy, show: showOutcome });
+      if (isCurrentRender(ctx)) buildRegistry.attach(tender.id, { setBusy, show: showOutcome });
     }
 
     /* ---- запуск ---- */

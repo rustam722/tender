@@ -347,6 +347,25 @@ test('build lock outlives the screen: leaving the build screen and coming back d
   assert.deepEqual(reopened.busy, [false]);
 });
 
+test('build lock: a refusal the user fixes on the spot is not replayed, a refusal from the server is', async () => {
+  const registry = app.createBuildRegistry();
+  const one = builderWith(buildRoutes([]), { registry });
+  assert.equal((await one.builder.run({ ...REQUEST, outputDir: '  ' })).status, 'failed');
+  registry.detach();                                       // пользователь ушёл с экрана
+  const again = [];
+  registry.attach(7, { setBusy: () => {}, show: (outcome) => again.push(outcome) });
+  assert.deepEqual(again, [], 'отказ валидации при возврате не переигрывается: его человек правит тут же');
+
+  // отказ сервера -- другое дело: сам он не исправится, и вернувшийся должен его увидеть
+  const two = builderWith(() => ({ status: 400, json: { error: 'Папка шаблонов не найдена.' } }), { registry });
+  assert.equal((await two.builder.run(REQUEST)).status, 'failed');
+  registry.detach();
+  const later = [];
+  registry.attach(7, { setBusy: () => {}, show: (outcome) => later.push(outcome) });
+  assert.equal(later.length, 1);
+  assert.equal(later[0].error, 'Папка шаблонов не найдена.');
+});
+
 test('build lock: a screen opened after the build finished still shows its result, once attached', async () => {
   const registry = app.createBuildRegistry();
   const one = builderWith(buildRoutes([]), { registry });
