@@ -7,7 +7,8 @@
     "A6": "Условия оплаты: {tender.payment_terms}",
     "A7": "Срок исполнения: {tender.deadline}",
     "A69": "{org.head_position} {org.head_name}",
-    "E72": "Дата: {today}г."
+    "E72": "Дата: {today}г.",
+    "D88": {"value": "{rounding}", "optional": true}
   },
   "rates": {
     "insurance": "C17",

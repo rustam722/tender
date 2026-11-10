@@ -27,7 +27,7 @@ TOP_LEVEL_KEYS = {
     "org", "customer", "tender", "items", "estimate", "labor", "employees",
     "assets", "experience", "declaration_text", "conditions", "today", "money",
     "money_total", "materials", "subcontract", "date_ru", "date_long", "warnings",
-    "printed_price_wo_vat",
+    "printed_price_wo_vat", "rounding",
 }
 
 # КП Арктикгаза: «Эколог-проектировщик, 4 чел.» при одном экологе в штате

@@ -40,6 +40,10 @@
                        {"headers": [...], "rows": [[...]]} под раскладку
     declaration_text   текст декларации из профиля заказчика
     conditions         ответы по условиям сделки: условие -> ответ
+    rounding           разрядность округления итога без НДС (int, настройка
+                       total_rounding_digits): её карта ячеек пишет в клетку
+                       округления книги заказчика (D88 формы КП), и тогда книга
+                       округляет итог так же, как программа
     today              дата сборки, «ДД.ММ.ГГГГ»
     money              функция: Decimal -> «5 985 000,00»
     money_total        функция: список Decimal -> Decimal, сумма строк, каждая из
@@ -313,6 +317,12 @@ _RATE_NAMES = {"insurance": "страховых взносов",
                "overhead": "накладных расходов",
                "profit": "прибыли"}
 # Причина, которая остаётся, когда строки напечатаны ровно и ставки совпадают.
+# Та же причина, когда разрядность не нулевая, но карта пишет её в книгу: итог
+# книга и программа округляют одинаково, и про целые рубли говорить нельзя.
+_INSURANCE_ROUNDED = (
+    "книга Excel не округляет страховые взносы, а программа округляет их до "
+    "копеек, поэтому на границе округления итоги расходятся. Исправить это "
+    "нельзя, предупреждение только сообщает.")
 _INSURANCE_CAUSE = (
     "книга Excel не округляет страховые взносы и округляет итог до целых "
     "рублей, а программа округляет страховые до копеек, поэтому на границе "
@@ -320,12 +330,19 @@ _INSURANCE_CAUSE = (
     "сообщает.")
 
 
-def _rounding_cause(digits: int) -> str:
-    """Почему итоги округлены по-разному. Книга всегда округляет до целых рублей
-    (D88 формы остаётся пустой), а программа -- по настройке; при digits != 0
-    причина -- сама настройка, и называть границу рубля было бы неправдой."""
+def _rounding_cause(digits: int, writes_rounding: bool) -> str:
+    """Почему итоги округлены по-разному.
+
+    Книга округляет итог по своей клетке округления (D88 формы КП). Карта,
+    которая эту клетку пишет, ставит туда нашу настройку -- тогда округление
+    итога у книги и у программы одинаковое, и остаётся единственная причина:
+    неокруглённые страховые взносы. Карта, которая клетку не пишет, оставляет
+    книгу на целых рублях, и при digits != 0 причина -- сама настройка;
+    называть тогда границу рубля было бы неправдой."""
     if digits == 0:
         return _INSURANCE_CAUSE
+    if writes_rounding:
+        return _INSURANCE_ROUNDED
     return ("книга Excel округляет итог без НДС до целых рублей (клетка D88 "
             "формы остаётся пустой), а программа -- по настройке «Округление "
             f"итога без НДС, знаков после запятой», сейчас {digits}. Поставьте "
@@ -396,6 +413,12 @@ def _workbook_sums_warnings(document: str, spec: DocSpec | None, cell_map,
     materials = materials if "materials" in sources else []
     subcontract = subcontract if "subcontract" in sources else []
 
+    # Клетка округления итога (D88 формы КП): карта, которая её пишет, ставит
+    # туда нашу настройку -- значит книга округлит итог так же, как программа.
+    # Карта, которая её не пишет, оставляет книгу на целых рублях.
+    writes_rounding = _ROUNDING in cell_paths(cell_map)
+    digits = settings.total_rounding_digits if writes_rounding else 0
+
     rate_notes = _rate_warnings(document, book_rates, settings)
     # Книга считает по СВОИМ ставкам: подставляем их, иначе сторож сравнивает
     # наши ставки сами с собой и расхождения в тысячи рублей не видит.
@@ -407,10 +430,11 @@ def _workbook_sums_warnings(document: str, spec: DocSpec | None, cell_map,
     book = workbook_total(
         [LaborLine(r.post, r.headcount, r.hours, r.rate) for r in labor],
         sum((i.quantity * i.price for i in materials), _ZERO),
-        sum((i.quantity * i.price for i in subcontract), _ZERO), book_settings)
+        sum((i.quantity * i.price for i in subcontract), _ZERO), book_settings,
+        digits)
     # Та же арифметика книги, но на напечатанных строках и на НАШИХ ставках:
     # что останется, то и есть расхождение от округления итога.
-    rounding_differs = workbook_total(*printed, settings) != program
+    rounding_differs = workbook_total(*printed, settings, digits) != program
     rows = (_inexact_rows("materials", [
                 (i.name, (i.quantity, i.price)) for i in materials])
             + _inexact_rows("subcontract", [
@@ -445,7 +469,8 @@ def _workbook_sums_warnings(document: str, spec: DocSpec | None, cell_map,
             f"{fix} так, чтобы произведение было целым числом копеек.")
     if rounding_differs:
         head = "Кроме того, " if causes else "Строк с долей копейки нет: "
-        causes.append(head + _rounding_cause(settings.total_rounding_digits))
+        causes.append(head + _rounding_cause(settings.total_rounding_digits,
+                                            writes_rounding))
     if rate_notes:
         causes.append("И ещё: ставки в книге и в настройках программы разные, "
                       "книга считает по своим -- об этом отдельное "
@@ -496,6 +521,8 @@ _ESTIMATE_SOURCES = frozenset({"labor", "materials", "subcontract"})
 
 _ESTIMATE_SOURCE = "estimate"
 _CONDITIONS = "conditions."
+# Путь контекста, которым карта берёт разрядность округления итога.
+_ROUNDING = "rounding"
 
 
 def required_conditions(cell_map) -> list[str]:
@@ -678,6 +705,9 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
         "experience": _table(layouts["experience"], selected),
         "declaration_text": profile.declaration_text if profile else "",
         "conditions": conditions,
+        # Разрядность округления итога -- для клетки округления книги (D88
+        # формы КП): карта пишет её туда, и книга округляет итог как программа
+        "rounding": settings.total_rounding_digits,
         "today": _today().strftime("%d.%m.%Y"),
         "money": money,
         "money_total": money_total,

@@ -28,7 +28,7 @@ from openpyxl import load_workbook
 from app import config, db
 from app.calc import LaborLine, workbook_total
 from app.models import LotItem, Tender, TenderCostItem, TenderLaborRow
-from app.render.context import build_context, money
+from app.render.context import build_context, money, required_conditions
 from app.render.package import PACKAGE_WIDE, build_package
 from app.render.xlsx_render import CellMapError, fill_workbook, load_cellmap
 from app.repo import Repo
@@ -299,7 +299,11 @@ def test_cellmap_capacities_are_derived_from_the_workbook_formulas():
         assert match and match[1] == match[2], ws[f"G{row}"].value
         reached.append(int(match[1]))
     assert blocks["subcontract"] == reached
-    assert "D88" not in cell_map.cells          # решение контроллера
+    # Клетка округления итога книги: карта пишет в неё настройку программы,
+    # и тогда книга и Word округляют итог одинаково. Механизм необязательной
+    # клетки для этого и задумывался: в чистой форме D88 пуста.
+    assert cell_map.cells["D88"] == "{rounding}"
+    assert "D88" in cell_map.optional
 
 
 # ---- предупреждение: разойдутся ли две бумаги ---------------------------------------
@@ -423,12 +427,20 @@ def test_no_warning_for_a_document_without_a_cellmap(repo):
     assert build_context(tid, repo)["warnings"] == []
 
 
+ROSNEFT_MAP = ROOT / "cellmaps" / "tkp_rosneft_murmansk.json"
+
+
 def move_to_rosneft(repo, tid):
     """Тот же тендер, но заказчик -- Роснефть: её карта шлёт в книгу только
-    позиции лота."""
+    позиции лота.
+
+    Ответы по условиям сделки её форма требует все, иначе контекст отказывает;
+    сами условия берутся из её карты, а не переписываются сюда списком."""
     tender = repo.get_tender(tid)
     tender.customer_id = next(p.customer_id for p in repo.list_customer_profiles()
                               if "ТКП по форме заказчика" in p.docs)
+    tender.deal_answers = {name: "подтверждаю" for name
+                           in required_conditions(load_cellmap(ROSNEFT_MAP))}
     repo.save_tender(tender)
 
 
@@ -736,13 +748,83 @@ def test_the_warning_prints_the_contexts_own_estimate_as_the_programs_total(repo
     assert "Коммерческое предложение" not in text
 
 
+def cellmap_without_rounding(folder: Path) -> Path:
+    """Копия карты Арктикгаза без клетки округления итога, в своей папке карт.
+    Так карта выглядела до того, как D88 в неё вошла: книга оставалась на
+    целых рублях, что бы ни стояло в настройке."""
+    data = json.loads(CELLMAP.read_text(encoding="utf-8"))
+    del data["cells"]["D88"]
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / CELLMAP.name
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def with_rounding(repo, digits, tmp_path=None):
+    """Тендер на 1 чел. x 1 ч x 1002,45 при заданной разрядности округления --
+    данные, на которых округление итога видно в чистом виде (страховые
+    302,7399 стоят на границе)."""
+    tid = make_custom_tender(repo, labor=[("Эколог", 1, "1", "1002.45")])
+    repo.save_settings(replace(repo.get_settings(),
+                               total_rounding_digits=digits))
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    if tmp_path is None:
+        return context, None
+    out = fill_workbook(TEMPLATE, load_cellmap(CELLMAP), context,
+                        tmp_path / "d88.xlsx")
+    return context, load_workbook(out)[SHEET]
+
+
+@pytest.mark.parametrize("digits, book", [(0, "1507"), (2, "1507.49"),
+                                          (-3, "2000")],
+                         ids=["до-рублей", "до-копеек", "до-тысяч"])
+def test_the_rounding_cell_carries_the_setting_into_the_book(
+        repo, tmp_path, digits, book):
+    # Открытое следствие D88 закрыто механизмом необязательной клетки: карта
+    # пишет настройку программы в клетку округления книги, и книга считает
+    # итог своей же формулой ROUND(..., +D88) -- по нашей разрядности, а не
+    # всегда до целых рублей.
+    context, ws = with_rounding(repo, digits, tmp_path)
+    assert context["rounding"] == digits
+    assert ws["D88"].value == digits
+    assert evaluate(ws, "D26") == Decimal(book)
+
+
+def test_rounding_to_thousands_brings_the_two_totals_together(repo, tmp_path):
+    # то, ради чего D88 и нужна: округление у книги и у программы одно,
+    # разница от страховых в него не попадает -- говорить не о чем
+    context, ws = with_rounding(repo, -3, tmp_path)
+    assert context["estimate"]["total_wo_vat"] == Decimal("2000.00")
+    assert evaluate(ws, "D26") == Decimal("2000")
+    assert context["warnings"] == []
+
+
+def test_the_setting_is_not_blamed_when_the_book_rounds_the_same_way(repo):
+    # Разрядность 2: итоги всё ещё расходятся на копейку, но причина уже не
+    # настройка -- книга округляет итог так же, как программа, а остаются
+    # неокруглённые страховые. Отправить человека менять настройку значило бы
+    # отправить его чинить не то.
+    context, _ = with_rounding(repo, 2)
+    (text,) = context["warnings"]
+    text = plain(text)
+    assert "итог без НДС 1 507,49" in text and "1 507,50" in text
+    assert "не округляет страховые взносы" in text
+    assert "на границе округления" in text and "Исправить это нельзя" in text
+    assert "Округление итога без НДС" not in text
+    assert "целых рублей" not in text and "границе рубля" not in text
+
+
 @pytest.mark.parametrize("digits, program", [(2, "1 507,50"), (-3, "2 000,00")],
                          ids=["до-копеек", "до-тысяч"])
 def test_rounding_setting_is_named_as_the_cause_instead_of_the_rouble_boundary(
-        repo, digits, program):
-    # при любой разрядности, кроме нуля, причина расхождения -- сама настройка,
-    # а не граница рубля: книга округляет итог до рублей (D88 пуста) всегда
+        repo, tmp_path, monkeypatch, digits, program):
+    # Карта, которая клетку округления НЕ пишет, оставляет книгу на целых
+    # рублях: тогда при любой разрядности, кроме нуля, причина расхождения --
+    # сама настройка, а не граница рубля. Текст этой причины остаётся нужным:
+    # карта любого другого заказчика может клетки округления не иметь.
     tid = make_custom_tender(repo, labor=[("Эколог", 1, "1", "1002.45")])
+    path = cellmap_without_rounding(tmp_path / "cellmaps")
+    monkeypatch.setattr(config, "CELLMAPS_DIR", path.parent)
     repo.save_settings(replace(repo.get_settings(),
                                total_rounding_digits=digits))
     context = build_context(tid, repo, document=DOC_ESTIMATE)
