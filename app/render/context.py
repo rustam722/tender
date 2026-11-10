@@ -71,9 +71,7 @@ from app.models import (
     CustomerProfile, DocSpec, LotItem, Organization, TenderCostItem, TenderLaborRow,
 )
 from app.render.layouts import TableLayout, build_rows, load_layout
-from app.render.xlsx_render import (
-    RATE_FIELDS, CellMapError, load_cellmap, read_rates,
-)
+from app.render.xlsx_render import RATE_FIELDS, load_cellmap, read_rates
 from app.repo import Repo
 
 
@@ -366,17 +364,28 @@ def _workbook_sums_warnings(document: str, spec: DocSpec | None, labor, material
     Причин расхождения три, и каждая называется отдельно, когда она есть:
     строки с долей копейки, разное округление итога (страховые и D88) и разные
     ставки в книге и в настройках. Назвать одну, пока действуют и другие, --
-    отправить человека чинить не то."""
+    отправить человека чинить не то.
+
+    Поднимает `CellMapError`, если карту не разобрать или из клетки ставки
+    книги ставку не прочитать: сторож, который молча выключается, хуже
+    отсутствующего. Сборка превращает это в пропуск одного документа
+    с причиной (`PackageResult.skipped`)."""
     if not (spec and spec.cellmap):
         return []
-    try:
-        cell_map = load_cellmap(Path(config.CELLMAPS_DIR) / spec.cellmap)
-        # Ставки книги лежат в самой книге; где именно -- говорит карта.
-        book_rates = (read_rates(Path(config.TEMPLATES_DOCS_DIR) / spec.template,
-                                 cell_map)
-                      if spec.template.lower().endswith(".xlsx") else {})
-    except CellMapError:
-        return []          # пропавшую или битую карту назовёт сборка пакета
+    # Здесь не глотается ничего. Сторож, который молча выключается, хуже
+    # отсутствующего: пакет уходит человеку без единого замечания, и он считает,
+    # что всё хорошо. Раньше отсюда возвращался пустой список на любой
+    # CellMapError -- и испорченная клетка ставки отключала не только сверку
+    # ставок, а всю проверку целиком, вместе со сравнением итогов.
+    # Отказ доходит до build_package, и документ уходит в skipped с русской
+    # причиной; остальные документы пакета собираются.
+    cell_map = load_cellmap(Path(config.CELLMAPS_DIR) / spec.cellmap)
+    # Ставки книги лежат в самой книге; где именно -- говорит карта. В эти
+    # клетки не смотрит больше никто: fill_workbook их не читает, и отказ,
+    # проглоченный здесь, не пришёл бы человеку ниоткуда.
+    book_rates = (read_rates(Path(config.TEMPLATES_DOCS_DIR) / spec.template,
+                             cell_map)
+                  if spec.template.lower().endswith(".xlsx") else {})
     sources = {b.source for b in cell_map.rows}
     labor = labor if "labor" in sources else []
     materials = materials if "materials" in sources else []
@@ -461,6 +470,12 @@ def _lot_rows(items: list[LotItem], rate: Decimal) -> list[dict]:
 def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
                   experience_ids: list[int] | tuple[int, ...] | None = None) -> dict:
     """Собирает контекст тендера. Неизвестный id -- LookupError по-русски.
+
+    С `document`, у которого в профиле есть карта ячеек, может поднять
+    `CellMapError`: карту не разобрать или ставку из клетки не прочитать.
+    Сборка пакета превращает это в пропуск одного документа с причиной.
+    Без `document` (экраны) карта не читается вовсе, и этого отказа быть
+    не может.
 
     document -- имя документа пакета, под который собирается контекст: таблицы
     строятся по раскладке, которую профиль заказчика назначает этому документу.

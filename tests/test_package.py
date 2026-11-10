@@ -661,6 +661,25 @@ def test_missing_cellmap_file_is_a_russian_skip(repo, dirs, tmp_path):
     assert "tkp_rosneft_murmansk.json" in result.skipped[0][1]
 
 
+def test_a_broken_cellmap_is_a_russian_skip_and_not_a_silent_package(
+        repo, dirs, tmp_path):
+    # Контекст отказ разбора карты глотает намеренно: ту же карту тем же кодом
+    # читает fill_workbook и отказывается с той же причиной. Без этого теста
+    # обещание «битую карту назовёт сама сборка» держалось бы на комментарии,
+    # а молчащий сторож в этой работе уже случался.
+    templates, cellmaps = dirs
+    shutil.copy(REAL_FORM, templates / "forma_tkp_rosneft_murmansk.xlsx")
+    (cellmaps / "tkp_rosneft_murmansk.json").write_text(
+        '{"sheet": "Лист1", "cells": {"нет такого адреса": "x"}}',
+        encoding="utf-8")
+    tid = rosneft_tender(repo)
+    result = build_package(tid, [TKP], tmp_path / "out", repo)
+    assert result.written == []
+    document, reason = result.skipped[0]
+    assert len(result.skipped) == 1 and document == TKP
+    assert "нет такого адреса" in reason and "адрес клетки" in reason
+
+
 def test_half_written_file_of_a_failed_document_is_removed(
         repo, dirs, tmp_path, monkeypatch):
     # сохранение могло оборваться посреди записи: огрызок файла не оставляем,
