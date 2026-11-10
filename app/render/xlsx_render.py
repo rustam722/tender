@@ -60,7 +60,9 @@ OrgSettings); значение -- адрес клетки. Адреса свои
 их место здесь, рядом со всеми прочими адресами. `read_rates` достаёт эти ставки
 из книги; по ним считает `app.calc.workbook_total`, а расхождение с
 настройками называет предупреждение сборки (app.render.context). Раздела нет --
-ставки берутся из настроек, как раньше.
+ставки берутся из настроек, как раньше. Клетка, из которой ставку не прочитать,
+-- отказ, и этот отказ доходит до человека: документ уходит в
+`PackageResult.skipped` с причиной, а не собирается без проверок.
 
 Чего здесь нет намеренно: клетки с названиями, номерами позиций и условиями
 заказчика (колонки A, B, C формы Роснефти) в карту не входят -- это его текст.
@@ -71,6 +73,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -275,14 +278,77 @@ def _rates(raw: object, name: str) -> dict[str, str]:
     return rates
 
 
+# Ставка -- доля единицы, не проценты. Формулировка дословно та же, что у
+# настроек калькуляции (_FRACTIONS в app/web/schema.py): одна и та же фраза
+# в двух местах, чтобы человек узнавал правило, а не разбирал его заново.
+_RATE_RULE = "ставка задаётся долей единицы, от 0 до 1: например, 0,05 для 5 %"
+
+# Что лежит в клетке, когда там не число: сказать это человеку по-русски, иначе
+# он пойдёт искать пустую клетку, а там дата.
+_CELL_KINDS = ((bool, "логическое значение (ДА/НЕТ)"), (datetime, "дата"),
+               (date, "дата"), (time, "время"), (timedelta, "длительность"))
+
+
+def _plain(value: Decimal) -> str:
+    """Число как оно есть, для сообщения: 30 -> «30», 0.3 -> «0,3»."""
+    if not value.is_finite():
+        return str(value)
+    return format(value.normalize(), "f").replace(".", ",")
+
+
+def _rate_of(value: object, key: str, address: str, book: str) -> Decimal:
+    """Значение клетки -> ставка-доля. Всё, что не доля от 0 до 1, -- отказ.
+
+    Нулевая доля, молча взятая вместо непрочитанной ставки, дала бы
+    правдоподобную цену без взносов; ставка 30 вместо 0,3 -- цену в сто раз
+    больше. И то и другое человек увидит только от проверяющего, поэтому здесь
+    отказ, а не догадка."""
+    where = f"В книге {book} клетка {address} (ставка «{key}»)"
+    if isinstance(value, str):
+        text = value.strip().replace(",", ".")
+        if text.startswith("="):
+            raise CellMapError(
+                f"{where} занята формулой: ставку оттуда не прочитать. "
+                "Проверьте адрес в карте ячеек.")
+        value = text
+    if value is None or value == "":
+        raise CellMapError(
+            f"{where} пуста: ставку оттуда не прочитать. Проверьте адрес "
+            "в карте ячеек или заполните клетку в шаблоне книги.")
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal, str)):
+        kind = next((name for cls, name in _CELL_KINDS if isinstance(value, cls)),
+                    "не число")
+        raise CellMapError(
+            f"{where} содержит не ставку, а {kind}. Проверьте адрес в карте "
+            "ячеек или клетку в шаблоне книги.")
+    try:
+        rate = Decimal(str(value))
+    except InvalidOperation:
+        raise CellMapError(
+            f"{where} содержит не число, а «{value}». Проверьте адрес в карте "
+            "ячеек или клетку в шаблоне книги.") from None
+    # is_finite первым: сравнение Decimal('NaN') с числом само поднимает
+    # InvalidOperation, то есть ошибку не по-русски и не для человека
+    if not rate.is_finite() or not Decimal(0) <= rate <= Decimal(1):
+        raise CellMapError(
+            f"{where} содержит {_plain(rate)}, а {_RATE_RULE}. Исправьте клетку "
+            "в шаблоне книги или адрес в карте ячеек.")
+    return rate
+
+
 def read_rates(template: Path, cell_map: CellMap) -> dict[str, Decimal]:
     """Ставки калькуляции из самой книги заказчика: имя ставки -> доля (0.3).
 
     Книга считает по своим ставкам, что бы ни стояло в настройках программы,
     поэтому читаются они из книги, а не из настроек. Нет раздела rates --
-    пустой словарь, и книга считается по настройкам, как раньше. Клетка с
-    формулой, с текстом или пустая -- отказ: молча взятая вместо ставки нулевая
-    доля дала бы правдоподобную цену без взносов.
+    пустой словарь, книга даже не открывается, и ставки берутся из настроек,
+    как раньше.
+
+    Клетка, из которой ставку не прочитать (формула, текст, пусто, дата, доля
+    вне 0..1), -- отказ `CellMapError`. Этот отказ обязан дойти до человека:
+    ставки не читает больше никто, `fill_workbook` в эти клетки не смотрит, и
+    проглоченное здесь исключение выключило бы всю проверку расхождений разом
+    (см. `app.render.context._workbook_sums_warnings`).
     """
     if not cell_map.rates:
         return {}
@@ -295,32 +361,8 @@ def read_rates(template: Path, cell_map: CellMap) -> dict[str, Decimal]:
                 f"В книге {template.name} нет листа «{cell_map.sheet}». "
                 f"Есть: {names}.")
         ws = wb[cell_map.sheet]
-        rates = {}
-        for key, address in cell_map.rates.items():
-            value = ws[address].value
-            if isinstance(value, bool) or not isinstance(value, (int, float,
-                                                                 Decimal, str)):
-                value = None
-            if isinstance(value, str):
-                value = value.strip().replace(",", ".")
-                if value.startswith("="):
-                    raise CellMapError(
-                        f"В книге {template.name} клетка {address} (ставка "
-                        f"«{key}») занята формулой: ставку оттуда не прочитать. "
-                        "Проверьте адрес в карте ячеек.")
-            if value is None or value == "":
-                raise CellMapError(
-                    f"В книге {template.name} клетка {address} (ставка "
-                    f"«{key}») пуста: ставку оттуда не прочитать. Проверьте "
-                    "адрес в карте ячеек или заполните клетку в шаблоне.")
-            try:
-                rates[key] = Decimal(str(value))
-            except InvalidOperation:
-                raise CellMapError(
-                    f"В книге {template.name} в клетке {address} (ставка "
-                    f"«{key}») не число, а «{value}». Проверьте адрес в карте "
-                    "ячеек.") from None
-        return rates
+        return {key: _rate_of(ws[address].value, key, address, template.name)
+                for key, address in cell_map.rates.items()}
     finally:
         wb.close()
 

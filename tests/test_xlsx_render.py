@@ -8,7 +8,9 @@
 копия в tests/fixtures, на ней проверяется карта cellmaps/tkp_rosneft_murmansk.json.
 """
 import json
+import re
 import warnings
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -390,6 +392,25 @@ GOOD = {"sheet": "Лист1",
         "rows": [{"first_row": 9, "last_row": 19, "source": "items",
                   "columns": {"C": "{row.price_value}"}}]}
 
+# Обрывки английских сообщений об ошибках: ни одного из них человек видеть
+# не должен -- причина отказа пишется по-русски и для него.
+_ENGLISH_LEAK = re.compile(
+    r"Error|Errno|Traceback|must be|expected|invalid|NoneType|object of type")
+
+
+def assert_russian_reason(text: str, only_latin=None) -> None:
+    """Причина -- русская фраза, а не английский обрывок.
+
+    `only_latin` -- латинские слова, которым в тексте место (имя файла карты,
+    имена ставок); с ним проверка строгая: любое другое латинское слово значит,
+    что в русский текст просочилось чужое сообщение."""
+    assert re.search(r"[а-яё]{4,}", text, re.IGNORECASE), text
+    assert not _ENGLISH_LEAK.search(text), text
+    if only_latin is not None:
+        strange = {word for word in re.findall(r"[A-Za-z][A-Za-z_0-9]*", text)
+                   if word not in only_latin}
+        assert not strange, (strange, text)
+
 
 def test_load_cellmap_reads_the_shape(tmp_path):
     cell_map = load_cellmap(write_map(tmp_path, GOOD))
@@ -448,6 +469,7 @@ def test_bad_cellmap_is_rejected_with_a_russian_reason(tmp_path, mutate, fragmen
     with pytest.raises(CellMapError) as caught:
         load_cellmap(write_map(tmp_path, data))
     assert fragment in str(caught.value)
+    assert_russian_reason(str(caught.value))
 
 
 # ---- настоящая форма Роснефти ---------------------------------------------------
@@ -794,12 +816,21 @@ RATES_MAP = {"insurance": "C17", "injury": "C18",
 @pytest.fixture
 def rates_form(tmp_path):
     """Форма, которая держит ставки калькуляции в своих клетках, как книга
-    Арктикгаза: C17, C18, C24, C25 и формула рядом."""
+    Арктикгаза: C17, C18, C24, C25, формула рядом -- и ниже клетки со всем,
+    что ставкой не является."""
     path = make_form(tmp_path / "rates.xlsx")
     wb = load_workbook(path)
     ws = wb["Лист1"]
     ws["C17"], ws["C18"], ws["C24"], ws["C25"] = 0.3, 0.002, 0.05, 0.1
     ws["C26"] = "=C17+C18"
+    ws["C40"] = True                        # логическое значение
+    ws["C41"] = datetime(2026, 11, 10)      # дата
+    ws["C42"] = 30                          # проценты числом вместо доли
+    ws["C43"] = -0.3                        # отрицательная доля
+    ws["C44"] = "30"                        # проценты текстом
+    ws["C45"] = 1                           # 100 % -- законная доля
+    ws["C46"] = 0                           # 0 % -- законная доля
+    ws["C47"] = "nan"                       # вовсе не число
     wb.save(path)
     wb.close()
     return path
@@ -833,6 +864,12 @@ def test_bad_rates_section_is_rejected_with_a_russian_reason(tmp_path, rates,
     with pytest.raises(CellMapError) as caught:
         load_cellmap(write_map(tmp_path, data))
     assert fragment in str(caught.value)
+    # «русская причина» вынесена в имя -- значит, она и проверяется: латиница
+    # в тексте допустима только там, где это имена из самой карты
+    assert_russian_reason(str(caught.value),
+                          {"map", "json", "rates", "insurance", "injury",
+                           "overhead", "profit", "insurance_rate", "C17",
+                           "c17", "C0"})
 
 
 def test_rates_section_must_be_an_object(tmp_path):
@@ -840,6 +877,7 @@ def test_rates_section_must_be_an_object(tmp_path):
     with pytest.raises(CellMapError) as caught:
         load_cellmap(write_map(tmp_path, data))
     assert "rates" in str(caught.value)
+    assert_russian_reason(str(caught.value), {"map", "json", "rates"})
 
 
 def test_read_rates_takes_every_rate_from_the_book(rates_form):
@@ -856,18 +894,50 @@ def test_read_rates_without_the_section_does_not_even_open_the_book(tmp_path):
 
 
 @pytest.mark.parametrize("address, fragment", [
-    ("C19", "пуста"),            # клетка пуста
-    ("C26", "формул"),           # клетка занята формулой
-    ("A3", "не число"),          # в клетке текст заказчика
-], ids=["пусто", "формула", "текст"])
+    ("C19", "пуста"),                        # клетка пуста
+    ("C26", "формул"),                       # клетка занята формулой
+    ("A3", "не число"),                      # в клетке текст заказчика
+    ("C40", "логическое значение"),          # ДА/НЕТ, а не «пуста»
+    ("C41", "дата"),                         # дата, а не «пуста»
+], ids=["пусто", "формула", "текст", "логическое", "дата"])
 def test_read_rates_refuses_a_cell_without_a_rate(rates_form, address, fragment):
     # молча взятая вместо ставки нулевая доля дала бы правдоподобную цену
-    # без взносов -- такую заявку никто не перепроверит
+    # без взносов -- такую заявку никто не перепроверит. И сказать человеку
+    # надо, что в клетке на самом деле: «пуста» про дату отправит его искать
+    # не там
     cell_map = CellMap("Лист1", {}, rates={"insurance": address})
     with pytest.raises(CellMapError) as caught:
         read_rates(rates_form, cell_map)
     text = str(caught.value)
     assert fragment in text and address in text and "insurance" in text
+    assert "пуста" not in text or fragment == "пуста"
+
+
+@pytest.mark.parametrize("address, shown", [
+    ("C42", "30"),
+    ("C43", "-0,3"),
+    ("C44", "30"),
+    ("C47", "NaN"),
+], ids=["проценты-числом", "отрицательная", "проценты-текстом", "не-число"])
+def test_read_rates_refuses_a_rate_that_is_not_a_fraction_of_one(
+        rates_form, address, shown):
+    # 30 вместо 0,3 -- цена в сто раз больше; громко, но неверно. Правило и
+    # формулировка те же, что у настроек калькуляции (_FRACTIONS в web/schema)
+    cell_map = CellMap("Лист1", {}, rates={"overhead": address})
+    with pytest.raises(CellMapError) as caught:
+        read_rates(rates_form, cell_map)
+    text = str(caught.value)
+    assert f"содержит {shown}, а ставка задаётся долей единицы, от 0 до 1" in text
+    assert "например, 0,05 для 5 %" in text
+    assert address in text and "overhead" in text
+
+
+@pytest.mark.parametrize("address, rate", [("C45", "1"), ("C46", "0")],
+                         ids=["доля-1", "доля-0"])
+def test_read_rates_takes_both_edges_of_the_range(rates_form, address, rate):
+    # 0 и 1 -- законные доли: у заказчика может не быть прибыли вовсе
+    cell_map = CellMap("Лист1", {}, rates={"profit": address})
+    assert read_rates(rates_form, cell_map) == {"profit": Decimal(rate)}
 
 
 def test_read_rates_names_the_missing_sheet(rates_form):
