@@ -14,6 +14,7 @@
     сборки, которое о таких данных говорит;
   * `workbook_total` из app.calc сверяется здесь с формулами самой книги.
 """
+import json
 import re
 from dataclasses import replace
 from decimal import ROUND_HALF_UP, Decimal
@@ -22,7 +23,7 @@ from pathlib import Path
 import pytest
 from openpyxl import load_workbook
 
-from app import db
+from app import config, db
 from app.calc import LaborLine, workbook_total
 from app.models import Tender, TenderCostItem, TenderLaborRow
 from app.render.context import build_context, money
@@ -440,10 +441,14 @@ def test_no_warning_about_lists_the_workbook_does_not_receive(repo, lists):
 
 @pytest.mark.parametrize("field, value, label, in_book, in_settings", [
     ("insurance_rate", "0.31", "страховых взносов", "30", "31"),
+    # ставку страховых закон может и понизить, и тогда сторож обязан сказать
+    # то же самое: сравнение -- на неравенство, а не «настройка выше книжной»
+    ("insurance_rate", "0.29", "страховых взносов", "30", "29"),
     ("injury_rate", "0.003", "взносов на травматизм", "0,2", "0,3"),
     ("overhead_rate", "0.10", "накладных расходов", "5", "10"),
     ("profit_rate", "0.11", "прибыли", "10", "11"),
-], ids=["страховые", "травматизм", "накладные", "прибыль"])
+], ids=["страховые-выше", "страховые-ниже", "травматизм", "накладные",
+        "прибыль"])
 def test_each_rate_of_the_book_is_compared_with_the_settings(
         repo, tmp_path, field, value, label, in_book, in_settings):
     # ставку страховых меняет закон, остальные -- человек в настройках; книга
@@ -461,6 +466,14 @@ def test_each_rate_of_the_book_is_compared_with_the_settings(
     assert "книга Excel посчитает итог без НДС 4 000 000,00" in totals
     assert context["estimate"]["total_wo_vat"] != Decimal("4000000.00")
     assert plain(money(context["estimate"]["total_wo_vat"])) in totals
+    # Чего в тексте быть НЕ должно: причина одна -- ставка, и она исправима.
+    # Пообещать «исправить это нельзя» там, где достаточно поправить одно
+    # число, -- худшая услуга, чем молчание.
+    assert "Исправить это нельзя" not in totals
+    assert "не округляет страховые" not in totals
+    assert "границе рубля" not in totals
+    assert "Строк с долей копейки нет" not in totals
+    assert "долей копейки" not in totals
     out = fill_workbook(TEMPLATE, load_cellmap(CELLMAP), context, tmp_path / "s.xlsx")
     assert evaluate(load_workbook(out)[SHEET], "D26") == Decimal("4000000")
 
@@ -494,14 +507,106 @@ def test_rates_that_match_the_settings_say_nothing_about_rates(repo):
     assert build_context(tid, repo, document=DOC_ESTIMATE)["warnings"] == []
 
 
-def test_a_cellmap_without_rates_still_takes_them_from_the_settings(repo):
-    # карта Роснефти раздела rates не знает: поведение прежнее, ничего не меняется
+def test_a_document_without_a_calculation_in_its_book_says_nothing_about_rates(repo):
+    # карта Роснефти раздела rates не знает и калькуляции в книгу не шлёт:
+    # поведение прежнее, ничего не меняется
     tid = make_custom_tender(repo, labor=ARKTIK_LABOR)
     repo.save_settings(replace(repo.get_settings(),
                                insurance_rate=Decimal("0.31")))
     move_to_rosneft(repo, tid)
     assert build_context(tid, repo, document="ТКП по форме заказчика"
                          )["warnings"] == []
+
+
+def cellmap_without_rates(folder: Path) -> Path:
+    """Копия карты Арктикгаза без раздела rates, в своей папке карт."""
+    data = json.loads(CELLMAP.read_text(encoding="utf-8"))
+    del data["rates"]
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / CELLMAP.name
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_a_cellmap_without_rates_takes_them_from_the_settings(repo, tmp_path,
+                                                              monkeypatch):
+    # Карта Роснефти для этого не годится: она не шлёт в книгу списков
+    # калькуляции, и workbook_total на ней не считается вовсе. Здесь карта
+    # Арктикгаза без раздела rates: калькуляция живая, ставки -- из настроек,
+    # и итог книги обязан поехать вместе с настройкой, а не остаться прежним.
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT)
+    path = cellmap_without_rates(tmp_path / "cellmaps")
+    monkeypatch.setattr(config, "CELLMAPS_DIR", path.parent)
+    cell_map = load_cellmap(path)
+    assert cell_map.rates == {}
+    assert {b.source for b in cell_map.rows} == {"materials", "labor",
+                                                 "subcontract"}
+    repo.save_settings(replace(repo.get_settings(),
+                               insurance_rate=Decimal("0.31")))
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    # ставка 31 % у обоих: и у программы, и у книги, которой карта ставок не дала
+    assert context["estimate"]["total_wo_vat"] == Decimal("4016715.00")
+    assert context["warnings"] == []
+
+
+# ---- испорченная клетка ставки: то, что увидит человек -------------------------------
+
+def templates_with_rate_cell(folder: Path, value) -> Path:
+    """Копия шаблона Арктикгаза в своей папке шаблонов, с заданным C17."""
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / TEMPLATE.name
+    wb = load_workbook(TEMPLATE)
+    wb[SHEET]["C17"] = value
+    wb.save(path)
+    wb.close()
+    return path
+
+
+def package_with_rate_cell(repo, tmp_path, value, monkeypatch):
+    """Пакет из одной калькуляции, собранный с заданным значением в C17 и
+    настройкой страховых 31 %: ставки разошлись, сторожу есть о чём сказать."""
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT)
+    path = templates_with_rate_cell(tmp_path / "templates", value)
+    monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR", path.parent)
+    repo.save_settings(replace(repo.get_settings(),
+                               insurance_rate=Decimal("0.31")))
+    return build_package(tid, [DOC_ESTIMATE], tmp_path / "out", repo)
+
+
+@pytest.mark.parametrize("value, fragment", [
+    ("=0.3", "формул"),
+    ("30 %", "не число"),
+    (None, "пуста"),
+    (30, "долей единицы"),
+], ids=["формула", "текст", "пусто", "проценты-вместо-доли"])
+def test_a_broken_rate_cell_skips_the_document_with_a_reason(
+        repo, tmp_path, monkeypatch, value, fragment):
+    # Худшее, что может сделать сторож, -- молча выключиться: испорченная клетка
+    # ставки отключала не только сверку ставок, а всю проверку целиком, и пакет
+    # уходил человеку без единого замечания (skipped пуст, warnings пуст).
+    result = package_with_rate_cell(repo, tmp_path, value, monkeypatch)
+    assert result.written == []
+    (document, reason) = result.skipped[0]
+    assert len(result.skipped) == 1 and document == DOC_ESTIMATE
+    assert "C17" in reason and "insurance" in reason and fragment in reason
+    assert "Errno" not in reason and "Traceback" not in reason
+    # и человек не остался с пустой папкой вместо файла и без объяснения
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+def test_a_sound_rate_cell_in_the_same_place_builds_and_warns_twice(
+        repo, tmp_path, monkeypatch):
+    # обратная сторона того же теста: клетка цела -- документ собран, и сторож
+    # говорит оба предупреждения (итоги и сама ставка)
+    result = package_with_rate_cell(repo, tmp_path, 0.3, monkeypatch)
+    assert result.skipped == []
+    assert [p.suffix for p in result.written] == [".xlsx"]
+    assert [d for d, _ in result.warnings] == [DOC_ESTIMATE, DOC_ESTIMATE]
+    totals, note = (plain(t) for _, t in result.warnings)
+    assert "книга Excel посчитает итог без НДС 4 000 000,00" in totals
+    assert "ставка страховых взносов 30 %, а в настройках программы 31 %" in note
 
 
 # Данные, на которых видна вся арифметика книги разом: материалы, субподряд и
@@ -561,6 +666,32 @@ def test_workbook_total_reproduces_the_formulas_of_the_real_book(
     assert abs(abs(raw_total - book) - Decimal("0.5")) < Decimal("0.05")
 
 
+def test_a_total_exactly_on_the_half_rouble_goes_up_as_excel_rounds(repo, tmp_path):
+    # ROUND в Excel округляет половину ВВЕРХ, а не к чётному: неокруглённый итог
+    # 4 000 000,50 даёт 4 000 001, хотя целая часть чётная и ROUND_HALF_EVEN
+    # оставил бы 4 000 000. Данные Арктикгаза с материалами 41 686,67 --
+    # единственный случай, где эта разница видна вообще
+    tid = make_custom_tender(
+        repo, labor=ARKTIK_LABOR, subcontract=ARKTIK_SUBCONTRACT,
+        materials=[("инвентарь, оборудование", "1", "24000"),
+                   ("расходные материалы", "1", "17686.67")])
+    context = build_context(tid, repo, document=DOC_ESTIMATE)
+    out = fill_workbook(TEMPLATE, load_cellmap(CELLMAP), context,
+                        tmp_path / "half.xlsx")
+    ws = load_workbook(out)[SHEET]
+    raw_total = sum(evaluate(ws, a) for a in ("D11", "D23", "D24", "D25"))
+    assert raw_total == Decimal("4000000.5")           # ровно половина
+    assert evaluate(ws, "D26") == Decimal("4000001")
+    assert workbook_total(
+        [LaborLine(post, people, Decimal(hours), Decimal(rate))
+         for post, people, hours, rate in ARKTIK_LABOR],
+        Decimal("41686.67"), raw_sum(ARKTIK_SUBCONTRACT),
+        repo.get_settings()) == Decimal("4000001.00")
+    # программа округляет половину так же, поэтому бумаги не расходятся
+    assert context["estimate"]["total_wo_vat"] == Decimal("4000001.00")
+    assert context["warnings"] == []
+
+
 def test_the_warning_prints_the_contexts_own_estimate_as_the_programs_total(repo):
     # «программа» в предупреждении -- ровно тот итог без НДС, который контекст
     # отдаёт документам Word, а не пересчитанный заново по сырым трудозатратам:
@@ -577,16 +708,21 @@ def test_the_warning_prints_the_contexts_own_estimate_as_the_programs_total(repo
     assert "13 897,79" not in plain(text)      # итог по сырым трудозатратам
 
 
-def test_rounding_setting_is_named_as_the_cause_instead_of_the_rouble_boundary(repo):
-    # при округлении итога до копеек причина расхождения -- сама настройка,
+@pytest.mark.parametrize("digits, program", [(2, "1 507,50"), (-3, "2 000,00")],
+                         ids=["до-копеек", "до-тысяч"])
+def test_rounding_setting_is_named_as_the_cause_instead_of_the_rouble_boundary(
+        repo, digits, program):
+    # при любой разрядности, кроме нуля, причина расхождения -- сама настройка,
     # а не граница рубля: книга округляет итог до рублей (D88 пуста) всегда
     tid = make_custom_tender(repo, labor=[("Эколог", 1, "1", "1002.45")])
-    repo.save_settings(replace(repo.get_settings(), total_rounding_digits=2))
+    repo.save_settings(replace(repo.get_settings(),
+                               total_rounding_digits=digits))
     context = build_context(tid, repo, document=DOC_ESTIMATE)
     (text,) = context["warnings"]
     text = plain(text)
-    assert "итог без НДС 1 507,00" in text and "1 507,50" in text
-    assert "«Округление итога без НДС, знаков после запятой», сейчас 2" in text
+    assert "итог без НДС 1 507,00" in text and program in text
+    assert ("«Округление итога без НДС, знаков после запятой», "
+            f"сейчас {digits}") in text
     assert "на границе рубля" not in text
 
 
