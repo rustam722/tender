@@ -41,8 +41,15 @@ async function seed(tag) {
   const customer = await call('POST', '/api/organizations', { role: 'customer', short_name: `ПАО «Заказчик ${tag}»`, inn: '7708514824' });
   const service = await call('POST', '/api/services', { code: `КЭР${tag}`, name: 'Комплексный экологический отчёт', stage_wording: '',
     norms: { 'Инженер-эколог': '40,5', 'Руководитель проекта': '20' } });
-  await call('POST', '/api/employees', { full_name: 'Петров', position: 'Инженер-эколог', hourly_rate: '1250,50' });
-  await call('POST', '/api/employees', { full_name: 'Сидоров', position: 'Руководитель проекта', hourly_rate: '2000' });
+  const employees = [
+    await call('POST', '/api/employees', { full_name: `Петров ${tag}`, position: 'Инженер-эколог', hourly_rate: '1250,50' }),
+    await call('POST', '/api/employees', { full_name: `Сидоров ${tag}`, position: 'Руководитель проекта', hourly_rate: '2000' }),
+  ];
+  const asset = await call('POST', '/api/assets', { name: `Газоанализатор ГАНК-4 ${tag}`, kind: 'equipment',
+    maker_model: 'НПО «Прибор», ГАНК-4', quantity: '2', year: '2021', location: 'Пермь, ул. Ласьвинская, 98' });
+  // настройки -- одна строка на всю базу; ставка травматизма засевается, чтобы на
+  // вкладке «Настройки» было что утверждать, кроме заголовка
+  const settings = await call('POST', '/api/settings', { injury_rate_percent: '0,3' });
   const tender = await call('POST', '/api/tenders', { customer_id: String(customer.id), participant_id: String(me.id),
     service_id: String(service.id), purchase_number: `N-${tag}`, purchase_date: '2025-10-24',
     subject: 'Разработка КЭР', price_wo_vat: '5700000' });
@@ -60,7 +67,31 @@ async function seed(tag) {
     experience.push(await call('POST', '/api/experience', { customer_name: `Заказчик опыта ${n}`, contract_number: n,
       contract_date: '01.02.2024', subject: `Работа ${n}`, amount: '1000000', term: '2024', status: 'исполнен', service_id: String(service.id) }));
   }
-  return { tender, customer, service, experience, base };
+  return { tender, customer, me, service, employees, asset, settings, experience, base };
+}
+
+/* Что на какой вкладке справочников обязано быть видно: ЗАСЕЯННОЕ значение,
+ * а не только отсутствие «undefined». Строки берутся из ответов сервера, а не
+ * сочиняются здесь, поэтому утверждение не зависит от того, как сервер печатает
+ * деньги. Опечатка в имени поля даёт пустые клетки, и assertClean её пропускает:
+ * текста на экране хватает за счёт заголовков, вкладок и кнопок -- ровно тот
+ * отказ, ради которого заглушка DOM и вводилась. */
+function seededOnTabs(s, tag) {
+  return {
+    organizations: { text: [`ПАО «Заказчик ${tag}»`, `ООО «Техносфера ${tag}»`, 'ИНН 7708514824'] },
+    employees: { text: [s.employees[0].full_name, s.employees[1].full_name, `${s.employees[0].hourly_rate} руб/ч`] },
+    assets: { text: [s.asset.name, s.asset.maker_model] },
+    experience: { text: [s.experience[0].customer_name, `№ ${s.experience[1].contract_number}`,
+      `${s.experience[0].amount} руб.`] },
+    services: { text: [`КЭР${tag}`, 'Комплексный экологический отчёт'] },
+    profiles: { text: [`ПАО «Заказчик ${tag}»`, 'Справка о МТР', 'Декларация соответствия'] },
+    // настройки живут в полях ввода: textContent у input пуст, поэтому значения
+    // сверяются с ответом сервера по каждому полю формы
+    settings: { fields: [['Страховые взносы, %', 'insurance_rate_percent'], ['Травматизм, %', 'injury_rate_percent'],
+      ['Накладные, % от оплаты труда со страховыми', 'overhead_rate_percent'], ['Прибыль, %', 'profit_rate_percent'],
+      ['НДС по умолчанию, %', 'vat_rate_percent'],
+      ['Округление итога без НДС, знаков после запятой', 'total_rounding_digits']] },
+  };
 }
 
 // ---- страница в заглушке DOM ---------------------------------------------------------
@@ -179,12 +210,22 @@ const WARNING = 'Запись сохранена, но пересчитать с
 live('render: every reference tab, the tender and the build screen draw real data with no placeholders', async () => {
   const s = await seed('R1');
   await withPage(async (page) => {
-    for (const tab of ['organizations', 'employees', 'assets', 'experience', 'services', 'profiles', 'settings']) {
+    const expected = seededOnTabs(s, 'R1');
+    assert.deepEqual(Object.keys(expected),
+      ['organizations', 'employees', 'assets', 'experience', 'services', 'profiles', 'settings'],
+      'утверждение нужно на каждую вкладку справочников, а не на одну');
+    for (const [tab, what] of Object.entries(expected)) {
       await page.goto(`#/refs/${tab}`);
       assertClean(page.text(), `справочник ${tab}`);
+      for (const value of what.text || []) {
+        assert.ok(page.text().includes(value), `на вкладке «${tab}» не видно засеянного значения «${value}»`);
+      }
+      for (const [label, key] of what.fields || []) {
+        assert.equal(page.field(label).value, String(s.settings[key]),
+          `на вкладке «${tab}» поле «${label}» показывает не то, что прислал сервер`);
+      }
     }
-    await page.goto('#/refs/organizations');
-    assert.ok(page.text().includes('ПАО «Заказчик R1»'));
+    assert.equal(s.settings.injury_rate_percent, '0,3', 'засеянная ставка травматизма дошла до сервера');
 
     await page.goto(`#/tender/${s.tender.id}`);
     const text = page.text();
