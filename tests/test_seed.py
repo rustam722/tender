@@ -11,7 +11,7 @@ from app.models import ROLE_PARTICIPANT, LotItem, Tender
 from app.render.context import DOCUMENTS, TABLE_DOCUMENTS, build_context
 from app.render.docx_render import render_docx
 from app.repo import Repo
-from scripts.seed import SeedError, seed
+from scripts.seed import SeedError, seed, seed_if_empty
 
 
 @pytest.fixture
@@ -283,3 +283,56 @@ def test_signature_guard_rejects_legacy_binary_formats(tmp_path):
     (tmp_path / "Старый.doc").write_bytes(bytes.fromhex("d0cf11e0"))
     problems = _images_outside_whitelist(tmp_path)
     assert len(problems) == 1 and "старом двоичном формате" in problems[0]
+
+
+# ---- первый запуск: справочники наполняются сами ---------------------------------
+
+def test_seed_if_empty_fills_an_empty_base(repo):
+    # фирма на новом компьютере не должна открыть «Справочники» и увидеть
+    # пустоту: всё, что здесь записано, уже написано
+    assert counts(repo) == {k: 0 for k in counts(repo)}
+    assert seed_if_empty(repo) is True
+    assert all(counts(repo).values())
+
+
+def test_seed_if_empty_does_not_touch_a_base_that_already_has_data(repo):
+    # Повторное наполнение вернуло бы запись, которую человек СТЁР осознанно
+    # (лишний прибор, уволившийся сотрудник). Поэтому условие -- пустота базы,
+    # а не идемпотентность seed.
+    seed(repo)
+    victim = repo.list_employees()[-1]
+    repo.delete_employee(victim.id)
+    before = counts(repo)
+    assert seed_if_empty(repo) is False
+    assert counts(repo) == before
+    assert victim.full_name not in [e.full_name for e in repo.list_employees()]
+
+
+def test_one_surviving_record_is_enough_to_count_as_not_empty(repo):
+    # пустота проверяется по каждому справочнику: одна организация в базе --
+    # уже не первый запуск
+    from app.models import ROLE_CUSTOMER, Organization
+    repo.save_organization(Organization(role=ROLE_CUSTOMER, inn="2904016130",
+                                        short_name="МУП «Полигон»"))
+    assert seed_if_empty(repo) is False
+    assert len(repo.list_employees()) == 0
+
+
+def test_the_program_fills_the_references_at_its_first_start(tmp_path, capsys):
+    # то, что увидит человек: наполнение делает сама программа, а не докстринг
+    from app import db as db_module
+    from app.web import __main__ as entry
+    path = tmp_path / "first.db"
+    conn = db_module.connect(path)
+    db_module.migrate(conn)
+    conn.close()
+    entry.fill_references(path)
+    out = capsys.readouterr().out
+    assert "Справочники заполнены" in out and "Traceback" not in out
+    conn = db_module.connect(path)
+    try:
+        assert all(counts(Repo(conn)).values())
+    finally:
+        conn.close()
+    entry.fill_references(path)                 # второй запуск молчит
+    assert "Справочники заполнены" not in capsys.readouterr().out

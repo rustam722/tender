@@ -941,6 +941,9 @@ def test_startup_failures_are_russian_not_tracebacks(app, monkeypatch, capsys):
     def broken(path):
         raise sqlite3.OperationalError("unable to open database file")
 
+    # наполнение справочников при первом запуске идёт по настоящему пути базы
+    # программы -- в тесте его не трогаем
+    monkeypatch.setattr(entry, "fill_references", lambda path: None)
     monkeypatch.setattr(entry, "create_app", broken)
     assert entry.main() == 1
     out = capsys.readouterr().out

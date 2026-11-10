@@ -4,6 +4,9 @@
 программа однопользовательская. С другого компьютера сети сюда не достучаться.
 Порт занят или база не открывается -- понятная фраза в окне программы вместо
 трассировки (окно видит пользователь, а не только разработчик).
+
+На пустой базе справочники наполняются сами: первый запуск на новом
+компьютере не должен показывать пустоту (см. fill_references).
 """
 import logging
 import sqlite3
@@ -11,7 +14,9 @@ import sys
 
 from werkzeug.serving import ThreadedWSGIServer
 
-from app.config import DB_PATH
+from app import db
+from app.config import BASE_DIR, DB_PATH
+from app.repo import Repo
 from app.web import create_app
 
 HOST = "127.0.0.1"
@@ -46,6 +51,42 @@ def build_server(app, port: int = PORT):
     return _LocalServer(HOST, port, app)
 
 
+def fill_references(db_path) -> None:
+    """Первый запуск на пустой базе: справочники наполняются сами.
+
+    Иначе фирма на новом компьютере открывает «Справочники» и видит пустоту --
+    организации, сотрудников, 23 позиции МТР, каталог услуг и три профиля
+    заказчиков пришлось бы набрать заново, хотя они уже написаны. Докстринг
+    скрипта наполнения путём к этому знанию не является.
+
+    Наполнение живёт в scripts/, а не в пакете app, поэтому импорт локальный,
+    а корень проекта добавляется в путь: ярлык может запустить программу из
+    любой папки. Сбой наполнения программу не останавливает -- справочники
+    можно завести руками, и фраза говорит, что случилось.
+    """
+    if str(BASE_DIR) not in sys.path:
+        sys.path.insert(0, str(BASE_DIR))
+    try:
+        from scripts.seed import SeedError, seed_if_empty
+    except ImportError:
+        logging.getLogger(__name__).exception("Нет модуля наполнения справочников")
+        print("Справочники не заполнены: рядом с программой нет папки scripts. "
+              "Справочники можно завести вручную на экране «Справочники».")
+        return
+    conn = db.connect(db_path)
+    try:
+        if seed_if_empty(Repo(conn)):
+            print("Справочники заполнены данными «Техносферы»: "
+                  "это первый запуск программы на этой базе.")
+    except (SeedError, OSError, sqlite3.Error) as exc:
+        logging.getLogger(__name__).exception("Не удалось заполнить справочники")
+        print(f"Справочники не заполнены: {exc if isinstance(exc, SeedError) else ''}"
+              " Программа работает, справочники можно завести вручную "
+              "на экране «Справочники».")
+    finally:
+        conn.close()
+
+
 def main() -> int:
     try:
         app = create_app(DB_PATH)
@@ -54,6 +95,7 @@ def main() -> int:
         print(f"Не удалось открыть базу данных {DB_PATH}: проверьте, что файл не занят "
               "другой программой, не повреждён и что в папке можно записывать.")
         return 1
+    fill_references(DB_PATH)
     try:
         server = build_server(app)
     except BindError:

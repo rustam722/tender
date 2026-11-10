@@ -426,6 +426,27 @@ def seed(repo: Repo) -> None:
                 declaration_text=declaration))
 
 
+def seed_if_empty(repo: Repo) -> bool:
+    """Наполняет справочники, если база пуста; возвращает, наполнила ли.
+
+    Первый запуск на новом компьютере не должен показывать пустоту: всё, что
+    здесь записано, уже написано, а человек, открывший пустые справочники,
+    решит, что программа сломана, и наберёт заново то, что у него есть.
+
+    Проверяется пустота, а не идемпотентность `seed`: повторный запуск по
+    непустой базе не дублирует записи, но вернул бы ту, которую человек
+    СТЁР осознанно (лишний прибор, уволившийся сотрудник). Поэтому
+    наполнение -- только по пустой базе; полное наполнение остаётся за
+    запуском самого скрипта (`python scripts/seed.py`).
+    """
+    if (repo.list_organizations() or repo.list_employees()
+            or repo.list_assets() or repo.list_services()
+            or repo.list_experience() or repo.list_customer_profiles()):
+        return False
+    seed(repo)
+    return True
+
+
 def main() -> int:
     conn = db.connect(DB_PATH)
     try:
