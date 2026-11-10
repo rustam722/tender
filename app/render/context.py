@@ -23,6 +23,12 @@
                        vat и vat_value -- НДС позиции по ставке тендера,
                        округлённый до копеек (ROUND_HALF_UP) на строке
     estimate           статьи калькуляции, Decimal
+    printed_price_wo_vat
+                       цена без НДС, которую НАПЕЧАТАЕТ этот документ (Decimal),
+                       или None, если цены он не печатает: у КП это сумма
+                       напечатанных строк позиций лота, у книги калькуляции --
+                       итог estimate. Сравнивает их сборка пакета
+                       (app.render.package), ей одной видно, что в пакете
     materials,         строки материалов и субподряда: number, name, unit,
     subcontract        quantity (Decimal), price и amount (текст через money),
                        price_value и amount_value (Decimal), note; их суммы
@@ -346,8 +352,8 @@ def _rate_warnings(document: str, book_rates: dict[str, Decimal],
     return found
 
 
-def _workbook_sums_warnings(document: str, spec: DocSpec | None, labor, materials,
-                            subcontract, settings) -> list[str]:
+def _workbook_sums_warnings(document: str, spec: DocSpec | None, cell_map,
+                            labor, materials, subcontract, settings) -> list[str]:
     """Документ с книгой Excel заказчика: разойдутся ли две бумаги.
 
     Программа считает итог по напечатанным строкам и округляет страховые до
@@ -366,11 +372,11 @@ def _workbook_sums_warnings(document: str, spec: DocSpec | None, labor, material
     ставки в книге и в настройках. Назвать одну, пока действуют и другие, --
     отправить человека чинить не то.
 
-    Поднимает `CellMapError`, если карту не разобрать или из клетки ставки
-    книги ставку не прочитать: сторож, который молча выключается, хуже
-    отсутствующего. Сборка превращает это в пропуск одного документа
-    с причиной (`PackageResult.skipped`)."""
-    if not (spec and spec.cellmap):
+    Карту разбирает и передаёт сюда `build_context` (одно чтение на документ);
+    поднимает `CellMapError`, если из клетки ставки книги ставку не прочитать:
+    сторож, который молча выключается, хуже отсутствующего. Сборка превращает
+    это в пропуск одного документа с причиной (`PackageResult.skipped`)."""
+    if cell_map is None:
         return []
     # Здесь не глотается ничего. Сторож, который молча выключается, хуже
     # отсутствующего: пакет уходит человеку без единого замечания, и он считает,
@@ -379,7 +385,6 @@ def _workbook_sums_warnings(document: str, spec: DocSpec | None, labor, material
     # ставок, а всю проверку целиком, вместе со сравнением итогов.
     # Отказ доходит до build_package, и документ уходит в skipped с русской
     # причиной; остальные документы пакета собираются.
-    cell_map = load_cellmap(Path(config.CELLMAPS_DIR) / spec.cellmap)
     # Ставки книги лежат в самой книге; где именно -- говорит карта. В эти
     # клетки не смотрит больше никто: fill_workbook их не читает, и отказ,
     # проглоченный здесь, не пришёл бы человеку ниоткуда.
@@ -417,9 +422,13 @@ def _workbook_sums_warnings(document: str, spec: DocSpec | None, labor, material
         return rate_notes
 
     if book != program:
+        # Называется только то, что действительно сравнили: итог книги против
+        # итога расчёта. «Коммерческое предложение» здесь когда-то стояло
+        # рядом с «программой» -- и обещало сравнение, которого не было: КП
+        # печатает сумму позиций лота, а не итог расчёта. Две цены пакета
+        # сличает build_package по printed_price_wo_vat.
         text = (f"В «{document}» книга Excel посчитает итог без НДС "
-                f"{money(book)}, а программа и «Коммерческое предложение» -- "
-                f"{money(program)}.")
+                f"{money(book)}, а расчёт программы даёт {money(program)}.")
     else:
         text = (f"В «{document}» итог без НДС в книге Excel и в программе "
                 f"совпадёт ({money(program)}), но подытоги книги не сойдутся "
@@ -467,6 +476,49 @@ def _lot_rows(items: list[LotItem], rate: Decimal) -> list[dict]:
     return rows
 
 
+# Откуда документ берёт цену без НДС, которую НАПЕЧАТАЕТ на бумаге.
+#
+# У документа с книгой заказчика это видно из его карты ячеек: пишет она
+# позиции лота -- книга сложит их и напечатает их сумму; пишет трудозатраты,
+# материалы и субподряд -- книга посчитает по ним калькуляцию и напечатает её
+# итог. Поэтому для книг список держать не нужно: новая форма нового заказчика
+# попадает под правило сама.
+#
+# У документов Word карты нет, и контекст не знает, какой шаблон его
+# отрендерит, -- поэтому здесь список имён, как TABLE_DOCUMENTS. Сегодня цену
+# печатает один шаблон Word: «Коммерческое предложение» выводит
+# money_total(items ... price_value). Новый шаблон Word с ценой -- добавить сюда,
+# иначе сверка цен пакета его не увидит.
+_PRICE_FROM_LOT_ITEMS = frozenset({"Коммерческое предложение"})
+_LOT_SOURCE = "items"
+_ESTIMATE_SOURCES = frozenset({"labor", "materials", "subcontract"})
+
+
+def _lot_price(items: list[dict]) -> Decimal:
+    """Цена без НДС по позициям лота -- сумма НАПЕЧАТАННЫХ строк, как её
+    выводит «Итого» коммерческого предложения (доктрина напечатанной строки)."""
+    return money_total([row["price_value"] for row in items])
+
+
+def _printed_price(document: str, cell_map, items: list[dict],
+                   calc: Estimate) -> Decimal | None:
+    """Цена без НДС, которую напечатает ИМЕННО ЭТОТ документ, или None, если
+    цены он не печатает вовсе (декларация, справка о кадрах).
+
+    Сравнивать надо напечатанное, а не посчитанное: позиции лота и калькуляцию
+    человек заполняет в разных местах карточки, и в одном пакете легко
+    оказываются две бумаги с разной ценой. Сравнение -- в `build_package`:
+    только сборка знает, какие документы в пакете."""
+    if cell_map is not None:
+        sources = {block.source for block in cell_map.rows}
+        if _LOT_SOURCE in sources:
+            return _lot_price(items)
+        if sources & _ESTIMATE_SOURCES:
+            return calc.total_wo_vat
+        return None
+    return _lot_price(items) if document in _PRICE_FROM_LOT_ITEMS else None
+
+
 def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
                   experience_ids: list[int] | tuple[int, ...] | None = None) -> dict:
     """Собирает контекст тендера. Неизвестный id -- LookupError по-русски.
@@ -512,6 +564,11 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
 
     layouts = _layouts(profile, document)
     spec = _doc_spec(profile, document)
+    # Карта ячеек читается ровно один раз на документ: по ней считают и сверку
+    # итогов, и цену, которую документ напечатает. Отказ разбора не глотается
+    # и уходит наверх -- сборка превратит его в пропуск документа с причиной.
+    cell_map = (load_cellmap(Path(config.CELLMAPS_DIR) / spec.cellmap)
+                if spec and spec.cellmap else None)
     warnings = []
     if (profile and document in TABLE_DOCUMENTS
             and document in profile.documents
@@ -521,7 +578,8 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
             "раскладка таблиц: колонки взяты по умолчанию. Если у заказчика "
             "своя форма таблицы, добавьте раскладку в профиль.")
     warnings.extend(_workbook_sums_warnings(
-        document or "", spec, stored_labor, materials, subcontract, priced))
+        document or "", spec, cell_map, stored_labor, materials, subcontract,
+        priced))
     if experience_ids is None:
         experience_ids = tender.experience_ids
     selected = []
@@ -535,11 +593,14 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
                 f"Запись опыта с id={exp_id} не найдена в справочнике, "
                 "в справку об опыте не попала. Проверьте отбор опыта.")
 
+    items = _lot_rows(repo.list_lot_items(tender_id), rate)
     return {
         "org": org,
         "customer": customer,
         "tender": tender_fields,
-        "items": _lot_rows(repo.list_lot_items(tender_id), rate),
+        "items": items,
+        "printed_price_wo_vat": _printed_price(document or "", cell_map,
+                                               items, calc),
         "estimate": asdict(calc),
         "materials": materials_table,
         "subcontract": subcontract_table,

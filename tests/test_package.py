@@ -15,9 +15,10 @@ from openpyxl import load_workbook
 from app import config, db
 from app.models import (
     ROLE_CUSTOMER, ROLE_PARTICIPANT, Asset, CustomerProfile, DocSpec,
-    ExperienceRecord, LotItem, Organization, Tender,
+    ExperienceRecord, LotItem, Organization, Tender, TenderLaborRow,
 )
 from app.render import package as package_module
+from app.render.context import build_context
 from app.render.package import (
     PackageError, PackageResult, build_package, planned_files, safe_filename,
 )
@@ -635,6 +636,22 @@ def test_excel_form_is_filled_from_the_customers_own_workbook(repo, dirs, tmp_pa
     assert ws["E9"].value == "=C9+D9"               # формулы заказчика целы
     # точное сравнение: приближённое спрятало бы регресс округления денег
     assert Decimal(str(ws["C9"].value)) == Decimal("100000.10")
+
+
+def test_the_price_of_a_document_is_read_from_its_own_cellmap(repo, dirs):
+    # Какую цену документ НАПЕЧАТАЕТ, видно из его карты: форма Роснефти пишет
+    # в книгу позиции лота (C9:C19), значит напечатает их сумму, а не итог
+    # калькулятора. Сказать про неё «итог расчёта» -- соврать о сравнении.
+    templates, cellmaps = dirs
+    shutil.copy(REAL_FORM, templates / "forma_tkp_rosneft_murmansk.xlsx")
+    shutil.copy(ROOT / "cellmaps" / "tkp_rosneft_murmansk.json", cellmaps)
+    tid = rosneft_tender(repo)                  # две позиции по 100 000,10
+    repo.save_tender_labor(TenderLaborRow(
+        tender_id=tid, position=1, post="Эколог", headcount=1,
+        hours=Decimal("10"), rate=Decimal("270")))
+    context = build_context(tid, repo, document=TKP)
+    assert context["printed_price_wo_vat"] == Decimal("200000.20")
+    assert context["estimate"]["total_wo_vat"] != Decimal("200000.20")
 
 
 def test_refused_excel_form_leaves_no_file_and_spares_the_word_documents(

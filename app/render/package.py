@@ -29,6 +29,9 @@
     документа заменяются при очистке имени.
   * Предупреждения контекста (`warnings`) собираются по документам в
     `PackageResult.warnings`, чтобы их показал интерфейс.
+  * Цены, которые документы НАПЕЧАТАЮТ (`printed_price_wo_vat` контекста),
+    сличаются между собой: разошлись -- предупреждение о пакете целиком.
+    Место именно здесь: только сборка знает, какие документы в пакете.
 """
 import os
 import re
@@ -37,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app import config
-from app.render.context import build_context
+from app.render.context import build_context, money
 from app.render.docx_render import TemplateError, render_docx
 from app.render.layouts import LayoutError
 from app.render.xlsx_render import CellMapError, fill_workbook, load_cellmap
@@ -73,12 +76,19 @@ class PackageError(Exception):
     """Пакет собрать нельзя вовсе (в отличие от одного документа); по-русски."""
 
 
+# Под этим именем в warnings стоит предупреждение не об одном документе, а о
+# пакете целиком (две бумаги с разной ценой). Экран печатает «имя: текст»,
+# и «Пакет: ...» читается так же, как «Калькуляция к КП: ...».
+PACKAGE_WIDE = "Пакет"
+
+
 @dataclass
 class PackageResult:
     written: list[Path] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)    # (документ, причина)
     # (документ, предупреждение контекста): что подставлено по умолчанию или
-    # пропало из данных; собирается и для документов, которые не удалось собрать
+    # пропало из данных; собирается и для документов, которые не удалось собрать.
+    # Под именем PACKAGE_WIDE стоит предупреждение обо всём пакете сразу.
     warnings: list[tuple[str, str]] = field(default_factory=list)
 
 
@@ -241,8 +251,32 @@ def _move_refusal(target: Path, replacing: bool) -> str:
             "программе, и соберите заново.")
 
 
+def _price_warnings(prices: dict[str, object]) -> list[tuple[str, str]]:
+    """Разошлись ли цены, которые документы пакета НАПЕЧАТАЮТ.
+
+    Сравнивается не то, что посчитала одна подсистема, а то, что каждый
+    документ выведет на бумагу: «Коммерческое предложение» печатает сумму
+    напечатанных строк позиций лота, книга калькуляции -- итог расчёта. Эти
+    два числа человек вводит в разных местах карточки, и до этой сверки их
+    не сравнивал никто: пакет уходил в комиссию с двумя разными ценами.
+
+    Документы без цены (декларация, справки) не участвуют. Одна цена на весь
+    пакет или один документ с ценой -- молчание: сигнал, который горит всегда,
+    через неделю перестают читать."""
+    priced = {d: p for d, p in prices.items() if p is not None}
+    if len(set(priced.values())) < 2:
+        return []
+    listing = "; ".join(f"«{d}» -- {money(p)}" for d, p in priced.items())
+    return [(PACKAGE_WIDE,
+             "Документы пакета печатают разную цену без НДС: "
+             f"{listing}. Одна заявка с двумя ценами -- повод отклонить её. "
+             "Сверьте позиции лота и калькулятор на карточке тендера "
+             "и соберите пакет заново.")]
+
+
 def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
                taken: set[str], warnings: list[tuple[str, str]],
+               prices: dict[str, object],
                overwrite: bool, experience_ids) -> Path:
     """Собирает один документ; при отказе поднимает исключение. Нового файла
     после отказа не остаётся, а прежний (при overwrite) остаётся целым."""
@@ -257,6 +291,7 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
     context = build_context(tender_id, repo, document=document,
                            experience_ids=experience_ids)
     warnings.extend((document, text) for text in context["warnings"])
+    prices[document] = context["printed_price_wo_vat"]
     # Единый путь записи: документ всегда пишется под временным именем рядом с
     # целью и становится настоящим файлом одним действием. Так оборванная или
     # неудавшаяся запись оставляет только `~pkg-…`, который уберёт подметание,
@@ -352,6 +387,10 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
 
     Перед сборкой из папки убираются остатки оборванных замен (`~pkg-xxxxxxxx`).
 
+    Цены, которые документы напечатают, сличаются между собой: разошлись --
+    в `warnings` ложится строка под именем `PACKAGE_WIDE` с именами документов
+    и их числами.
+
     Неизвестный тендер -- `LookupError`; нет папки шаблонов или нельзя создать
     папку пакета -- `PackageError`; в обоих случаях на диск ничего не пишется.
     Сбой одного документа в исключение не превращается: см. `PackageResult.skipped`.
@@ -363,6 +402,7 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
     result = PackageResult()
     seen: set[str] = set()
     taken: set[str] = set()
+    prices: dict[str, object] = {}      # документ -> цена, которую он напечатает
     for document in documents:
         if document in seen:
             result.skipped.append((document, (
@@ -372,7 +412,7 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
         spec = profile.docs.get(document) if profile else None
         try:
             path = _build_one(tender_id, document, spec, out_dir, repo,
-                              taken, result.warnings, overwrite,
+                              taken, result.warnings, prices, overwrite,
                               experience_ids)
         except _Refusal as exc:
             result.skipped.append((document, str(exc)))
@@ -384,4 +424,5 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
                 f"({type(exc).__name__}). Остальные документы пакета не затронуты.")))
         else:
             result.written.append(path)
+    result.warnings.extend(_price_warnings(prices))
     return result

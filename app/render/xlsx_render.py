@@ -255,6 +255,30 @@ def load_cellmap(path: Path) -> CellMap:
                    rates=_rates(data.get("rates"), name))
 
 
+def cell_paths(cell_map: CellMap) -> list[str]:
+    """Пути контекста, которые карта берёт из данных, в порядке появления.
+
+    Нужен тем, кто должен знать, ЧТО карта напишет в книгу, книги не открывая:
+    экран показывает условия сделки, которых требует форма заказчика, а сборка
+    называет недостающие ответы все разом, а не по одному за попытку.
+
+    Пути, начинающиеся с `row.`, в список не входят: они относятся к элементу
+    списка внутри блока строк, а не к самому контексту.
+    """
+    paths: list[str] = []
+    expressions = [*cell_map.cells.values()]
+    for block in cell_map.rows:
+        expressions.extend(block.columns.values())
+    for expr in expressions:
+        for raw in _PLACEHOLDER.findall(expr):
+            path = raw.strip()
+            if path == "row" or path.startswith("row."):
+                continue
+            if path not in paths:
+                paths.append(path)
+    return paths
+
+
 def _rates(raw: object, name: str) -> dict[str, str]:
     """Раздел rates: имя ставки -> адрес клетки. Нет раздела -- пустой словарь."""
     if raw is None:

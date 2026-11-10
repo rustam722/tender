@@ -21,17 +21,18 @@ from dataclasses import replace
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
+import docx
 import pytest
 from openpyxl import load_workbook
 
 from app import config, db
 from app.calc import LaborLine, workbook_total
-from app.models import Tender, TenderCostItem, TenderLaborRow
+from app.models import LotItem, Tender, TenderCostItem, TenderLaborRow
 from app.render.context import build_context, money
-from app.render.package import build_package
+from app.render.package import PACKAGE_WIDE, build_package
 from app.render.xlsx_render import CellMapError, fill_workbook, load_cellmap
 from app.repo import Repo
-from scripts.seed import DOC_ESTIMATE, DOC_KP, seed
+from scripts.seed import DOC_DECLARATION, DOC_ESTIMATE, DOC_KP, seed
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "templates_docs" / "Калькуляция к КП Арктикгаз.xlsx"
@@ -83,10 +84,12 @@ def repo(tmp_path):
     conn.close()
 
 
-def make_custom_tender(repo, *, labor=(), materials=(), subcontract=()) -> int:
+def make_custom_tender(repo, *, labor=(), materials=(), subcontract=(),
+                       lot=()) -> int:
     """Тендер Арктикгаза из справочников, которые наполняет seed.
     labor -- (должность, человек, часов, ставка); materials и subcontract --
-    (название, количество, цена)."""
+    (название, количество, цена); lot -- позиции лота (название, цена),
+    из них коммерческое предложение печатает свой итог."""
     seed(repo)
     me = repo.find_organization_by_inn("5904188041")
     customer = next(p.customer_id for p in repo.list_customer_profiles()
@@ -106,6 +109,9 @@ def make_custom_tender(repo, *, labor=(), materials=(), subcontract=()) -> int:
                 tender_id=tid, kind=kind, position=n, name=name, unit="шт.",
                 quantity=Decimal(quantity), price=Decimal(price),
                 note="содержание" if kind == "subcontract" else ""))
+    for n, (name, price) in enumerate(lot, start=1):
+        repo.save_lot_item(LotItem(tender_id=tid, position=n, name=name,
+                                   price=Decimal(price)))
     return tid
 
 
@@ -573,9 +579,14 @@ def templates_with_rate_cell(folder: Path, value) -> Path:
 
 def package_with_rate_cell(repo, tmp_path, value, monkeypatch):
     """Пакет из калькуляции и КП, собранный с заданным значением в C17 и
-    настройкой страховых 31 %: ставки разошлись, сторожу есть о чём сказать."""
+    настройкой страховых 31 %: ставки разошлись, сторожу есть о чём сказать.
+
+    Позиция лота нужна КП: без неё коммерческое предложение ушло бы в skipped
+    с нулевым итогом, и проверка «остальные документы человек получает»
+    проверяла бы пустоту."""
     tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
-                             subcontract=ARKTIK_SUBCONTRACT)
+                             subcontract=ARKTIK_SUBCONTRACT,
+                             lot=[("Разработка КЭР", "3950000")])
     path = templates_with_rate_cell(tmp_path / "templates", value)
     monkeypatch.setattr(config, "TEMPLATES_DOCS_DIR", path.parent)
     repo.save_settings(replace(repo.get_settings(),
@@ -611,10 +622,14 @@ def test_a_sound_rate_cell_in_the_same_place_builds_and_warns_twice(
     result = package_with_rate_cell(repo, tmp_path, 0.3, monkeypatch)
     assert result.skipped == []
     assert [p.suffix for p in result.written] == [".xlsx", ".docx"]
-    assert [d for d, _ in result.warnings] == [DOC_ESTIMATE, DOC_ESTIMATE]
-    totals, note = (plain(t) for _, t in result.warnings)
+    # третье предупреждение -- о пакете целиком: КП печатает 3 950 000 из
+    # позиции лота, а калькуляция при страховых 31 % даёт другой итог
+    assert [d for d, _ in result.warnings] == [DOC_ESTIMATE, DOC_ESTIMATE,
+                                               PACKAGE_WIDE]
+    totals, note, prices = (plain(t) for _, t in result.warnings)
     assert "книга Excel посчитает итог без НДС 4 000 000,00" in totals
     assert "ставка страховых взносов 30 %, а в настройках программы 31 %" in note
+    assert f"«{DOC_KP}» -- 3 950 000,00" in prices
 
 
 # Данные, на которых видна вся арифметика книги разом: материалы, субподряд и
@@ -712,8 +727,11 @@ def test_the_warning_prints_the_contexts_own_estimate_as_the_programs_total(repo
     (text,) = context["warnings"]
     program = context["estimate"]["total_wo_vat"]
     assert program == Decimal("13897.80")
-    assert f"«Коммерческое предложение» -- {money(program)}." in text
+    assert f"расчёт программы даёт {money(program)}." in text
     assert "13 897,79" not in plain(text)      # итог по сырым трудозатратам
+    # «Коммерческое предложение» из текста убрано: оно печатает сумму позиций
+    # лота, а не итог расчёта, и сторож не вправе обещать сравнение с ним
+    assert "Коммерческое предложение" not in text
 
 
 @pytest.mark.parametrize("digits, program", [(2, "1 507,50"), (-3, "2 000,00")],
@@ -786,3 +804,65 @@ def test_package_builds_the_estimate_from_the_customer_profile(repo, tmp_path):
     assert len(result.warnings) == 1
     document, text = result.warnings[0]
     assert document == DOC_ESTIMATE and "«materials 1»" in text
+
+
+# ---- две бумаги с ценой: сличается НАПЕЧАТАННОЕ ---------------------------------------
+
+# Цена «Коммерческого предложения» приходит из позиций лота, цена калькуляции --
+# из калькулятора. Это два разных числа, которые человек вводит в разных местах
+# карточки, и до этой сверки их не сравнивал никто: пакет уходил в комиссию
+# с двумя разными ценами, и ни одного предупреждения в нём не было.
+
+def kp_total(path: Path) -> str:
+    """Итог без НДС, НАПЕЧАТАННЫЙ в коммерческом предложении: предпоследняя
+    клетка строки «Итого». Читается из готового файла, а не из контекста."""
+    row = docx.Document(path).tables[-1].rows[-1]
+    return plain(row.cells[-2].text.strip())
+
+
+def two_papers(repo, tmp_path, lot_price, documents=(DOC_KP, DOC_ESTIMATE)):
+    """Пакет Арктикгаза (итог калькулятора ровно 4 000 000) с одной позицией
+    лота на lot_price."""
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT,
+                             lot=[("Разработка КЭР", lot_price)])
+    return build_package(tid, list(documents), tmp_path / "out", repo)
+
+
+def test_a_package_names_both_papers_and_both_numbers_when_prices_differ(
+        repo, tmp_path):
+    result = two_papers(repo, tmp_path, "3950000")
+    assert result.skipped == []
+    written = {p.suffix: p for p in result.written}
+    # сперва убеждаемся, что бумаги действительно разные: 50 000 разницы
+    assert kp_total(written[".docx"]) == "3 950 000,00"
+    assert evaluate(load_workbook(written[".xlsx"])[SHEET], "D26") \
+        == Decimal("4000000")
+    (document, text), = [w for w in result.warnings if w[0] == PACKAGE_WIDE]
+    text = plain(text)
+    assert f"«{DOC_KP}» -- 3 950 000,00" in text
+    assert f"«{DOC_ESTIMATE}» -- 4 000 000,00" in text
+
+
+def test_the_same_price_in_both_papers_says_nothing(repo, tmp_path):
+    # обратная сторона: сигнал, который горит всегда, через неделю перестают
+    # читать. На ровных данных Арктикгаза молчат и прочие сторожа
+    result = two_papers(repo, tmp_path, "4000000")
+    assert result.skipped == [] and len(result.written) == 2
+    assert kp_total(result.written[0]) == "4 000 000,00" \
+        or kp_total(result.written[1]) == "4 000 000,00"
+    assert result.warnings == []
+
+
+def test_one_document_with_a_price_is_compared_with_nothing(repo, tmp_path):
+    result = two_papers(repo, tmp_path, "3950000", documents=(DOC_KP,))
+    assert [p.name for p in result.written] == [f"{DOC_KP}.docx"]
+    assert result.warnings == []
+
+
+def test_a_document_without_a_price_does_not_join_the_comparison(repo, tmp_path):
+    # у декларации цены нет вовсе: назвать её в сверке -- соврать
+    result = two_papers(repo, tmp_path, "3950000",
+                        documents=(DOC_KP, DOC_DECLARATION))
+    assert result.skipped == [] and len(result.written) == 2
+    assert result.warnings == []
