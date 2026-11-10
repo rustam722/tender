@@ -1,10 +1,13 @@
 import copy
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
 
-from app.calc import LaborLine, TargetTooLow, estimate, price_gap, solve_hours
-from tests.test_calc import ARKTIK, DEFAULTS
+from app.calc import (
+    LaborLine, TargetTooLow, estimate, price_gap, printed_labor, solve_hours,
+)
+from tests.test_calc import ARKTIK, DEFAULTS, KOPECKS
 
 MATERIALS = Decimal("41686")
 SUBCONTRACT = Decimal("1620000")
@@ -330,3 +333,36 @@ def test_target_too_low_prints_money_the_way_money_does():
     text = str(with_vat.value)
     assert money(Decimal("1050000")) in text and money(Decimal("1000000")) in text
     assert not re.search(r"\d\.\d", text) and not re.search(r"\d \d", text)
+
+
+# ---- доводка меряет НАПЕЧАТАННЫЙ итог ------------------------------------------
+
+# Ставка с тремя знаками: 13 ч x 181,215 = 2 355,795 печатается как 2 355,80,
+# и три строки дают 7 067,40 напечатанного ФОТ против 7 067,39 сырого.
+FRACTIONAL = [LaborLine(f"Эколог {n}", 1, Decimal("13"), Decimal("181.215"))
+              for n in (1, 2, 3)]
+
+
+def printed_total(lines, settings=KOPECKS):
+    """Итог без НДС по напечатанным строкам -- тот, который выведет документ."""
+    return estimate(printed_labor(lines), Decimal(0), Decimal(0),
+                    settings).total_wo_vat
+
+
+def test_solved_hours_are_a_local_optimum_of_the_printed_total():
+    # Доктрина напечатанной строки одна на весь проект: доводка обязана
+    # минимизировать тот итог, который выведут документ и экран, а не сумму
+    # сырых произведений. На этих данных доводка по сырым строкам
+    # останавливается там, где напечатанный итог ещё можно приблизить
+    # к цели на копейку, -- и человек видит расхождение, которого нет.
+    target = Decimal("11036.78")
+    solved = solve_hours(target, FRACTIONAL, Decimal(0), Decimal(0), KOPECKS)
+    best = abs(printed_total(solved) - target)
+    for i, line in enumerate(solved):
+        for step in (1, -1):
+            if line.hours + step < 0:
+                continue
+            trial = (solved[:i] + [replace(line, hours=line.hours + step)]
+                     + solved[i + 1:])
+            assert abs(printed_total(trial) - target) >= best, (i, step)
+    assert [x.hours for x in solved] == [Decimal(13), Decimal(13), Decimal(14)]

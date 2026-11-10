@@ -52,6 +52,26 @@ def money_total(values) -> Decimal:
     return sum((_money(Decimal(v)) for v in values), Decimal("0.00"))
 
 
+def printed_labor(labor: list[LaborLine]) -> list[LaborLine]:
+    """Строки ФОТ как они будут НАПЕЧАТАНЫ: сумма строки округлена до копеек
+    один раз, на строке, и дальше участвует уже округлённой.
+
+    Доктрина напечатанной строки: ФОТ в документе -- сумма напечатанных сумм
+    строк, а не округление суммы сырых произведений. На двух строках
+    13 ч x 181,215 руб/ч это 4 711,60 против 4 711,59, и итог расходится на
+    две копейки. Строка отдаётся как «1 чел. x сумма строки x 1 руб.»:
+    `estimate` округляет ФОТ сам, и от сырых произведений итог разошёлся бы
+    с напечатанными строками.
+
+    Те же множители строит `app.render.context._printed` -- оттуда идут цифры
+    документов и экранов; здесь они нужны подбору часов, который без них
+    минимизировал не ту величину, что напечатают."""
+    return [LaborLine(x.post, 1,
+                      _money(Decimal(x.headcount) * x.hours * x.rate),
+                      Decimal(1))
+            for x in labor]
+
+
 def estimate(labor: list[LaborLine], materials: Decimal, subcontract: Decimal,
              settings: OrgSettings) -> Estimate:
     """Считает все статьи по составу формул книги КП.xlsx, но своей арифметикой.
@@ -174,7 +194,11 @@ def solve_hours(target: Decimal, labor: list[LaborLine], materials: Decimal,
 
     Ставки, проценты, материалы и субподряд не трогаются. Один множитель k
     на все строки (замкнутая форма), часы -- целые; затем жадная доводка.
-    Исходные строки не меняются, возвращаются новые."""
+    Исходные строки не меняются, возвращаются новые.
+
+    Доводка меряет итог по НАПЕЧАТАННЫМ строкам (`printed_labor`): именно его
+    выведут документ и экран, и минимизировать надо его. Вызывающий обязан
+    считать итог подобранных часов так же -- через `printed_labor`."""
     target_wo_vat = target / (1 + settings.vat_rate) if target_includes_vat else target
     fot0 = sum((Decimal(x.headcount) * x.hours * x.rate for x in labor),
                Decimal("0"))
@@ -200,8 +224,13 @@ def solve_hours(target: Decimal, labor: list[LaborLine], materials: Decimal,
              for x in labor]
 
     def gap(current: list[Decimal]) -> Decimal:
+        # Итог считается по НАПЕЧАТАННЫМ строкам -- тот самый, который выведут
+        # документ и экран калькуляции. По сырым строкам подбор минимизировал
+        # не ту величину и показывал расхождение там, где документ попадал
+        # в цель ровно.
         lines = [replace(x, hours=h) for x, h in zip(labor, current)]
-        return abs(price_gap(target, estimate(lines, materials, subcontract, settings),
+        return abs(price_gap(target, estimate(printed_labor(lines), materials,
+                                              subcontract, settings),
                              target_includes_vat))
 
     # Жадная доводка: часы округлены, и шаг сетки итогов -- стоимость часа самой

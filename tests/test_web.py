@@ -1837,3 +1837,25 @@ def test_the_build_names_every_missing_condition_at_once(client, dirs, tmp_path)
     # на отвеченное условие не жалуемся
     assert "«Цена и условия:»" not in skip["reason"]
     assert "условиям сделки" in skip["reason"]
+
+
+# ---- подбор часов считает ФОТ так же, как его печатает документ -----------------
+
+def test_solve_counts_the_fot_the_way_the_document_prints_it(client):
+    # Единственное место, где доктрина напечатанной строки не соблюдалась:
+    # подбор строил строки из сырых полей базы, и на тех же самых часах
+    # /solve давал 7 085,33 против 7 085,35 в документе -- человек видел
+    # ложное расхождение -0,02 и гонялся за ним.
+    ok(client.post("/api/settings", json={"total_rounding_digits": 2}))
+    tid = make_tender(client)["id"]
+    for n in (1, 2):
+        add_labor(client, tid, post=f"Эколог {n}", hours="13", rate="181,215")
+    direct = ok(client.post(f"/api/tenders/{tid}/estimate", json={}))
+    assert direct["estimate"]["labor"] == f"4{NBSP}711,60"      # сумма напечатанных строк
+    body = ok(client.post(f"/api/tenders/{tid}/solve", json={
+        "target": direct["estimate_value"]["total_wo_vat"]}))
+    # часы подбор не менял -- значит и итог обязан быть тот же, до копейки
+    assert [row["hours"] for row in body["labor"]] == ["13", "13"]
+    assert body["estimate"] == direct["estimate"]
+    assert body["difference_value"] == "0.00"
+    assert body["difference"] == "0,00"

@@ -49,7 +49,10 @@ from urllib.parse import urlsplit
 from flask import current_app, g, jsonify, render_template, request
 
 from app import config, db
-from app.calc import Estimate, LaborLine, estimate, money_total, price_gap, solve_hours
+from app.calc import (
+    Estimate, LaborLine, estimate, money_total, price_gap, printed_labor,
+    solve_hours,
+)
 from app.inn.lookup import build_draft
 from app.render.context import (
     DOCUMENTS, build_context, labor_rows, money, required_conditions,
@@ -497,7 +500,10 @@ def _estimate(tender_id: int):
 
 def _solve(tender_id: int):
     """Подбор часов под цену без НДС. Результат -- предложение: в базе часы не
-    меняются, пользователь применяет их сам (POST строк трудозатрат)."""
+    меняются, пользователь применяет их сам (POST строк трудозатрат).
+
+    ФОТ считается по напечатанным строкам -- так же, как в документах и в
+    ручке /estimate: доктрина напечатанной строки одна на весь проект."""
     data = json_body()
     _only(data, ("target", "target_includes_vat"), "подбор часов")
     target, includes_vat = _target(data, required=True)
@@ -510,7 +516,10 @@ def _solve(tender_id: int):
     materials, subcontract = ctx["estimate"]["materials"], ctx["estimate"]["subcontract"]
     solved = solve_hours(target, lines, materials, subcontract, settings,
                          target_includes_vat=includes_vat)
-    result = estimate(solved, materials, subcontract, settings)
+    # Итог -- по напечатанным строкам, как его считают документы и экран
+    # калькуляции (context._printed). По сырым строкам подбор показывал
+    # расхождение в копейках там, где документ попадал в цель ровно.
+    result = estimate(printed_labor(solved), materials, subcontract, settings)
     body = {
         # та же форма, что у сохранённых строк ФОТ: с суммой строки
         "labor": _labor_view([replace(row, hours=line.hours)
