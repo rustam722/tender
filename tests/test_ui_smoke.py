@@ -110,26 +110,254 @@ def test_script_never_parses_or_formats_a_number():
         assert not re.search(forbidden, code), f"в app.js найдено запрещённое: {forbidden}"
 
 
+def _skip_quoted(code: str, i: int) -> int:
+    """Индекс сразу за закрывающей кавычкой строки, начинающейся на i."""
+    quote = code[i]
+    i += 1
+    while i < len(code):
+        if code[i] == "\\":
+            i += 2
+            continue
+        if code[i] == "\n":           # незакрытая строка: перенос отдаём разбору обратно
+            return i
+        if code[i] == quote:
+            return i + 1
+        i += 1
+    return i
+
+
+def _skip_regex(code: str, i: int) -> int:
+    """Индекс сразу за регулярным выражением (с флагами), начинающимся на i.
+    Внутри класса символов `[…]` косая черта не закрывает выражение: так написано
+    `.replace(/[\\/]+/g, '/')` в app.js."""
+    i += 1
+    in_class = False
+    while i < len(code):
+        ch = code[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "\n":
+            return i
+        if in_class:
+            if ch == "]":
+                in_class = False
+        elif ch == "[":
+            in_class = True
+        elif ch == "/":
+            i += 1
+            while i < len(code) and code[i].isalpha():
+                i += 1
+            return i
+        i += 1
+    return i
+
+
+# После этих знаков косая черта начинает регулярное выражение, а не делит. Ни
+# одной регулярки после ключевого слова (`return /…/`) в app.js нет; появится --
+# сторож посчитает её делением и пожалуется, то есть ошибётся в сторону шума.
+_EXPRESSION_START = set("([{,;:=!&|?+-*/%<>~^") | {""}
+
+
 def _strip_literals(code: str) -> str:
-    """Код без строк и регулярных выражений: остаются только операции."""
-    code = re.sub(r"`(?:\\.|\$\{[^}]*\}|[^`\\])*`", "``", code)
-    code = re.sub(r"'(?:\\.|[^'\\\n])*'", "''", code)
-    code = re.sub(r'"(?:\\.|[^"\\\n])*"', '""', code)
-    code = re.sub(r"(?<=[(,=:!&|?{;])\s*/(?![/*])(?:\\.|\[(?:\\.|[^\]\\\n])*\]|[^/\\\n\[])+/[a-z]*", " /r/", code)
-    return re.sub(r"//[^\n]*", "", code)       # хвостовые комментарии: литералы уже убраны
+    """Код без ТЕКСТА строк, комментариев и регулярных выражений -- но С
+    содержимым подстановок `${…}` шаблонных строк.
+
+    Подстановка -- ровно то место, где экран собирает выводимое: «${rate * 100}»
+    и есть находка, из-за которой запрет появился, поэтому её содержимое обязано
+    дойти до проверки. Текст вокруг подстановки -- не код: «2 * 2» в предложении
+    и «/items» в адресе ничего не считают, и их видеть не нужно.
+
+    Разбор посимвольный, а не регуляркой: подстановки вкладываются друг в друга
+    (`${items.map((x) => `${x}`)}`), и `\\$\\{[^}]*\\}` на первой же `}` обрывается.
+    Переносы строк сохраняются -- номер строки в находке должен быть настоящим."""
+    out = []
+    prev = ""                 # последний значимый (не пробельный) выданный знак
+    stack = []                # "tpl" -- текст шаблонной строки; int -- глубина скобок в ${}
+
+    def emit(text):
+        nonlocal prev
+        out.append(text)
+        stripped = text.strip()
+        if stripped:
+            prev = stripped[-1]
+
+    i, n = 0, len(code)
+    while i < n:
+        ch = code[i]
+        if stack and stack[-1] == "tpl":                      # внутри текста шаблонной строки
+            if ch == "\\":
+                i += 2
+            elif ch == "`":
+                stack.pop()
+                emit("`")
+                i += 1
+            elif ch == "$" and code[i + 1:i + 2] == "{":
+                stack.append(0)
+                emit(" ")
+                i += 2
+            else:
+                out.append("\n" if ch == "\n" else "")        # текст выбрасывается, строки -- нет
+                i += 1
+            continue
+        if ch == "`":
+            stack.append("tpl")
+            emit("`")
+            i += 1
+        elif ch in "'\"":
+            i = _skip_quoted(code, i)
+            emit(ch * 2)
+        elif code[i:i + 2] == "//":
+            while i < n and code[i] != "\n":
+                i += 1
+        elif code[i:i + 2] == "/*":
+            end = code.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            out.append("\n" * code.count("\n", i, end))
+            i = end
+        elif ch == "/" and prev in _EXPRESSION_START:
+            i = _skip_regex(code, i)
+            emit(" rx ")                                      # имя без знаков операций
+        elif ch == "{" and stack and isinstance(stack[-1], int):
+            stack[-1] += 1
+            emit(ch)
+            i += 1
+        elif ch == "}" and stack and isinstance(stack[-1], int):
+            if stack[-1] == 0:
+                stack.pop()                                   # подстановка закрылась -- снова текст
+                emit(" ")
+            else:
+                stack[-1] -= 1
+                emit(ch)
+            i += 1
+        else:
+            emit(ch)
+            i += 1
+    return "".join(out)
+
+
+# Единственное разрешённое исключение, названное и объяснённое: счётчик отрисовок.
+# Это не число на экране, а защита от гонки при быстрой смене экранов.
+ALLOWED_ARITHMETIC = "renderToken += 1"
+
+_OPERATORS = re.compile(r"\*\*=?|\+\+|--|[+\-*/%]=|[+\-*/%~]")
+_OPERAND_END = re.compile(r"[\w$)\]'\"`]")        # чем может кончаться операнд
+_OPERAND_START = re.compile(r"[A-Za-z_$(\['\"`]")  # имя, вызов, скобка или текст
+
+
+def _is_arithmetic(token: str, prev: str, nxt: str) -> bool:
+    """Помечать ли операцию, зная её знак и ближайшие значимые знаки вокруг.
+
+    `*`, `/`, `%`, `**`, `++`, `--` и присваивания с операцией -- всегда счёт.
+    `+`, `-`, `~` смотрят по сторонам: между операндами (с любыми пробелами и
+    через перенос строки) -- счёт; без операнда слева -- унарная форма, и она
+    счёт перед ИМЕНЕМ, вызовом или текстом (`+value`, `~index`, `+'5'` -- всё
+    это приведение к float), но не перед числом: `cells.at(-1)` и
+    `cells.slice(0, -1)` -- индекс с конца, а не арифметика."""
+    if token not in ("+", "-", "~"):
+        return True
+    if not nxt:
+        return False
+    if prev and _OPERAND_END.fullmatch(prev):
+        return bool(_OPERAND_START.fullmatch(nxt)) or nxt.isdigit()
+    return bool(_OPERAND_START.fullmatch(nxt))
+
+
+def _arithmetic_hits(source: str) -> list:
+    """Находки сторожа: (номер строки, сама строка) на каждую операцию."""
+    code = _strip_literals(source).replace(ALLOWED_ARITHMETIC, "")
+    lines = code.split("\n")
+    hits = []
+    for match in _OPERATORS.finditer(code):
+        before = code[:match.start()].rstrip()
+        after = code[match.end():].lstrip()
+        if not _is_arithmetic(match.group(0), before[-1:], after[:1]):
+            continue
+        number = code.count("\n", 0, match.start()) + 1
+        hits.append((number, lines[number - 1].strip()[:100], match.group(0)))
+    return hits
+
+
+# Пробы сторожа: на каждое написание -- и образец, который он ОБЯЗАН пометить,
+# и близкий к нему, который метить НЕЛЬЗЯ. Жадный сторож, метящий всё подряд,
+# бесполезен ровно так же, как слепой: его просто выключат.
+ARITHMETIC_PROBES = (
+    ("умножение на сто внутри подстановки шаблонной строки",
+     "const t = `ставка ${rate * 100} %`;",
+     "const t = `ставка ${rate} %, и 2 * 2 в тексте`;"),
+    ("сложение внутри подстановки шаблонной строки",
+     "const t = `итого ${a + b} руб.`;",
+     "const t = `итого ${a}+${b} руб.`;"),
+    ("операция внутри ВЛОЖЕННОЙ подстановки",
+     "const t = `${items.map((x) => `${x * 2}`)}`;",
+     "const t = `${items.map((x) => `${x}`)}`;"),
+    ("голое умножение вне строки",
+     "const t = a * 100;",
+     "/* в комментарии\n   a * 100\n   ничего не считает */"),
+    ("пробел только слева",
+     "const t = a +b;",
+     "const t = `a +b -- это текст`;"),
+    ("пробел только справа",
+     "const t = a+ b;",
+     "const t = `a+ b -- это тоже текст`;"),
+    ("унарный плюс перед именем",
+     "const n = +value;",
+     "const n = cells.at(-1);"),
+    ("унарный минус перед именем",
+     "const n = -value;",
+     "const n = cells.slice(0, -1);"),
+    ("унарная тильда перед именем",
+     "const n = ~index;",
+     "const t = `~${index}`;"),
+    ("приведение текста к числу унарным плюсом",
+     "const n = +'5';",
+     "const t = ['5', '7'];"),
+    ("операция в начале строки (перенос выражения)",
+     "const t = a\n  + b;",
+     "const t = a\n  // + b\n  ;"),
+    ("деление",
+     "const t = total / count;",
+     "const ok = /^\\d+[.)]?$/.test(cells[0]);"),
+    ("деление рядом с регуляркой с косой чертой внутри класса",
+     "const t = folder.replace(/[\\\\/]+/g, '/') / 2;",
+     "const t = folder.replace(/[\\\\/]+/g, '/').replace(/\\/$/, '');"),
+    ("приращение счётчика",
+     "shownCount += 1;",
+     "renderToken += 1;"),
+    ("операция в теле стрелочной функции",
+     "const f = (x) => x * 2;",
+     "const f = (x) => x;"),
+    ("конкатенация строк",
+     "const t = 'первая ' + 'вторая';",
+     "const t = `первая вторая`;"),
+    ("остаток от деления",
+     "const t = index % 2;",
+     "const t = `${index} %`;"),
+)
+
+
+def test_the_arithmetic_guard_catches_every_spelling_it_claims_to():
+    """Сторож проверяет сам себя, и проверка настоящая: на каждое написание из
+    таблицы ARITHMETIC_PROBES -- образец, который обязан быть помечен, и близкий
+    к нему, который метить нельзя. Без обеих половин проба ничего не значит:
+    сторож, метящий всё подряд, зелёный на положительных образцах."""
+    assert len(ARITHMETIC_PROBES) >= 12, "таблица проб обеднела"
+    missed = [(name, sample) for name, sample, _ in ARITHMETIC_PROBES if not _arithmetic_hits(sample)]
+    overzealous = [(name, sample, _arithmetic_hits(sample))
+                   for name, _, sample in ARITHMETIC_PROBES if _arithmetic_hits(sample)]
+    assert not missed, f"сторож не увидел арифметику: {missed}"
+    assert not overzealous, f"сторож пометил то, что арифметикой не является: {overzealous}"
 
 
 def test_script_has_no_arithmetic_operators_on_anything():
-    """Ни умножения, ни деления, ни вычитания, ни сложения: ни `* 100`, ни `a - b`.
-    Единственное разрешённое исключение -- счётчик отрисовок `renderToken += 1`
-    (не число на экране: защита от гонки при быстрой смене экранов). Конкатенация
-    строк тоже не нужна: тексты собираются шаблонными строками."""
-    code = _strip_literals(_code_without_comments())
-    code = code.replace("renderToken += 1", "")
-    hits = []
-    for number, line in enumerate(code.split("\n"), 1):
-        for match in re.finditer(r"[\w)\]]\s*(\+\+|--|\+=|-=|\*=|/=|%=|\*\*|[*%])|[\w)\]]\s+[+\-/]\s+[\w(]|[\w)\]][+\-/][\w(]", line):
-            hits.append((number, line.strip()[:100]))
+    """Ни умножения, ни деления, ни вычитания, ни сложения: ни `* 100`, ни `a - b`,
+    ни `${rate * 100}` внутри шаблонной строки, ни конкатенации текстов (тексты
+    собираются шаблонными строками). Единственное разрешённое исключение --
+    счётчик отрисовок `renderToken += 1` (не число на экране: защита от гонки при
+    быстрой смене экранов), он назван в ALLOWED_ARITHMETIC. Унарный минус перед
+    числом -- не исключение, а не арифметика: `cells.at(-1)` -- индекс с конца.
+    Что именно сторож ловит и чего не ловит -- в таблице ARITHMETIC_PROBES."""
+    hits = _arithmetic_hits((STATIC / "app.js").read_text(encoding="utf-8"))
     assert not hits, hits
 
 

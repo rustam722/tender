@@ -20,8 +20,7 @@
 /* 1. Логика без страницы                                                     */
 /* ======================================================================== */
 
-const NO_CONNECTION = 'Не удалось связаться с программой. Проверьте, что чёрное окно программы '
-  + 'не закрыто, и повторите действие.';
+const NO_CONNECTION = 'Не удалось связаться с программой. Проверьте, что чёрное окно программы не закрыто, и повторите действие.';
 
 class ApiFailure extends Error {
   constructor(message, status, body) {
@@ -36,8 +35,7 @@ class ApiFailure extends Error {
 
 function sentenceFor(status, data) {
   if (data && typeof data.error === 'string' && data.error.trim()) return data.error;
-  return `Программа ответила ошибкой (код ${status}), но не объяснила причину. Повторите действие; `
-    + 'если ошибка повторяется, покажите чёрное окно программы разработчику.';
+  return `Программа ответила ошибкой (код ${status}), но не объяснила причину. Повторите действие; если ошибка повторяется, покажите чёрное окно программы разработчику.`;
 }
 
 /* Единственное место, где страница ходит на сервер. Каждый POST и PUT идёт с
@@ -323,8 +321,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
     }
     function failureText(error) {
       console.error(error);
-      return 'Что-то пошло не так в самой странице. Обновите её (F5) и повторите; если повторится, '
-        + 'покажите разработчику чёрное окно программы.';
+      return 'Что-то пошло не так в самой странице. Обновите её (F5) и повторите; если повторится, покажите разработчику чёрное окно программы.';
     }
 
     function ask({ title, message, items, ok = 'Да', cancel = 'Отмена' }) {
@@ -428,7 +425,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       const value = str(record[keyOf(spec)]);
       if (spec.kind === 'textarea') return h('textarea', { value, rows: spec.rows || 3 });
       if (spec.kind === 'select' || spec.ref) {
-        const options = spec.ref ? [['', DASH + ' не выбрано']].concat(lookups[spec.ref] || []) : spec.options;
+        const options = spec.ref ? [['', `${DASH} не выбрано`]].concat(lookups[spec.ref] || []) : spec.options;
         const select = h('select', {}, options.map(([v, label]) => h('option', { value: str(v), text: label })));
         select.value = value;
         if (select.value !== value && value) {         // значения нет в списке -- не теряем его молча
