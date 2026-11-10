@@ -26,8 +26,8 @@ from app.models import (
 )
 from app.render.context import build_context
 from app.render.xlsx_render import (
-    RATE_FIELDS, CellMap, CellMapError, RowBlock, fill_workbook, load_cellmap,
-    read_rates,
+    RATE_FIELDS, CellMap, CellMapError, RowBlock, cell_paths, fill_workbook,
+    load_cellmap, read_rates,
 )
 from app.repo import Repo
 
@@ -1023,3 +1023,30 @@ def test_save_failure_of_the_book_names_the_cause_the_os_reported(
     for wrong in forbidden:
         assert wrong not in text, wrong
     assert "Errno" not in text and "Traceback" not in text
+
+
+# ---- что карта берёт из данных: по этому списку спрашивают, не открывая книгу -----
+
+def test_cell_paths_lists_what_the_map_takes_from_the_context():
+    # По этому списку экран показывает условия сделки, которых требует форма,
+    # а сборка называет недостающие ответы все разом. Пути внутри блока строк
+    # (`row....`) относятся к элементу списка, а не к контексту.
+    cell_map = CellMap(
+        sheet="Лист1",
+        cells={"D8": "Ставка НДС: {tender.vat_percent}%",
+               "E23": "{conditions.Цена и условия:}",
+               "D88": "{ rounding }",
+               "B31": "{org.head_position} {org.head_name}",
+               "B32": "{org.head_name}"},          # повтор -- один раз в списке
+        rows=[RowBlock(first_row=9, last_row=19, source="items",
+                       columns={"C": "{row.price_value}",
+                                "D": "{conditions.Срок:}"})])
+    assert cell_paths(cell_map) == [
+        "tender.vat_percent", "conditions.Цена и условия:", "rounding",
+        "org.head_position", "org.head_name", "conditions.Срок:"]
+
+
+def test_cell_paths_of_the_real_rosneft_map_are_its_seven_conditions():
+    paths = cell_paths(load_cellmap(REAL_MAP))
+    assert [p[len("conditions."):] for p in paths
+            if p.startswith("conditions.")] == CONDITIONS
