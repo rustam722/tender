@@ -97,6 +97,12 @@ def make_custom_tender(repo, *, labor=(), materials=(), subcontract=(),
     # Поля закупки заполнены все: их печатают документы Word (декларация), и
     # на пустой графе сборка теперь предупреждает -- заявку из-за такой графы
     # отклоняют. Пустые графы проверяются своими тестами, а не этим.
+    # Так же и текст декларации в профиле: на пустом декларация не собирается вовсе
+    # (это проверяет tests/test_package.py), а здесь она лишь соседка по пакету.
+    profile = repo.find_customer_profile(customer)
+    if not profile.declaration_text.strip():
+        profile.declaration_text = "Не находимся в процессе ликвидации"
+        repo.save_customer_profile(profile)
     tid = repo.save_tender(Tender(
         customer_id=customer, participant_id=me.id,
         purchase_number="32514010203", purchase_date="2025-10-01",

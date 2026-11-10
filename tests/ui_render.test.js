@@ -632,19 +632,29 @@ live('render: creating a tender whose number is taken says so on the new tender,
     assert.equal(mine.length, 2, 'второй тендер с этим номером создан (это предупреждение, а не отказ)');
     const second = mine.find((t) => t.id !== s.tender.id);
 
-    // экран сменился на новый тендер, и предупреждение переехало вместе с ним
+    // экран сменился на новый тендер, и предупреждение переехало вместе с ним.
+    // Смотрим на сам блок предупреждения: слова «запись №» стоят и в списке тендеров,
+    // и найденные где попало они ничего не доказывают.
+    const warningBoxes = () => page.all((e) => e.className.includes('notice') && e.className.includes('warning'));
     assert.equal(page.world.location.hash, `#/tender/${second.id}`);
-    const text = page.text();
-    assertClean(text, 'новый тендер-двойник');
-    assert.ok(text.includes(`запись № ${s.tender.id}`), 'не названа запись, с которой совпал номер');
-    assert.ok(text.includes(s.tender.purchase_number) && text.includes(s.tender.subject),
+    assertClean(page.text(), 'новый тендер-двойник');
+    assert.equal(warningBoxes().length, 1, 'предупреждение выведено не как предупреждение, или его нет');
+    let warned = warningBoxes()[0].textContent;
+    assert.ok(warned.includes(`запись № ${s.tender.id}`), 'не названа запись, с которой совпал номер');
+    assert.ok(warned.includes(s.tender.purchase_number) && warned.includes(s.tender.subject),
       'предупреждение не называет номер и предмет');
-    const boxes = page.all((e) => e.className.includes('notice') && e.className.includes('warning'));
-    assert.ok(boxes.length, 'предупреждение выведено не как предупреждение');
 
-    // повторное сохранение того же тендера: двойник по-прежнему назван
+    // повторное сохранение того же тендера: двойник по-прежнему назван в блоке предупреждения
     await page.press(page.button('Сохранить тендер'));
-    assert.ok(page.text().includes(`запись № ${s.tender.id}`), 'при сохранении существующего тендера двойник не назван');
+    assert.equal(warningBoxes().length, 1, 'после повторного сохранения предупреждение пропало');
+    warned = warningBoxes()[0].textContent;
+    assert.ok(warned.includes(`запись № ${s.tender.id}`) && warned.includes('Тендер сохранён'));
+    assert.equal(page.all((e) => e.className.includes('notice') && e.className.includes('ok')).length, 0,
+      'тендер с двойником сохранён «просто хорошо»');
+
+    // шапка с текущим тендером тоже различает двойников
+    const header = page.world.root.querySelector('#current-tender').textContent;
+    assert.ok(header.includes(`запись № ${second.id}`), `в шапке двойник не отличим: ${header}`);
 
     // в списке строки различимы, и это видно без щелчка по каждой
     const options = page.all((e) => e.tagName === 'OPTION' && e.value && e.textContent.includes(s.tender.purchase_number));
