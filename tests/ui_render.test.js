@@ -614,3 +614,56 @@ live('render: the tender card shows the conditions the customer form requires, n
     assert.equal(answers[1].value, '', 'ответ за человека не придуман');
   });
 });
+
+live('render: creating a tender whose number is taken says so on the new tender, and the two rows differ in the list', async () => {
+  const s = await seed('D1');
+  await withPage(async (page) => {
+    // первый тендер этого номера уже лежит в базе (его завёл seed): заводим второй через экран
+    await page.goto('#/tender/new');
+    page.type(page.field('Номер закупки'), s.tender.purchase_number);
+    page.type(page.field('Предмет закупки'), s.tender.subject);
+    const customer = page.field('Заказчик');
+    customer.value = String(s.customer.id);
+    customer.dispatchEvent({ type: 'change', bubbles: true });
+    await page.press(page.button('Создать тендер'));
+
+    const all = await call('GET', '/api/tenders');
+    const mine = all.filter((t) => t.purchase_number === s.tender.purchase_number);
+    assert.equal(mine.length, 2, 'второй тендер с этим номером создан (это предупреждение, а не отказ)');
+    const second = mine.find((t) => t.id !== s.tender.id);
+
+    // экран сменился на новый тендер, и предупреждение переехало вместе с ним
+    assert.equal(page.world.location.hash, `#/tender/${second.id}`);
+    const text = page.text();
+    assertClean(text, 'новый тендер-двойник');
+    assert.ok(text.includes(`запись № ${s.tender.id}`), 'не названа запись, с которой совпал номер');
+    assert.ok(text.includes(s.tender.purchase_number) && text.includes(s.tender.subject),
+      'предупреждение не называет номер и предмет');
+    const boxes = page.all((e) => e.className.includes('notice') && e.className.includes('warning'));
+    assert.ok(boxes.length, 'предупреждение выведено не как предупреждение');
+
+    // повторное сохранение того же тендера: двойник по-прежнему назван
+    await page.press(page.button('Сохранить тендер'));
+    assert.ok(page.text().includes(`запись № ${s.tender.id}`), 'при сохранении существующего тендера двойник не назван');
+
+    // в списке строки различимы, и это видно без щелчка по каждой
+    const options = page.all((e) => e.tagName === 'OPTION' && e.value && e.textContent.includes(s.tender.purchase_number));
+    assert.equal(options.length, 2, options.map((o) => o.textContent).join(' | '));
+    assert.notEqual(options[0].textContent, options[1].textContent, 'две строки списка совпадают буква в букву');
+    assert.ok(options.some((o) => o.textContent.includes(`запись № ${s.tender.id}`)));
+    assert.ok(options.some((o) => o.textContent.includes(`запись № ${second.id}`)));
+  });
+});
+
+live('render: a tender whose number is free is created with no warning', async () => {
+  const s = await seed('D2');
+  await withPage(async (page) => {
+    await page.goto('#/tender/new');
+    page.type(page.field('Номер закупки'), 'N-D2-свободный');
+    await page.press(page.button('Создать тендер'));
+    const text = page.text();
+    assertClean(text, 'новый тендер без двойника');
+    assert.ok(!text.includes('уже записан'), 'предупреждение о двойнике без двойника');
+    assert.equal(page.all((e) => e.className.includes('notice') && e.className.includes('warning')).length, 0);
+  });
+});

@@ -633,3 +633,45 @@ live('live: selected experience goes as string ids, the server accepts them and 
 process.on('exit', () => {
   if (process.env.TENDER_REPORT_REQUESTS) require('node:fs').writeSync(1, `REQUESTS_SENT=${requestsSent}\n`);
 });
+
+// ---- строка списка тендеров -------------------------------------------------------
+
+const ORGS = [{ id: 1, short_name: 'ПМУП «Автоспецтранс»' }, { id: 2, short_name: 'МУП «Полигон»' }];
+const twinTender = (id, over = {}) => ({ id, customer_id: 1, purchase_number: '32616547309',
+  subject: 'Разработка КЭР', purchase_date: '2026-11-05', price_wo_vat: '100,00', ...over });
+
+test('two tenders that agree in number, subject and customer are two different list rows', () => {
+  const list = [twinTender(3), twinTender(7)];
+  const [a, b] = list.map((t) => app.describeTender(t, ORGS, list));
+  assert.notEqual(a, b);
+  assert.ok(a.includes('запись № 3') && b.includes('запись № 7'), `${a} | ${b}`);
+  for (const row of [a, b]) {
+    assert.ok(row.includes('32616547309') && row.includes('Разработка КЭР') && row.includes('Автоспецтранс'),
+      'строка не потеряла то, по чему тендер узнают');
+  }
+});
+
+test('two twins that even agree in date and price are still told apart', () => {
+  const list = [twinTender(1), twinTender(2)];
+  assert.equal(list[0].purchase_date, list[1].purchase_date);
+  assert.equal(list[0].price_wo_vat, list[1].price_wo_vat);
+  assert.notEqual(app.describeTender(list[0], ORGS, list), app.describeTender(list[1], ORGS, list));
+});
+
+test('a tender that has no look-alike keeps its plain row, with no record number', () => {
+  const list = [twinTender(3), twinTender(7, { purchase_number: '999' }), twinTender(8, { customer_id: 2 })];
+  assert.equal(app.describeTender(list[0], ORGS, list), '№ 32616547309 — Разработка КЭР — ПМУП «Автоспецтранс»');
+  assert.equal(app.describeTender(list[1], ORGS, list), '№ 999 — Разработка КЭР — ПМУП «Автоспецтранс»');
+  assert.equal(app.describeTender(list[2], ORGS, list), '№ 32616547309 — Разработка КЭР — МУП «Полигон»');
+});
+
+test('a row described without the list is the plain row', () => {
+  assert.equal(app.describeTender(twinTender(3), ORGS), '№ 32616547309 — Разработка КЭР — ПМУП «Автоспецтранс»');
+});
+
+test('look-alike rows without a number are told apart as well', () => {
+  const list = [twinTender(4, { purchase_number: '' }), twinTender(5, { purchase_number: '' })];
+  const [a, b] = list.map((t) => app.describeTender(t, ORGS, list));
+  assert.notEqual(a, b);
+  assert.ok(a.startsWith('без номера') && b.startsWith('без номера'));
+});

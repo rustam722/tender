@@ -269,10 +269,27 @@ function createBuilder({ api: call, confirmReplace, registry = buildRegistry }) 
   return { run };
 }
 
+/* Как тендер назван в списке и в шапке: «№ номер — предмет — заказчик». Если в списке
+ * есть другой тендер с точно такой же строкой (тот же номер, предмет и заказчик --
+ * например, двойник, заведённый дважды), к строке добавляется номер записи: из того,
+ * что человек вводит сам, он единственный, что у двух записей различно ВСЕГДА (даты
+ * и цена у двойника как раз совпадают). Остальные строки остаются как были. */
+function describeTender(tender, orgs, tenders = []) {
+  const plain = (one) => {
+    const customer = orgs.find((org) => org.id === one.customer_id);
+    const head = one.purchase_number ? `№ ${one.purchase_number}` : 'без номера';
+    return [head, one.subject || 'без предмета', customer ? customer.short_name || customer.full_name : '']
+      .filter(Boolean).join(' — ');
+  };
+  const line = plain(tender);
+  const twin = tenders.some((other) => other.id !== tender.id && plain(other) === line);
+  return twin ? `${line} (запись № ${tender.id})` : line;
+}
+
 if (typeof module === 'object' && module.exports) {
   module.exports = {
     ApiFailure, api, splitWarning, recordForWrite, writeRecord, splitPasted, lotPayload,
-    differenceKind, documentChoices, serviceOf, toggleId, createBuilder, createBuildRegistry, buildRegistry,
+    differenceKind, describeTender, documentChoices, serviceOf, toggleId, createBuilder, createBuildRegistry, buildRegistry,
   };
 }
 
@@ -361,13 +378,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       $('#nav-build').setAttribute('href', '#/build');
       $('#current-tender').textContent = '';
     }
-    function describeTender(tender, orgs) {
-      const customer = orgs.find((org) => org.id === tender.customer_id);
-      const head = tender.purchase_number ? `№ ${tender.purchase_number}` : 'без номера';
-      return [head, tender.subject || 'без предмета', customer ? customer.short_name || customer.full_name : '']
-        .filter(Boolean).join(' — ');
-    }
-
+    let pendingTenderNotice = null;       // {tenderId, text}: предупреждение, которое переживает переход
     let active = { token: 0, dirty: [] };
     let renderToken = 0;
     /* Экран жив, пока его отрисовка -- последняя. Две отрисовки одного экрана
@@ -915,7 +926,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
     function tenderPicker({ tenders, orgs, currentId, screen, withNew }) {
       const select = h('select', { 'aria-label': 'Тендер' },
         h('option', { value: '', text: tenders.length ? 'Выберите тендер…' : 'Тендеров пока нет' }),
-        tenders.map((t) => h('option', { value: String(t.id), text: describeTender(t, orgs) })));
+        tenders.map((t) => h('option', { value: String(t.id), text: describeTender(t, orgs, tenders) })));
       select.value = currentId ? String(currentId) : '';
       select.addEventListener('change', () => { if (select.value) go(`#/${screen}/${select.value}`); });
       return h('div', { class: 'card inline' },
@@ -939,7 +950,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       }
       if (tender) {
         rememberTender(tender.id);
-        $('#current-tender').textContent = describeTender(tender, orgs);
+        $('#current-tender').textContent = describeTender(tender, orgs, tenders);
       } else if (idArg !== 'new') {
         $('#current-tender').textContent = '';
       }
@@ -1182,6 +1193,12 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
 
       /* -- шапка -- */
       const headMsg = notice();
+      /* Предупреждение о двойнике, пришедшее при создании: экран тут же сменился, и
+       * показать его надо на новом. */
+      if (tender && pendingTenderNotice && pendingTenderNotice.tenderId === tender.id && isCurrentRender(ctx)) {
+        headMsg.show('warning', 'Тендер создан.', [pendingTenderNotice.text]);
+        pendingTenderNotice = null;
+      }
       let headDirty = false;
       const dirtyTag = h('span', { class: 'state-tag', text: 'есть несохранённые изменения', hidden: true });
       const form = buildForm(TENDER_FIELDS(lookups, deal), record, lookups, () => { headDirty = true; dirtyTag.hidden = false; });
@@ -1193,12 +1210,16 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         try {
           const edits = form.collect();
           if (edits.price_wo_vat.trim() === '') edits.price_wo_vat = '0';      // цену ещё не задали: 0,00 на виду, а не отказ
-          const { record: saved } = await writeRecord('/api/tenders', recordForWrite(record, edits));
+          const { record: saved, warning } = await writeRecord('/api/tenders', recordForWrite(record, edits));
           headDirty = false;
-          if (isNew) { go(`#/tender/${saved.id}`); return; }
+          if (isNew) {
+            if (warning) pendingTenderNotice = { tenderId: saved.id, text: warning };
+            go(`#/tender/${saved.id}`);
+            return;
+          }
           Object.assign(record, saved);
           dirtyTag.hidden = true;
-          headMsg.show('ok', 'Тендер сохранён.');
+          if (warning) headMsg.show('warning', 'Тендер сохранён.', [warning]); else headMsg.show('ok', 'Тендер сохранён.');
           form.mark(null);
           if (calc) calc.refreshEstimate();
         } catch (error) {
