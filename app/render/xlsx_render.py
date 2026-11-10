@@ -16,7 +16,7 @@
         "D8":  "Ставка НДС: {tender.vat_percent}%",
         "E23": "{conditions.Цена и условия:}",
         "B31": "{org.head_position} {org.head_name}",
-        "D88": {"value": "{tender.rounding}", "optional": true}  // пример: может быть пусто
+        "D88": {"value": "{rounding}", "optional": true}  // пример: может быть пусто
       },
       "rows": [                                    // блоки повторяющихся строк
         {"first_row": 9, "last_row": 19,           // сколько строк в форме
@@ -281,6 +281,40 @@ def cell_paths(cell_map: CellMap) -> list[str]:
     return paths
 
 
+def lone_path(expr: str) -> str | None:
+    """Путь контекста, если выражение -- ровно один `{путь}` и ничего кроме;
+    иначе None.
+
+    Таким выражением карта пишет значение КАК ЕСТЬ (число остаётся числом), а
+    выражением с текстом вокруг -- строку. По этому же признаку узнаётся
+    клетка, в которую карта кладёт разрядность округления итога: «{rounding}»
+    в текстовой клетке («Округление: {rounding} знаков») книгу округлять
+    по-нашему не заставит, и считать такую карту пишущей разрядность -- назвать
+    человеку неверную причину расхождения итогов."""
+    lone = _PLACEHOLDER.fullmatch(expr)
+    return lone.group(1).strip() if lone else None
+
+
+def required_cell_paths(cell_map: CellMap) -> list[str]:
+    """Пути контекста, значения которых карта ТРЕБУЕТ от данных, в порядке клеток.
+
+    Это пути обязательных одиночных клеток (`cells` без `optional`): только на
+    них заполнение книги отказывается из-за пустого значения. Пути блоков
+    строк сюда не входят -- в строке блока пустое значение законно
+    (примечание), и требовать его значило бы отказывать в сборке на том, чего
+    книга заказчика не требует. По этому списку сборка называет недостающие
+    ответы по условиям сделки."""
+    paths: list[str] = []
+    for address, expr in cell_map.cells.items():
+        if address in cell_map.optional:
+            continue
+        for raw in _PLACEHOLDER.findall(expr):
+            path = raw.strip()
+            if path not in paths:
+                paths.append(path)
+    return paths
+
+
 def _rates(raw: object, name: str) -> dict[str, str]:
     """Раздел rates: имя ставки -> адрес клетки. Нет раздела -- пустой словарь."""
     if raw is None:
@@ -431,9 +465,8 @@ def _evaluate(expr: str, scope: Mapping, address: str, required: bool = False):
     из одних пробелов) или пустая часть текста -- отказ, а не пустая графа.
     Не required -- пустое значение даёт None (или пустой текст)."""
     where = f"клетки {address}"
-    lone = _PLACEHOLDER.fullmatch(expr)
-    if lone:
-        path = lone.group(1).strip()
+    path = lone_path(expr)
+    if path is not None:
         value = _lookup(scope, path, where)
         if _blank(value):
             if required:

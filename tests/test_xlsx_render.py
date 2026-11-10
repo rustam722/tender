@@ -27,7 +27,7 @@ from app.models import (
 from app.render.context import build_context
 from app.render.xlsx_render import (
     RATE_FIELDS, CellMap, CellMapError, RowBlock, cell_paths, fill_workbook,
-    load_cellmap, read_rates,
+    load_cellmap, lone_path, read_rates, required_cell_paths,
 )
 from app.repo import Repo
 
@@ -1050,3 +1050,47 @@ def test_cell_paths_of_the_real_rosneft_map_are_its_seven_conditions():
     paths = cell_paths(load_cellmap(REAL_MAP))
     assert [p[len("conditions."):] for p in paths
             if p.startswith("conditions.")] == CONDITIONS
+
+
+def test_required_cell_paths_leave_out_row_blocks_and_optional_cells():
+    """Пути, значения которых карта ТРЕБУЕТ: только обязательные одиночные
+    клетки. В строке блока пустое значение законно (примечание), и клетка
+    с `optional` пустой быть вправе -- требовать с них нечего."""
+    cell_map = CellMap(
+        sheet="Лист1",
+        cells={"E23": "{conditions.Цена и условия:}",
+               "D8": "Ставка НДС: {tender.vat_percent}%",
+               "D88": "{rounding}"},
+        optional={"D88"},
+        rows=[RowBlock(first_row=9, last_row=19, source="items",
+                       columns={"C": "{row.price_value}",
+                                "D": "{conditions.Срок:}"})])
+    assert required_cell_paths(cell_map) == [
+        "conditions.Цена и условия:", "tender.vat_percent"]
+    # обратная сторона: полный список карты шире -- в нём и то, и другое
+    assert cell_paths(cell_map) == [
+        "conditions.Цена и условия:", "tender.vat_percent", "rounding",
+        "conditions.Срок:"]
+
+
+def test_required_cell_paths_of_the_real_rosneft_map_are_its_seven_conditions():
+    # сужение не должно отпустить настоящую форму: её семь условий лежат
+    # в обязательных одиночных клетках E23-E29 и требуются все
+    paths = required_cell_paths(load_cellmap(REAL_MAP))
+    assert [p[len("conditions."):] for p in paths
+            if p.startswith("conditions.")] == CONDITIONS
+
+
+@pytest.mark.parametrize("expr, path", [
+    ("{rounding}", "rounding"),
+    ("{ rounding }", "rounding"),
+    ("{org.head_name}", "org.head_name"),
+    ("Округление: {rounding} знаков", None),
+    ("{org.head_position} {org.head_name}", None),
+    ("просто текст", None),
+])
+def test_lone_path_is_one_placeholder_and_nothing_else(expr, path):
+    # по этому признаку значение пишется как есть (число остаётся числом) и
+    # узнаётся клетка округления итога: упоминание пути в тексте книгу
+    # округлять по-нашему не заставит
+    assert lone_path(expr) == path
