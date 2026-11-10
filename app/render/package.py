@@ -52,7 +52,7 @@ from app.render.context import (
     CUSTOMER_FORM_DOCUMENTS, ContextError, blank_fields_warning, build_context,
     money, printed_price,
 )
-from app.render.docx_render import TemplateError, render_docx
+from app.render.docx_render import TemplateError, render_docx, template_uses
 from app.render.layouts import LayoutError
 from app.render.xlsx_render import CellMapError, fill_workbook, load_cellmap
 from app.repo import Repo
@@ -386,6 +386,18 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
     context = build_context(tender_id, repo, document=document,
                            experience_ids=experience_ids)
     warnings.extend((document, text) for text in context["warnings"])
+    if (template.suffix.lower() == ".docx" and not str(context["declaration_text"]).strip()
+            and template_uses(template, "declaration_text")):
+        # Декларация без требований: заголовок, «декларирует соответствие следующим
+        # требованиям:» и пустое место. Значение идёт через .splitlines(), пустоту
+        # графы там не видно, и никто бы не сказал. Законной пустоты тут нет, а
+        # смотрим на шаблон, не на имя: форма другого заказчика может печатать
+        # требования сама, и тогда пустой текст в профиле ей не мешает.
+        raise _Refusal(
+            f"«{document}» печатает текст декларации из профиля заказчика, а он пуст: "
+            "документ вышел бы с заголовком и без единого требования. Впишите "
+            "требования в поле «Текст декларации» профиля заказчика (экран "
+            "«Справочники», вкладка «Профили заказчиков») и соберите пакет заново.")
     # Единый путь записи: документ всегда пишется под временным именем рядом с
     # целью и становится настоящим файлом одним действием. Так оборванная или
     # неудавшаяся запись оставляет только `~pkg-…`, который уберёт подметание,

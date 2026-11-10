@@ -1544,3 +1544,166 @@ def test_a_paper_written_by_another_document_is_not_called_its_own(
     assert [d for d, _ in result.skipped] == ["Справка? 1"]
     assert names(out) == ["Справка 1.docx"]
     assert [w for w in result.warnings if w[0] == PACKAGE_WIDE] == []
+
+
+# ---- декларация без текста требований --------------------------------------------------
+
+REQUIREMENTS_LOOP = ("{%p for line in declaration_text.splitlines() %}", "{{ line }}",
+                     "{%p endfor %}")
+OWN_REQUIREMENTS = ("Настоящим {{ org.short_name }} декларирует соответствие требованиям:",
+                    "1. Не находится в процессе ликвидации.",
+                    "2. Не приостановлена деятельность в порядке, установленном КоАП РФ.")
+
+
+def make_declaration(repo, dirs, text, document=DECLARATION, template_lines=REQUIREMENTS_LOOP,
+                     **kw):
+    """Тендер, у заказчика которого в профиле текст декларации `text`, и шаблон документа
+    `document`, печатающий (или нет) этот текст."""
+    templates, _ = dirs
+    make_template(templates / f"{document}.docx", "Настоящим декларируем:", *template_lines)
+    tid = make_tender(repo, documents=[document], **kw)
+    profile = repo.find_customer_profile(repo.get_tender(tid).customer_id)
+    profile.declaration_text = text
+    repo.save_customer_profile(profile)
+    return tid
+
+
+def test_a_declaration_with_no_requirements_text_is_refused_and_says_where_to_fill_it(
+        repo, dirs, tmp_path):
+    tid = make_declaration(repo, dirs, "")
+    result = build_package(tid, [DECLARATION], tmp_path / "out", repo)
+
+    assert result.written == []
+    assert not (tmp_path / "out").exists() or names(tmp_path / "out") == []
+    [(document, reason)] = result.skipped
+    assert document == DECLARATION
+    assert "требован" in reason and "пуст" in reason
+    # куда идти: экран, вкладка и поле называются так, как они подписаны на экране
+    assert "Справочники" in reason and "Профили заказчиков" in reason
+    assert "Текст декларации" in reason
+
+
+def test_a_declaration_text_of_only_blanks_is_as_empty_as_none(repo, dirs, tmp_path):
+    tid = make_declaration(repo, dirs, "  \n\t\n  ")
+    result = build_package(tid, [DECLARATION], tmp_path / "out", repo)
+    assert result.written == [] and [d for d, _ in result.skipped] == [DECLARATION]
+
+
+def test_a_declaration_with_requirements_text_prints_every_line(repo, dirs, tmp_path):
+    tid = make_declaration(repo, dirs, "Не в процессе ликвидации\nНе приостановлена деятельность")
+    result = build_package(tid, [DECLARATION], tmp_path / "out", repo)
+    assert result.skipped == []
+    assert text_of(result.written[0]) == [
+        "Настоящим декларируем:", "Не в процессе ликвидации", "Не приостановлена деятельность"]
+
+
+def test_a_template_that_prints_its_own_requirements_does_not_need_the_profile_text(
+        repo, dirs, tmp_path):
+    # Под именем «Декларация соответствия», но требования напечатаны самим шаблоном и
+    # метки declaration_text в нём нет: пустой текст в профиле этому шаблону не мешает.
+    tid = make_declaration(repo, dirs, "", template_lines=OWN_REQUIREMENTS)
+    result = build_package(tid, [DECLARATION], tmp_path / "out", repo)
+    assert result.skipped == []
+    assert "1. Не находится в процессе ликвидации." in text_of(result.written[0])
+
+
+def test_the_refusal_follows_the_template_and_not_the_name_of_the_document(
+        repo, dirs, tmp_path):
+    other = "Декларация о требованиях заказчика"
+    tid = make_declaration(repo, dirs, "", document=other)
+    result = build_package(tid, [other], tmp_path / "out", repo)
+    [(document, reason)] = result.skipped
+    assert result.written == [] and document == other and "Текст декларации" in reason
+
+
+def test_a_custom_template_named_in_the_profile_is_looked_at_not_the_document_name(
+        repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / "Своя декларация.docx", "{{ declaration_text }}")
+    tid = make_tender(repo, documents=[DECLARATION], docs={
+        DECLARATION: DocSpec(template="Своя декларация.docx")})
+    profile = repo.find_customer_profile(repo.get_tender(tid).customer_id)
+    profile.declaration_text = ""
+    repo.save_customer_profile(profile)
+    result = build_package(tid, [DECLARATION], tmp_path / "out", repo)
+    [(document, reason)] = result.skipped
+    assert result.written == [] and document == DECLARATION and "Текст декларации" in reason
+
+
+def test_a_tag_split_across_runs_in_word_is_still_seen(repo, dirs, tmp_path):
+    # Word режет текст на куски по правке и проверке орфографии: метка в файле может
+    # лежать в двух кусках, и поиск строки «declaration_text» по разметке её не найдёт.
+    templates, _ = dirs
+    doc = docx.Document()
+    paragraph = doc.add_paragraph()
+    paragraph.add_run("{%p for line in declaration_")
+    paragraph.add_run("text.splitlines() %}")
+    doc.add_paragraph("{{ line }}")
+    doc.add_paragraph("{%p endfor %}")
+    doc.save(templates / f"{DECLARATION}.docx")
+    tid = make_tender(repo, documents=[DECLARATION])
+    profile = repo.find_customer_profile(repo.get_tender(tid).customer_id)
+    profile.declaration_text = ""
+    repo.save_customer_profile(profile)
+    result = build_package(tid, [DECLARATION], tmp_path / "out", repo)
+    [(document, reason)] = result.skipped
+    assert result.written == [] and document == DECLARATION
+    assert "Текст декларации" in reason        # отказ именно об этом, а не о сломанной разметке
+
+
+def test_a_customer_with_no_profile_gets_the_same_refusal_for_a_template_that_prints_the_text(
+        repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{DECLARATION}.docx", *REQUIREMENTS_LOOP)
+    tid = make_tender(repo, with_profile=False)
+    result = build_package(tid, [DECLARATION], tmp_path / "out", repo)
+    [(document, reason)] = result.skipped
+    assert document == DECLARATION and "Текст декларации" in reason
+
+
+def test_the_refusal_does_not_stop_the_other_documents_of_the_package(repo, dirs, tmp_path):
+    templates, _ = dirs
+    make_template(templates / f"{MTR}.docx", "МТР {{ org.short_name }}")
+    tid = make_declaration(repo, dirs, "")
+    result = build_package(tid, [DECLARATION, MTR], tmp_path / "out", repo)
+    assert [p.name for p in result.written] == [f"{MTR}.docx"]
+    assert [d for d, _ in result.skipped] == [DECLARATION]
+
+
+def test_a_broken_template_is_still_reported_as_broken_when_the_text_is_empty(
+        repo, dirs, tmp_path):
+    templates, _ = dirs
+    (templates / f"{DECLARATION}.docx").write_bytes(b"not a docx")
+    tid = make_tender(repo, documents=[DECLARATION])
+    profile = repo.find_customer_profile(repo.get_tender(tid).customer_id)
+    profile.declaration_text = ""
+    repo.save_customer_profile(profile)
+    result = build_package(tid, [DECLARATION], tmp_path / "out", repo)
+    [(document, reason)] = result.skipped
+    assert "не открывается" in reason          # своя причина, а не жалоба на текст декларации
+
+
+def test_the_declaration_refusal_leaves_no_half_written_file(repo, dirs, tmp_path):
+    tid = make_declaration(repo, dirs, "")
+    build_package(tid, [DECLARATION], tmp_path / "out", repo)
+    assert not (tmp_path / "out").exists() or list((tmp_path / "out").iterdir()) == []
+
+
+def test_the_real_declaration_form_of_the_firm_is_refused_empty_and_prints_with_text(
+        repo, dirs, tmp_path):
+    templates, _ = dirs
+    shutil.copy(ROOT / "templates_docs" / f"{DECLARATION}.docx", templates)
+    tid = make_tender(repo, documents=[DECLARATION])
+    profile = repo.find_customer_profile(repo.get_tender(tid).customer_id)
+
+    profile.declaration_text = ""
+    repo.save_customer_profile(profile)
+    refused = build_package(tid, [DECLARATION], tmp_path / "empty", repo)
+    assert refused.written == [] and "Текст декларации" in refused.skipped[0][1]
+
+    profile.declaration_text = "Не находимся в процессе ликвидации\nНе банкроты"
+    repo.save_customer_profile(profile)
+    built = build_package(tid, [DECLARATION], tmp_path / "full", repo)
+    assert built.skipped == []
+    printed = text_of(built.written[0])
+    assert "Не находимся в процессе ликвидации" in printed and "Не банкроты" in printed

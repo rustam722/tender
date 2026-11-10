@@ -119,6 +119,21 @@ def _environment(blanks: list[str]) -> jinja2.Environment:
     return env
 
 
+def template_uses(template: Path, name: str) -> bool:
+    """Обращается ли шаблон к значению контекста `name` (`declaration_text`).
+
+    Смотрит на разметку, а не на имя документа: у одного заказчика форма декларации
+    печатает требования из профиля, у другого -- свои, и метки в ней нет. Разметку
+    читает сам docxtpl: он склеивает куски текста, на которые Word режет метку при
+    правке, чего поиск строки по XML не сделает; заглядывает и в колонтитулы.
+    Шаблон, который не открывается или не разбирается, -- «нет»: честную причину
+    назовёт `render_docx`."""
+    try:
+        return name in DocxTemplate(Path(template)).get_undeclared_template_variables()
+    except Exception:
+        return False
+
+
 def render_docx(template: Path, context: dict, out: Path,
                 blanks: list[str] | None = None) -> Path:
     """Подставить `context` в `template` и сохранить результат в `out`.
