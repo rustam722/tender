@@ -22,6 +22,7 @@ from app.render.context import build_context
 from app.render.package import (
     PackageError, PackageResult, build_package, planned_files, safe_filename,
 )
+from app.render.xlsx_render import CellMapError
 from app.repo import Repo
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -678,6 +679,9 @@ def test_missing_cellmap_file_is_a_russian_skip(repo, dirs, tmp_path):
     assert "tkp_rosneft_murmansk.json" in result.skipped[0][1]
 
 
+BROKEN_CELLMAP = '{"sheet": "Лист1", "cells": {"нет такого адреса": "x"}}'
+
+
 def test_a_broken_cellmap_is_a_russian_skip_and_not_a_silent_package(
         repo, dirs, tmp_path):
     # Контекст больше не глотает ничего: отказ разбора карты доходит до сборки,
@@ -687,13 +691,38 @@ def test_a_broken_cellmap_is_a_russian_skip_and_not_a_silent_package(
     templates, cellmaps = dirs
     shutil.copy(REAL_FORM, templates / "forma_tkp_rosneft_murmansk.xlsx")
     (cellmaps / "tkp_rosneft_murmansk.json").write_text(
-        '{"sheet": "Лист1", "cells": {"нет такого адреса": "x"}}',
-        encoding="utf-8")
+        BROKEN_CELLMAP, encoding="utf-8")
     tid = rosneft_tender(repo)
+    # Отказ приходит ИЗ КОНТЕКСТА, а не из второго чтения карты в сборке.
+    # Утверждать это обязательно: пока здесь стояла одна проверка через
+    # build_package, тест был зелёным и с проглоченным отказом -- карту
+    # грузит ещё раз сама сборка (package._build_one) и отказывает оттуда.
+    # Это был единственный выживший мутант из 58, девятый за работу случай
+    # проверки, которая обещает больше, чем делает.
+    with pytest.raises(CellMapError, match="нет такого адреса"):
+        build_context(tid, repo, document=TKP)
     result = build_package(tid, [TKP], tmp_path / "out", repo)
     assert result.written == []
     document, reason = result.skipped[0]
     assert len(result.skipped) == 1 and document == TKP
+    assert "нет такого адреса" in reason and "адрес клетки" in reason
+
+
+def test_a_word_document_with_a_broken_cellmap_is_skipped_too(
+        repo, dirs, tmp_path):
+    # Вот что терялось по-настоящему: у документа Word с картой ячеек (DocSpec
+    # такое допускает) сборка карту второй раз не читает -- заполняет шаблон
+    # docxtpl. Проглоти контекст отказ, и документ собрался бы молча, вовсе
+    # без сверки двух бумаг, а человек не узнал бы об этом никак.
+    templates, cellmaps = dirs
+    make_template(templates / f"{DECLARATION}.docx", "{{ org.short_name }}")
+    (cellmaps / "broken.json").write_text(BROKEN_CELLMAP, encoding="utf-8")
+    tid = make_tender(repo, documents=[DECLARATION],
+                      docs={DECLARATION: DocSpec(cellmap="broken.json")})
+    result = build_package(tid, [DECLARATION], tmp_path / "out", repo)
+    assert result.written == [] and names(tmp_path / "out") == []
+    document, reason = result.skipped[0]
+    assert len(result.skipped) == 1 and document == DECLARATION
     assert "нет такого адреса" in reason and "адрес клетки" in reason
 
 
