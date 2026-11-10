@@ -7,6 +7,7 @@
 проверяются защита листа и отказы), и настоящая форма ТКП Роснефти --
 копия в tests/fixtures, на ней проверяется карта cellmaps/tkp_rosneft_murmansk.json.
 """
+import errno
 import json
 import re
 import warnings
@@ -993,3 +994,32 @@ def test_read_rates_reports_a_missing_book_in_russian(tmp_path):
     with pytest.raises(CellMapError) as caught:
         read_rates(tmp_path / "net.xlsx", cell_map)
     assert "net.xlsx" in str(caught.value) and "Errno" not in str(caught.value)
+
+
+# ---- причина отказа записи книги: та же разводка, что у Word ----------------------
+
+@pytest.mark.parametrize("failure, expected, forbidden", [
+    (OSError(errno.ENOSPC, "No space left on device"),
+     "на диске не осталось места", ("Excel", "нет такой папки")),
+    (PermissionError(errno.EACCES, "Permission denied"),
+     "в эту папку нельзя записывать", ("на диске", "в Excel")),
+    (FileNotFoundError(errno.ENOENT, "No such file or directory"),
+     "папки для него больше нет", ("на диске", "Excel")),
+], ids=["нет-места", "нет-прав", "нет-папки"])
+def test_save_failure_of_the_book_names_the_cause_the_os_reported(
+        tmp_path, monkeypatch, failure, expected, forbidden):
+    # «нет такой папки или файл открыт в другой программе» на любую причину
+    # отправляло человека закрывать Excel, которого он не открывал
+    form = make_form(tmp_path / "form.xlsx")
+
+    def refuse(self, path):
+        raise failure
+
+    monkeypatch.setattr(Workbook, "save", refuse)
+    with pytest.raises(CellMapError) as exc:
+        fill_workbook(form, basic_map(), make_context(), tmp_path / "out.xlsx")
+    text = exc.value.args[0]
+    assert "out.xlsx" in text and expected in text
+    for wrong in forbidden:
+        assert wrong not in text, wrong
+    assert "Errno" not in text and "Traceback" not in text

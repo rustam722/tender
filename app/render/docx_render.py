@@ -34,6 +34,8 @@ from pathlib import Path
 import jinja2
 from docxtpl import DocxTemplate
 
+from app.render import save_cause
+
 
 class TemplateError(Exception):
     """Шаблон не удалось заполнить; текст на русском, с именем шаблона и причиной."""
@@ -94,7 +96,8 @@ def render_docx(template: Path, context: dict, out: Path) -> Path:
     try:
         tpl.save(out)
     except OSError as exc:
+        # Причина называется та, которую сообщила ОС: нехватка места и запрет
+        # записи в папку не лечатся закрытием Word (см. app.render.save_cause).
         raise TemplateError(
-            f"Не удалось сохранить «{out.name}»: проверьте, что файл не открыт "
-            f"в Word и что папка существует.") from exc
+            f"Не удалось сохранить «{out.name}»: {save_cause(exc)}") from exc
     return out

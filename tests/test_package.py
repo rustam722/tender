@@ -4,6 +4,7 @@
 заказчика -- настоящая форма Роснефти из tests/fixtures. Каждая проверка читает
 готовые файлы с диска, а не результат вызова.
 """
+import errno
 import shutil
 from decimal import Decimal
 from pathlib import Path
@@ -1368,7 +1369,8 @@ def test_save_failure_of_a_word_document_names_the_final_file_not_the_temp_one(
                       docs={DECLARATION: DocSpec(prefix="1.")})
 
     def cannot_save(self, *args, **kwargs):
-        raise PermissionError("locked")
+        # замок Word: ERROR_SHARING_VIOLATION, как его отдаёт Windows
+        raise PermissionError(errno.EACCES, "locked", None, 32)
 
     monkeypatch.setattr(docxtpl.DocxTemplate, "save", cannot_save)
     out = tmp_path / "out"
@@ -1392,7 +1394,7 @@ def test_save_failure_of_an_excel_form_names_the_final_file_not_the_temp_one(
     tid = rosneft_tender(repo)
 
     def cannot_save(self, filename):
-        raise PermissionError("locked")
+        raise PermissionError(errno.EACCES, "locked", None, 32)
 
     monkeypatch.setattr(workbook_module.Workbook, "save", cannot_save)
     result = build_package(tid, [TKP], tmp_path / "out", repo)

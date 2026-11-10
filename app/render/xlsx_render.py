@@ -80,6 +80,8 @@ from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 
+from app.render import save_cause
+
 
 # Ставки калькуляции, которые книга заказчика хранит у себя: имя в карте ячеек
 # -> поле OrgSettings, с которым ставка сравнивается. Это весь словарь раздела
@@ -537,9 +539,11 @@ def fill_workbook(template: Path, cell_map: CellMap, context: dict,
         try:
             wb.save(out)
         except OSError as exc:
+            # Та же разводка причин, что у Word: «закройте файл в Excel» на
+            # нехватку места отправило бы человека чинить не то.
             raise CellMapError(
-                f"Не удалось сохранить файл {out.name}: нет такой папки или "
-                "файл открыт в другой программе.") from exc
+                f"Не удалось сохранить файл {out.name}: {save_cause(exc)}"
+            ) from exc
     finally:
         wb.close()
     return out

@@ -3,6 +3,7 @@
 Каждая проверка текста читает его из готового файла через python-docx,
 а не из словаря на входе: тест, сверяющий вход с самим собой, ничего не доказывает.
 """
+import errno
 import zipfile
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from lxml import etree
 from app.models import Asset
 from app.render.context import money
 from app.render.layouts import build_rows, load_layout
+from app.render import docx_render
 from app.render.docx_render import TemplateError, render_docx
 
 FIXTURE = Path(__file__).parent / "fixtures" / "minimal.docx"
@@ -249,3 +251,44 @@ def test_empty_rows_keep_every_header_cell(tmp_path):
     out = render_docx(FIXTURE, ctx, tmp_path / "o.docx")
     assert _table(out) == [ctx["assets"]["headers"]]
     assert len(_table(out)[0]) == 7
+
+
+# ---- причина отказа записи: что можно отличить -- отличаем -----------------------
+
+# Раньше любой OSError получал подсказку «проверьте, что файл не открыт в Word»:
+# человек шёл закрывать Word, которого не открывал, а на диске не было места
+# или в папку было нельзя записывать. Эти пробы и держат разводку причин.
+SAVE_FAILURES = [
+    (OSError(errno.ENOSPC, "No space left on device"),
+     "на диске не осталось места", ("Word", "права")),
+    (PermissionError(errno.EACCES, "Permission denied"),
+     "в эту папку нельзя записывать", ("в Word", "на диске")),
+    (PermissionError(errno.EACCES, "The process cannot access the file",
+                     None, 32),
+     "открыт в другой программе", ("на диске", "права на папку")),
+    (FileNotFoundError(errno.ENOENT, "No such file or directory"),
+     "папки для него больше нет", ("Word", "на диске")),
+    (OSError(errno.EIO, "I/O error"),
+     "записать его не удалось", ()),
+]
+SAVE_IDS = ["нет-места", "нет-прав", "занят-другой-программой", "нет-папки",
+            "прочее"]
+
+
+@pytest.mark.parametrize("failure, expected, forbidden", SAVE_FAILURES,
+                         ids=SAVE_IDS)
+def test_save_failure_names_the_cause_the_os_reported(
+        tmp_path, monkeypatch, failure, expected, forbidden):
+    def refuse(self, path):
+        raise failure
+
+    monkeypatch.setattr(docx_render.DocxTemplate, "save", refuse)
+    with pytest.raises(TemplateError) as exc:
+        render_docx(FIXTURE, _context(), tmp_path / "o.docx")
+    text = exc.value.args[0]
+    assert "o.docx" in text and expected in text
+    for wrong in forbidden:
+        assert wrong not in text, wrong
+    # наружу уходит русская фраза, а не текст и код операционной системы
+    assert "Errno" not in text and "Traceback" not in text
+    assert str(failure.errno) not in text
