@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app import config
-from app.render.context import build_context, money
+from app.render.context import ContextError, build_context, money
 from app.render.docx_render import TemplateError, render_docx
 from app.render.layouts import LayoutError
 from app.render.xlsx_render import CellMapError, fill_workbook, load_cellmap
@@ -416,7 +416,7 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
                               experience_ids)
         except _Refusal as exc:
             result.skipped.append((document, str(exc)))
-        except (TemplateError, CellMapError, LayoutError) as exc:
+        except (TemplateError, CellMapError, LayoutError, ContextError) as exc:
             result.skipped.append((document, str(exc)))
         except Exception as exc:
             result.skipped.append((document, (

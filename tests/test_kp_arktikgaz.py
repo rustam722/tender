@@ -415,7 +415,8 @@ def test_one_warning_names_every_offending_row(repo):
 def test_no_warning_for_a_document_without_a_cellmap(repo):
     # те же данные, что дают предупреждение, но документ собирается Word
     tid = make_custom_tender(repo, labor=[("Эколог", 1, "1", "1002.45")],
-                             materials=[("м", "1.5", "1234.57")])
+                             materials=[("м", "1.5", "1234.57")],
+                             lot=[("Разработка КЭР", "1000")])
     assert build_context(tid, repo, document=DOC_ESTIMATE)["warnings"]
     assert build_context(tid, repo, document="Коммерческое предложение"
                          )["warnings"] == []
@@ -439,7 +440,7 @@ def move_to_rosneft(repo, tid):
 def test_no_warning_about_lists_the_workbook_does_not_receive(repo, lists):
     # ТКП Роснефти пишет в книгу только позиции лота: материалы, ФОТ и
     # субподряд тендера в ней не участвуют, предупреждать о них было бы враньём
-    tid = make_custom_tender(repo, **lists)
+    tid = make_custom_tender(repo, lot=[("Разработка КЭР", "1000")], **lists)
     assert build_context(tid, repo, document=DOC_ESTIMATE)["warnings"]
     move_to_rosneft(repo, tid)
     assert build_context(tid, repo, document="ТКП по форме заказчика"
@@ -519,7 +520,8 @@ def test_rates_that_match_the_settings_say_nothing_about_rates(repo):
 def test_a_document_without_a_calculation_in_its_book_says_nothing_about_rates(repo):
     # карта Роснефти раздела rates не знает и калькуляции в книгу не шлёт:
     # поведение прежнее, ничего не меняется
-    tid = make_custom_tender(repo, labor=ARKTIK_LABOR)
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR,
+                             lot=[("Разработка КЭР", "1000")])
     repo.save_settings(replace(repo.get_settings(),
                                insurance_rate=Decimal("0.31")))
     move_to_rosneft(repo, tid)
@@ -866,3 +868,27 @@ def test_a_document_without_a_price_does_not_join_the_comparison(repo, tmp_path)
                         documents=(DOC_KP, DOC_DECLARATION))
     assert result.skipped == [] and len(result.written) == 2
     assert result.warnings == []
+
+
+def test_a_commercial_offer_without_lot_items_is_skipped_not_written_at_zero(
+        repo, tmp_path):
+    # Коммерческое предложение на 0,00 руб. -- не документ. Раньше оно молча
+    # уходило человеку и стояло в списке «Записано» как ни в чём не бывало:
+    # слой Excel за пустую обязательную графу отказывается, а Word молчал.
+    tid = make_custom_tender(repo, labor=ARKTIK_LABOR, materials=ARKTIK_MATERIALS,
+                             subcontract=ARKTIK_SUBCONTRACT)      # позиций лота нет
+    result = build_package(tid, [DOC_KP, DOC_ESTIMATE], tmp_path / "out", repo)
+    (document, reason), = result.skipped
+    assert document == DOC_KP
+    assert "позиции лота" in reason and "0,00" in reason
+    assert "Traceback" not in reason and "Error" not in reason
+    # остальные документы пакета собраны, и нулевого КП в папке нет
+    assert [p.name for p in result.written] == [f"{DOC_ESTIMATE}.xlsx"]
+    assert [p.name for p in (tmp_path / "out").iterdir()] == [f"{DOC_ESTIMATE}.xlsx"]
+
+
+def test_one_lot_item_is_enough_to_let_the_offer_through(repo, tmp_path):
+    # обратная сторона: отказ держится на пустоте списка, а не на чём-то ещё
+    result = two_papers(repo, tmp_path, "4000000", documents=(DOC_KP,))
+    assert result.skipped == []
+    assert [p.name for p in result.written] == [f"{DOC_KP}.docx"]

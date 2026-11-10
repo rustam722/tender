@@ -494,6 +494,32 @@ _LOT_SOURCE = "items"
 _ESTIMATE_SOURCES = frozenset({"labor", "materials", "subcontract"})
 
 
+_ESTIMATE_SOURCE = "estimate"
+
+
+class ContextError(Exception):
+    """Документ по этим данным собирать нельзя; текст на русском, для человека.
+
+    Не сбой программы, а отказ: обязательной графы в данных тендера нет, и
+    документ с нею пустой -- не документ. Так же отказывается слой Excel на
+    пустой обязательной клетке. Сборка превращает это в пропуск одного
+    документа с причиной (`PackageResult.skipped`), остальные документы пакета
+    собираются."""
+
+
+def _price_source(document: str, cell_map) -> str | None:
+    """Откуда документ берёт цену, которую напечатает: «items» (позиции лота),
+    «estimate» (итог калькулятора) или None -- цены он не печатает."""
+    if cell_map is not None:
+        sources = {block.source for block in cell_map.rows}
+        if _LOT_SOURCE in sources:
+            return _LOT_SOURCE
+        if sources & _ESTIMATE_SOURCES:
+            return _ESTIMATE_SOURCE
+        return None
+    return _LOT_SOURCE if document in _PRICE_FROM_LOT_ITEMS else None
+
+
 def _lot_price(items: list[dict]) -> Decimal:
     """Цена без НДС по позициям лота -- сумма НАПЕЧАТАННЫХ строк, как её
     выводит «Итого» коммерческого предложения (доктрина напечатанной строки)."""
@@ -509,14 +535,12 @@ def _printed_price(document: str, cell_map, items: list[dict],
     человек заполняет в разных местах карточки, и в одном пакете легко
     оказываются две бумаги с разной ценой. Сравнение -- в `build_package`:
     только сборка знает, какие документы в пакете."""
-    if cell_map is not None:
-        sources = {block.source for block in cell_map.rows}
-        if _LOT_SOURCE in sources:
-            return _lot_price(items)
-        if sources & _ESTIMATE_SOURCES:
-            return calc.total_wo_vat
-        return None
-    return _lot_price(items) if document in _PRICE_FROM_LOT_ITEMS else None
+    source = _price_source(document, cell_map)
+    if source == _LOT_SOURCE:
+        return _lot_price(items)
+    if source == _ESTIMATE_SOURCE:
+        return calc.total_wo_vat
+    return None
 
 
 def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
@@ -525,8 +549,10 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
 
     С `document`, у которого в профиле есть карта ячеек, может поднять
     `CellMapError`: карту не разобрать или ставку из клетки не прочитать.
-    Сборка пакета превращает это в пропуск одного документа с причиной.
-    Без `document` (экраны) карта не читается вовсе, и этого отказа быть
+    С `document`, который печатает цену по позициям лота, может поднять
+    `ContextError`: позиций нет, и документ вышел бы на 0,00. Сборка пакета
+    превращает и то и другое в пропуск одного документа с причиной.
+    Без `document` (экраны) карта не читается вовсе, и этих отказов быть
     не может.
 
     document -- имя документа пакета, под который собирается контекст: таблицы
@@ -569,6 +595,16 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
     # и уходит наверх -- сборка превратит его в пропуск документа с причиной.
     cell_map = (load_cellmap(Path(config.CELLMAPS_DIR) / spec.cellmap)
                 if spec and spec.cellmap else None)
+    items = _lot_rows(repo.list_lot_items(tender_id), rate)
+    # Документ, который печатает цену по позициям лота, без позиций напечатает
+    # 0,00 -- и встанет в список «Записано» как ни в чём не бывало. Коммерческое
+    # предложение на ноль рублей -- не документ: отказ, как у пустой обязательной
+    # клетки в книге Excel. Без имени документа (экраны) отказа быть не может.
+    if document and not items and _price_source(document, cell_map) == _LOT_SOURCE:
+        raise ContextError(
+            f"В тендере нет ни одной позиции лота, а «{document}» печатает "
+            "цену по ним: документ вышел бы с итогом 0,00 руб. Добавьте "
+            "позиции лота на карточке тендера и соберите пакет заново.")
     warnings = []
     if (profile and document in TABLE_DOCUMENTS
             and document in profile.documents
@@ -593,7 +629,6 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
                 f"Запись опыта с id={exp_id} не найдена в справочнике, "
                 "в справку об опыте не попала. Проверьте отбор опыта.")
 
-    items = _lot_rows(repo.list_lot_items(tender_id), rate)
     return {
         "org": org,
         "customer": customer,

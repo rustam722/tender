@@ -13,7 +13,7 @@
     InnLookupError                    502           внешний источник не ответил
     TargetTooLow, PackageError,
     TemplateError, CellMapError,
-    LayoutError                       400           отказ домена, текст по-русски
+    LayoutError, ContextError         400           отказ домена, текст по-русски
     sqlite3.IntegrityError            400           см. translate_integrity
     sqlite3.OperationalError          503           база занята или недоступна
     decimal.DecimalException          400           числа слишком велики для счёта
@@ -35,6 +35,7 @@ from werkzeug.exceptions import HTTPException
 
 from app.calc import TargetTooLow
 from app.inn.fns import CaptchaRequired, InnLookupError, InnNotFound, SourceUnavailable
+from app.render.context import ContextError
 from app.render.docx_render import TemplateError
 from app.render.layouts import LayoutError
 from app.render.package import PackageError
@@ -184,7 +185,8 @@ def handle_exception(exc: Exception):
         return _reply(str(exc), 400)
     if isinstance(exc, (CaptchaRequired, SourceUnavailable, InnLookupError)):
         return _reply(str(exc), 502)
-    if isinstance(exc, (TargetTooLow, PackageError, TemplateError, CellMapError, LayoutError)):
+    if isinstance(exc, (TargetTooLow, PackageError, TemplateError, CellMapError,
+                        LayoutError, ContextError)):
         return _reply(str(exc), 400)
     if isinstance(exc, sqlite3.IntegrityError):
         error = translate_integrity(exc)
