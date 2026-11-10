@@ -32,9 +32,7 @@ from pathlib import Path
 if __package__ in (None, ""):          # запуск файлом: найти пакет app
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app import db
-from app import config
-from app.config import DB_PATH
+from app import config, db
 from app.models import (
     ROLE_CUSTOMER, ROLE_PARTICIPANT, Asset, CustomerProfile, DocSpec, Employee,
     ExperienceRecord, Organization, Service,
@@ -448,7 +446,9 @@ def seed_if_empty(repo: Repo) -> bool:
 
 
 def main() -> int:
-    conn = db.connect(DB_PATH)
+    # Путь читается из config в момент вызова, а не копируется именем при
+    # загрузке модуля (доктрина app/config.py).
+    conn = db.connect(config.DB_PATH)
     try:
         db.migrate(conn)
         repo = Repo(conn)

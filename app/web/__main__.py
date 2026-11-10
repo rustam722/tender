@@ -11,11 +11,11 @@
 import logging
 import sqlite3
 import sys
+from pathlib import Path
 
 from werkzeug.serving import ThreadedWSGIServer
 
-from app import db
-from app.config import BASE_DIR, DB_PATH
+from app import config, db
 from app.repo import Repo
 from app.web import create_app
 
@@ -64,8 +64,8 @@ def fill_references(db_path) -> None:
     любой папки. Сбой наполнения программу не останавливает -- справочники
     можно завести руками, и фраза говорит, что случилось.
     """
-    if str(BASE_DIR) not in sys.path:
-        sys.path.insert(0, str(BASE_DIR))
+    if str(config.BASE_DIR) not in sys.path:
+        sys.path.insert(0, str(config.BASE_DIR))
     try:
         from scripts.seed import SeedError, seed_if_empty
     except ImportError:
@@ -87,15 +87,24 @@ def fill_references(db_path) -> None:
         conn.close()
 
 
-def main() -> int:
+def main(db_path=None) -> int:
+    """Запуск программы. `db_path` -- база, с которой работать; None -- рабочая
+    база программы (`config.DB_PATH`).
+
+    Путь читается из `config` в момент вызова, а не копируется именем при
+    загрузке модуля: так подмена пути в тесте видна и здесь, и всем остальным.
+    Параметр нужен тому, кто зовёт `main` не из ярлыка: тест передаёт
+    временный путь и ничего не подменяет.
+    """
+    db_path = Path(config.DB_PATH if db_path is None else db_path)
     try:
-        app = create_app(DB_PATH)
+        app = create_app(db_path)
     except (OSError, sqlite3.Error):
-        logging.getLogger(__name__).exception("Не удалось открыть базу данных %s", DB_PATH)
-        print(f"Не удалось открыть базу данных {DB_PATH}: проверьте, что файл не занят "
+        logging.getLogger(__name__).exception("Не удалось открыть базу данных %s", db_path)
+        print(f"Не удалось открыть базу данных {db_path}: проверьте, что файл не занят "
               "другой программой, не повреждён и что в папке можно записывать.")
         return 1
-    fill_references(DB_PATH)
+    fill_references(db_path)
     try:
         server = build_server(app)
     except BindError:

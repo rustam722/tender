@@ -935,17 +935,19 @@ def test_hostile_document_names_and_prefixes_cannot_leave_the_folder(client, tmp
     assert "\\" not in written[0] and "/" not in written[0]   # разделители стали дефисами
 
 
-def test_startup_failures_are_russian_not_tracebacks(app, monkeypatch, capsys):
+def test_startup_failures_are_russian_not_tracebacks(app, monkeypatch, capsys,
+                                                     tmp_path):
     from app.web import __main__ as entry
+    base = tmp_path / "t.db"
 
     def broken(path):
         raise sqlite3.OperationalError("unable to open database file")
 
-    # наполнение справочников при первом запуске идёт по настоящему пути базы
-    # программы -- в тесте его не трогаем
+    # База -- временная (main принимает путь), наполнение здесь не проверяется:
+    # рабочую базу фирмы сторожит tests/conftest.py на весь набор.
     monkeypatch.setattr(entry, "fill_references", lambda path: None)
     monkeypatch.setattr(entry, "create_app", broken)
-    assert entry.main() == 1
+    assert entry.main(db_path=base) == 1
     out = capsys.readouterr().out
     assert "базу данных" in out and "Traceback" not in out
 
@@ -955,7 +957,7 @@ def test_startup_failures_are_russian_not_tracebacks(app, monkeypatch, capsys):
         raise entry.BindError("[WinError 10048] Only one usage of each socket address")
 
     monkeypatch.setattr(entry, "build_server", busy)
-    assert entry.main() == 1
+    assert entry.main(db_path=base) == 1
     out = capsys.readouterr().out
     assert "порт 8765 занят" in out and "Traceback" not in out
 

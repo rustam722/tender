@@ -336,3 +336,133 @@ def test_the_program_fills_the_references_at_its_first_start(tmp_path, capsys):
         conn.close()
     entry.fill_references(path)                 # второй запуск молчит
     assert "Справочники заполнены" not in capsys.readouterr().out
+
+
+# ---- живой случай: форма заказчика печатает пустые реквизиты ----------------------
+
+# Заявку по форме ПМУП «Автоспецтранс» собрали на живой работе, и в анкете
+# участника четыре строки банковских реквизитов и основание полномочий
+# оказались пустыми: в справочнике их нет намеренно (см. выше). Программа
+# отдала документ и ничего не сказала -- узнать об этом человек мог только
+# от закупочной комиссии.
+
+ANKETA = "Анкета участника"
+AUTOSPETSTRANS_FORM = "Заявка на участие Автоспецтранс.docx"
+
+
+def autospetstrans_tender(repo, **requisites) -> int:
+    from app.models import ROLE_CUSTOMER, CustomerProfile, DocSpec, Organization
+    seed(repo)
+    me = repo.find_organization_by_inn("5904188041")
+    if requisites:
+        from dataclasses import replace as dc_replace
+        repo.save_organization(dc_replace(me, **requisites))
+    customer = repo.save_organization(Organization(
+        role=ROLE_CUSTOMER, short_name="ПМУП «Автоспецтранс»", inn="5903004541"))
+    repo.save_customer_profile(CustomerProfile(
+        customer_id=customer, documents=[ANKETA],
+        docs={ANKETA: DocSpec(template=AUTOSPETSTRANS_FORM, prefix="1.")}))
+    tid = repo.save_tender(Tender(
+        customer_id=customer, participant_id=me.id,
+        purchase_number="32514010203", subject="Разработка КЭР",
+        deadline="90 дней с даты заключения договора", doc_date="2025-11-10"))
+    repo.save_lot_item(LotItem(tender_id=tid, position=1, name="Разработка КЭР",
+                               price=Decimal("1000000")))
+    return tid
+
+
+BANK = {"bank_name": "Филиал «Нижегородский» АО «АЛЬФА-БАНК»",
+        "bank_bik": "042202824", "bank_account": "40702810122250001234",
+        "bank_corr_account": "30101810200000000824", "head_basis": "Устав"}
+
+
+def test_the_form_of_the_new_customer_names_its_empty_requisites(repo, tmp_path):
+    from app.render.package import build_package
+    tid = autospetstrans_tender(repo)
+    result = build_package(tid, [ANKETA], tmp_path / "out", repo)
+    assert [p.name for p in result.written] == [f"1.{ANKETA}.docx"]
+    (document, text), = result.warnings
+    assert document == ANKETA
+    for name in ("Банк", "БИК", "Расчётный счёт", "Корреспондентский счёт",
+                 "Основание полномочий"):
+        assert name in text, name
+    assert "справочник «Организации»" in text      # где их заполняют
+    assert "org.bank_name" not in text             # имя поля, а не путь
+
+
+def test_the_same_form_with_the_requisites_filled_says_nothing(repo, tmp_path):
+    # обратная сторона: заполнили -- и предупреждения нет ни одного
+    from app.render.package import build_package
+    tid = autospetstrans_tender(repo, **BANK)
+    result = build_package(tid, [ANKETA], tmp_path / "out", repo)
+    assert [p.name for p in result.written] == [f"1.{ANKETA}.docx"]
+    assert result.warnings == []
+
+
+def test_the_form_prints_the_requisites_it_was_given(repo, tmp_path):
+    """Третья сторона: предупреждение говорит о НАПЕЧАТАННОМ. Реквизиты,
+    которые документ печатает, читаются из готового файла."""
+    import docx
+    from app.render.package import build_package
+    tid = autospetstrans_tender(repo, **BANK)
+    result = build_package(tid, [ANKETA], tmp_path / "out", repo)
+    document = docx.Document(result.written[0])
+    text = "\n".join(
+        [p.text for p in document.paragraphs]
+        + [c.text for t in document.tables for row in t.rows for c in row.cells])
+    assert BANK["bank_account"] in text and BANK["bank_bik"] in text
+    assert "Устав" in text
+
+
+# ---- сторож рабочей базы: он один на весь набор и включается сам ------------------
+
+def test_the_guard_refuses_the_working_database_of_the_firm(tmp_path):
+    """Рабочая база фирмы для набора тестов закрыта (tests/conftest.py).
+    Сторож, которого можно забыть, ничего не стережёт: он автоматический,
+    смотрит на путь и падает по-русски."""
+    from app import config
+    from app import db as db_module
+    existed = Path(config.DB_PATH).exists()
+    with pytest.raises(pytest.fail.Exception) as caught:
+        db_module.connect(config.DB_PATH)
+    text = str(caught.value)
+    assert "рабочую базу" in text and str(config.DB_PATH) in text
+    assert "tmp_path" in text                      # что делать вместо этого
+    # база не создана и папка data не появилась: сторож не пропустил вызов
+    assert Path(config.DB_PATH).exists() == existed
+    # а временные базы открываются как раньше -- иначе сторожил бы всё подряд
+    conn = db_module.connect(tmp_path / "t.db")
+    conn.close()
+
+
+def test_the_guard_looks_at_the_path_not_at_the_name(tmp_path, monkeypatch):
+    # Модуль может взять DB_PATH копией имени, и подмена config.DB_PATH до него
+    # не дойдёт: настоящий путь сторож запомнил при загрузке.
+    from app import config
+    from app import db as db_module
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "подменённая.db")
+    with pytest.raises(pytest.fail.Exception):
+        db_module.connect(Path(__file__).resolve().parent.parent
+                          / "data" / "tender.db")
+
+
+def test_main_works_on_the_database_it_is_given(tmp_path, monkeypatch, capsys):
+    """`main(db_path=...)` -- вторая дверь к рабочей базе, закрытая у входа:
+    тест передаёт временный путь и ничего не подменяет. Проверяется то, что
+    видит человек: база создана, справочники наполнены."""
+    from app.web import __main__ as entry
+    path = tmp_path / "своя.db"
+
+    def busy(app, port=entry.PORT):
+        raise entry.BindError("занято")
+
+    monkeypatch.setattr(entry, "build_server", busy)
+    assert entry.main(db_path=path) == 1            # до сервера дело дошло
+    out = capsys.readouterr().out
+    assert "Справочники заполнены" in out and "Traceback" not in out
+    assert path.is_file()
+    conn = db.connect(path)
+    try:
+        assert all(counts(Repo(conn)).values())
+    finally:
+        conn.close()
