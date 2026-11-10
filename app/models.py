@@ -1,8 +1,14 @@
-"""Модели справочников. Только датаклассы, без логики.
+"""Модели справочников. Только датаклассы и русские имена их полей, без логики.
 
 Деньги и часы -- только Decimal. Даты хранятся строкой ISO (ГГГГ-ММ-ДД):
 встроенные адаптеры дат в sqlite3 объявлены устаревшими.
 `id is None` означает запись, ещё не сохранённую в базе.
+
+Русские имена полей (ORGANIZATION_LABELS, TENDER_LABELS) лежат рядом с самими
+полями, потому что их читают два слоя: веб (подписи на экранах и в отказах,
+app.web.schema) и отрисовка (предупреждение о пустых графах документа,
+app.render.context). Два списка имён разошлись бы, и человек увидел бы одно
+поле под двумя названиями.
 """
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -40,6 +46,19 @@ class Organization:
     vat_rate: Decimal | None = None   # None -- брать из настроек организации
     msp_status: str = ""              # статус МСП: '', 'micro', 'small', 'medium'
     id: int | None = None
+
+
+ORGANIZATION_LABELS = {
+    "role": "Роль", "inn": "ИНН", "kpp": "КПП", "ogrn": "ОГРН",
+    "short_name": "Краткое наименование", "full_name": "Полное наименование",
+    "legal_address": "Юридический адрес", "postal_address": "Почтовый адрес",
+    "phones": "Телефоны", "email": "E-mail", "website": "Сайт",
+    "bank_name": "Банк", "bank_bik": "БИК", "bank_account": "Расчётный счёт",
+    "bank_corr_account": "Корреспондентский счёт",
+    "head_name": "ФИО руководителя", "head_position": "Должность руководителя",
+    "head_basis": "Основание полномочий", "okpo": "ОКПО", "oktmo": "ОКТМО",
+    "okved": "ОКВЭД", "vat_rate": "Ставка НДС", "msp_status": "Статус МСП",
+}
 
 
 @dataclass
@@ -186,6 +205,19 @@ class Tender:
     # опыт. Одна услуга на тендер (КЭР; НДВ, НДС, НООЛР, ППЭЭ и ПЭК -- её этапы).
     service_id: int | None = None
     id: int | None = None
+
+
+TENDER_LABELS = {
+    "customer_id": "Заказчик", "participant_id": "Участник",
+    "purchase_number": "Номер закупки", "purchase_date": "Дата закупки",
+    "method": "Способ закупки", "subject": "Предмет закупки",
+    "object_name": "Объект", "object_address": "Адрес объекта",
+    "price_wo_vat": "Цена без НДС", "vat_rate": "Ставка НДС",
+    "deadline": "Сроки исполнения", "payment_terms": "Условия оплаты",
+    "doc_date": "Дата документов", "platform": "Площадка",
+    "output_dir": "Папка пакета", "deal_answers": "Ответы по условиям сделки",
+    "experience_ids": "Отбор опыта", "service_id": "Услуга",
+}
 
 
 @dataclass

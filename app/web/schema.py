@@ -22,6 +22,7 @@ from pathlib import Path
 
 from app.config import BASE_DIR
 from app.models import (
+    ORGANIZATION_LABELS, TENDER_LABELS,
     Asset, CustomerProfile, DocSpec, Employee, ExperienceRecord, LotItem, Organization,
     OrgSettings, Service, Tender, TenderCostItem, TenderLaborRow,
 )
@@ -90,15 +91,7 @@ _COST_KINDS = ("materials", "subcontract")
 
 ORGANIZATIONS = Entity(
     "organizations", Organization, "Организация",
-    labels={"role": "Роль", "inn": "ИНН", "kpp": "КПП", "ogrn": "ОГРН",
-            "short_name": "Краткое наименование", "full_name": "Полное наименование",
-            "legal_address": "Юридический адрес", "postal_address": "Почтовый адрес",
-            "phones": "Телефоны", "email": "E-mail", "website": "Сайт", "bank_name": "Банк",
-            "bank_bik": "БИК", "bank_account": "Расчётный счёт",
-            "bank_corr_account": "Корреспондентский счёт", "head_name": "ФИО руководителя",
-            "head_position": "Должность руководителя", "head_basis": "Основание полномочий",
-            "okpo": "ОКПО", "oktmo": "ОКТМО", "okved": "ОКВЭД", "vat_rate": "Ставка НДС",
-            "msp_status": "Статус МСП"},
+    labels=ORGANIZATION_LABELS,
     save="save_organization", get="get_organization", list_="list_organizations",
     delete="delete_organization",
     choices={"role": _ROLES, "msp_status": _MSP}, percents=("vat_rate",),
@@ -149,15 +142,7 @@ PROFILES = Entity(
 
 TENDERS = Entity(
     "tenders", Tender, "Тендер",
-    labels={"customer_id": "Заказчик", "participant_id": "Участник",
-            "purchase_number": "Номер закупки", "purchase_date": "Дата закупки",
-            "method": "Способ закупки", "subject": "Предмет закупки", "object_name": "Объект",
-            "object_address": "Адрес объекта", "price_wo_vat": "Цена без НДС",
-            "vat_rate": "Ставка НДС", "deadline": "Сроки исполнения",
-            "payment_terms": "Условия оплаты", "doc_date": "Дата документов",
-            "platform": "Площадка", "output_dir": "Папка пакета",
-            "deal_answers": "Ответы по условиям сделки", "experience_ids": "Отбор опыта",
-            "service_id": "Услуга"},
+    labels=TENDER_LABELS,
     save="save_tender", get="get_tender", list_="list_tenders", delete="delete_tender",
     refs={"customer_id": ("Заказчик", "get_organization"),
           "participant_id": ("Участник", "get_organization"),

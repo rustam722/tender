@@ -292,3 +292,154 @@ def test_save_failure_names_the_cause_the_os_reported(
     # наружу уходит русская фраза, а не текст и код операционной системы
     assert "Errno" not in text and "Traceback" not in text
     assert str(failure.errno) not in text
+
+
+# ---- пустая графа: что документ напечатал пустым ---------------------------------
+
+# Заявку отклоняют и за одну пустую графу, а Word, в отличие от книги Excel,
+# понятия обязательного поля не имел вовсе: заявка ушла с четырьмя пустыми
+# строками банковских реквизитов, и человек узнал об этом от комиссии.
+# Проверки ниже читают список, который отрисовка отдала о себе, и текст
+# готового файла -- не словарь на входе.
+
+def _blanks(tmp_path, paragraph, context, name="o.docx"):
+    """Пути полей, напечатанных пустыми, и текст готового документа."""
+    found: list[str] = []
+    out = render_docx(_template_with(tmp_path, paragraph), context,
+                      tmp_path / name, found)
+    return found, "\n".join(p.text for p in docx.Document(out).paragraphs)
+
+
+def test_a_field_printed_empty_is_named_with_its_path(tmp_path):
+    found, text = _blanks(
+        tmp_path, "{{ org.bank_name }} / {{ org.inn }}",
+        {"org": {"bank_name": "", "inn": "5904188041"}})
+    assert found == ["org.bank_name"]
+    assert text == " / 5904188041"                 # документ собран и подписан
+
+
+def test_a_filled_field_says_nothing(tmp_path):
+    # обратная сторона: сигнал, который горит всегда, через неделю перестают читать
+    found, text = _blanks(
+        tmp_path, "{{ org.bank_name }} / {{ org.inn }}",
+        {"org": {"bank_name": "АО «БАНК»", "inn": "5904188041"}})
+    assert found == []
+    assert text == "АО «БАНК» / 5904188041"
+
+
+def test_a_value_of_spaces_alone_counts_as_empty(tmp_path):
+    # графа из пробелов выглядит пустой и в заявке, и для комиссии
+    found, _ = _blanks(tmp_path, "{{ org.head_basis }}",
+                       {"org": {"head_basis": "   "}})
+    assert found == ["org.head_basis"]
+
+
+def test_a_missing_value_of_none_counts_as_empty(tmp_path):
+    found, text = _blanks(tmp_path, "{{ tender.vat_rate }}",
+                          {"tender": {"vat_rate": None}})
+    assert found == ["tender.vat_rate"]
+    assert text == "" and "None" not in text
+
+
+def test_the_optional_filter_is_how_a_legal_blank_is_marked(tmp_path):
+    # Факс, которого у фирмы нет, -- не повод пугать человека перед подачей.
+    # Законная пустота отмечается в самих данных, то есть в шаблоне.
+    found, text = _blanks(tmp_path, "Факс: {{ org.fax|optional }}",
+                          {"org": {"fax": ""}})
+    assert found == []
+    assert text == "Факс: "                        # графа осталась пустой
+
+
+def test_the_optional_filter_still_prints_a_value_when_there_is_one(tmp_path):
+    # обратная сторона: фильтр молчит о пустоте, а не глотает значение
+    found, text = _blanks(tmp_path, "Факс: {{ org.fax|optional }}",
+                          {"org": {"fax": "8 (342) 20-66-991"}})
+    assert found == [] and text == "Факс: 8 (342) 20-66-991"
+
+
+def test_a_blank_the_template_handles_itself_is_not_named(tmp_path):
+    # «{{ a or b }}» печатает b: пустота не напечатана, и говорить не о чем
+    found, text = _blanks(tmp_path, "{{ org.website or 'сайта нет' }}",
+                          {"org": {"website": ""}})
+    assert found == []
+    assert text == "сайта нет"
+
+
+def test_a_blank_only_asked_about_in_a_condition_is_not_named(tmp_path):
+    found, text = _blanks(
+        tmp_path, "{% if org.website %}{{ org.website }}{% endif %}конец",
+        {"org": {"website": ""}})
+    assert found == []
+    assert text == "конец"
+
+
+def test_the_same_field_printed_twice_is_named_once(tmp_path):
+    found, _ = _blanks(tmp_path, "{{ org.bank_bik }} и ещё {{ org.bank_bik }}",
+                       {"org": {"bank_bik": ""}})
+    assert found == ["org.bank_bik"]
+
+
+def test_an_empty_date_keeps_its_field_name_through_date_ru(tmp_path):
+    # date_ru и date_long отдают пустую дату как есть именно для этого:
+    # «{{ date_ru(tender.doc_date) }}» на пустой дате печатает пустую графу
+    from app.render.context import date_long, date_ru
+    context = {"tender": {"doc_date": "", "purchase_date": ""},
+               "date_ru": date_ru, "date_long": date_long}
+    found, text = _blanks(
+        tmp_path,
+        "{{ date_ru(tender.doc_date) }}|{{ date_long(tender.purchase_date) }}",
+        context)
+    assert found == ["tender.doc_date", "tender.purchase_date"]
+    assert text == "|"
+
+
+def test_a_filled_date_says_nothing(tmp_path):
+    from app.render.context import date_ru
+    found, text = _blanks(tmp_path, "{{ date_ru(tender.doc_date) }}",
+                          {"tender": {"doc_date": "2025-10-24"},
+                           "date_ru": date_ru})
+    assert found == [] and text == "24.10.2025"
+
+
+def test_empty_cells_of_tables_and_subtables_are_not_named(tmp_path):
+    """Граница проверки, закреплённая нарочно: в клетке табличной справки и
+    в строке подтаблицы пустое значение законно (примечание, документ
+    о владении) -- ровно как в блоке строк карты Excel. Иначе предупреждение
+    о каждой справке горело бы всегда."""
+    context = {"items": [{"name": "", "price": "0,00"}],
+               "assets": {"headers": ["Наименование", "Примечание"],
+                          "rows": [["Компьютер", ""]]}}
+    found, text = _blanks(
+        tmp_path,
+        "{% for it in items %}{{ it.name }}:{{ it.price }}{% endfor %}"
+        "{% for row in assets.rows %}{% for c in row %}[{{ c }}]{% endfor %}"
+        "{% endfor %}",
+        context)
+    assert found == []
+    assert text == ":0,00[Компьютер][]"
+
+
+def test_a_blank_that_went_through_a_filter_is_not_seen(tmp_path):
+    """Второй край той же границы: значение, прошедшее через фильтр или
+    функцию шаблона, приходит оттуда обычной строкой, и пустота в нём не
+    видна. Сказано об этом в начале модуля; тест стоит здесь, чтобы никто
+    не принял список пустых граф за полный."""
+    found, text = _blanks(tmp_path, "[{{ org.bank_name|upper }}]",
+                          {"org": {"bank_name": ""}})
+    assert found == [] and text == "[]"
+
+
+def test_the_source_context_is_not_touched_by_the_check(tmp_path):
+    # в книгу Excel и на экран уходит тот же словарь: пометки в нём остаться
+    # не должны
+    context = {"org": {"bank_name": ""}}
+    _blanks(tmp_path, "{{ org.bank_name }}", context)
+    assert context == {"org": {"bank_name": ""}}
+    assert type(context["org"]["bank_name"]) is str
+
+
+def test_blanks_are_not_collected_when_the_caller_does_not_ask(tmp_path):
+    # список необязателен: экраны и предпросмотр о пустых графах не спрашивают
+    out = render_docx(_template_with(tmp_path, "{{ org.bank_name }}"),
+                      {"org": {"bank_name": ""}}, tmp_path / "o.docx")
+    assert out.is_file()

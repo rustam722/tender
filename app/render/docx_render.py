@@ -27,14 +27,34 @@
 не разбирается как шаблон, так что `{{ ... }}` внутри данных остаётся текстом.
 Обращение к ключу, которого нет в контексте, -- ошибка, а не пустое место:
 документ, молча потерявший реквизит, в тендер не уходит.
+
+Пустая графа. Ключ, который ЕСТЬ в контексте, но пуст, документ печатает
+пустым местом -- и заявку из-за такой графы отклоняют молча (так ушла заявка
+с четырьмя пустыми строками банковских реквизитов). Поэтому отрисовка
+запоминает поля, напечатанные пустыми, и отдаёт их списком в `blanks`;
+сборка пакета превращает список в предупреждение с именами полей. Правило то
+же, что у одиночных клеток карты Excel: пусто -- повод сказать, а законная
+пустота отмечается в самих данных, то есть в шаблоне:
+
+    {{ org.website|optional }}      графа законно может остаться пустой
+
+Что видно, а что нет. Видна пустота значения, напечатанного напрямую
+(`{{ org.bank_name }}`). Значение, прошедшее через функцию или фильтр
+(`{{ money(...) }}`, `{{ x|upper }}`), приходит оттуда обычной строкой, и
+пустота в нём не видна; исключение -- `date_ru`/`date_long`, которые отдают
+пустоту как есть. Клетки табличных справок (`{{ c }}` из `assets.rows`) и
+строки подтаблиц (`{{ it.name }}` из `items`) не проверяются вовсе: там
+пустое значение законно (примечание, документ о владении) -- ровно так же,
+как в блоках строк карты Excel.
 """
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 import jinja2
 from docxtpl import DocxTemplate
 
-from app.render import save_cause
+from app.render import Blank, save_cause
 
 
 class TemplateError(Exception):
@@ -51,19 +71,64 @@ def _missing_key(exc: jinja2.UndefinedError) -> str:
     return "шаблон обращается к значению, которого нет в данных"
 
 
-def _environment() -> jinja2.Environment:
-    # StrictUndefined: пропавший ключ -- ошибка. finalize: None печатается пустотой,
-    # иначе необязательное поле (год, ставка) превратилось бы в слово «None».
-    return jinja2.Environment(
+def _watched(value: object, path: str = ""):
+    """Копия контекста, в которой пустое значение помечено своим путём.
+
+    Помечаются значения словарей контекста (`org.bank_name`, `tender.deadline`)
+    на любой глубине. Элементы списков не помечаются: в клетке табличной
+    справки и в строке подтаблицы пустое значение законно, как в блоке строк
+    карты Excel. Исходный контекст не меняется -- в книгу Excel и на экран
+    уходит он же."""
+    if isinstance(value, Mapping):
+        return {key: _watched(item, f"{path}.{key}" if path else key)
+                for key, item in value.items()}
+    if path and (value is None or (isinstance(value, str) and not value.strip())):
+        return Blank(value, path)
+    return value
+
+
+def _optional(value: object):
+    """Фильтр шаблона: эта графа законно может остаться пустой.
+
+    Снимает пометку пустоты, и предупреждение о пустых графах про неё
+    молчит. Факс, которого у фирмы нет, -- не повод пугать человека перед
+    подачей; сигнал, который горит всегда, через неделю перестают читать."""
+    if value is None:
+        return ""
+    return "" + value if isinstance(value, str) else value     # пометка снята
+
+
+def _finalize(value: object, blanks: list[str]):
+    """Что печатается на месте `{{ ... }}`: None -- пустота (иначе
+    необязательное поле превратилось бы в слово «None»), помеченная пустота --
+    пустота, и путь поля запоминается."""
+    if isinstance(value, Blank):
+        if value.path not in blanks:
+            blanks.append(value.path)
+        return ""
+    return "" if value is None else value
+
+
+def _environment(blanks: list[str]) -> jinja2.Environment:
+    # StrictUndefined: пропавший ключ -- ошибка.
+    env = jinja2.Environment(
         undefined=jinja2.StrictUndefined,
-        finalize=lambda value: "" if value is None else value,
+        finalize=lambda value: _finalize(value, blanks),
     )
+    env.filters["optional"] = _optional
+    return env
 
 
-def render_docx(template: Path, context: dict, out: Path) -> Path:
+def render_docx(template: Path, context: dict, out: Path,
+                blanks: list[str] | None = None) -> Path:
     """Подставить `context` в `template` и сохранить результат в `out`.
 
     Возвращает `out`. Любой сбой -- `TemplateError` с именем шаблона и причиной.
+
+    `blanks` -- список, в который дописываются пути полей, напечатанных
+    пустыми (`org.bank_name`), в порядке появления и без повторов. Что в него
+    попадает, а что нет, сказано в начале модуля; имена полей по этим путям
+    собирает `app.render.context.blank_fields_warning`.
     """
     template, out = Path(template), Path(out)
     name = template.name
@@ -79,8 +144,10 @@ def render_docx(template: Path, context: dict, out: Path) -> Path:
             f"Шаблон «{name}» не открывается: файл повреждён или не является "
             f"документом Word (.docx).") from exc
 
+    found: list[str] = []
     try:
-        tpl.render(context, jinja_env=_environment(), autoescape=True)
+        tpl.render(_watched(context), jinja_env=_environment(found),
+                   autoescape=True)
     except jinja2.UndefinedError as exc:
         raise TemplateError(f"Шаблон «{name}»: {_missing_key(exc)}.") from exc
     except jinja2.TemplateError as exc:
@@ -100,4 +167,6 @@ def render_docx(template: Path, context: dict, out: Path) -> Path:
         # записи в папку не лечатся закрытием Word (см. app.render.save_cause).
         raise TemplateError(
             f"Не удалось сохранить «{out.name}»: {save_cause(exc)}") from exc
+    if blanks is not None:
+        blanks.extend(found)
     return out
