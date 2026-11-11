@@ -160,6 +160,60 @@ function toggleId(list, id, on) {
   return rest.filter((item) => item !== key);
 }
 
+/* Пауза в вводе, после которой запрашивается предпросмотр. Человек печатает
+ * ИНН или цену несколькими нажатиями, и запрос на каждую букву -- это и лишняя
+ * работа сервера (отрисовка документа!), и мигающая область на экране. */
+const PREVIEW_DELAY = 700;
+
+/* Предпросмотр документа: запрос с задержкой и маркер отрисовки.
+ *
+ * `load(document)` -- обращение к серверу (его делает экран, здесь только
+ * порядок); `show({status, document, data|error})` -- что показать: 'loading',
+ * 'shown' или 'failed'. `alive()` -- жив ли ещё экран, который это заказывал
+ * (на карточке тендера это isCurrentRender).
+ *
+ * Два правила, за которые отвечает этот код:
+ *  * `later` откладывает запрос на `delay`, и каждая новая правка отодвигает
+ *    его заново: три правки подряд дают ОДИН запрос. `now` (выбор другого
+ *    документа, кнопка) спрашивает сразу и снимает отложенный.
+ *  * ответ старого запроса не затирает новый. Отрисовка документа идёт
+ *    десятки миллисекунд, ответы приходят в любом порядке, и без номера
+ *    запроса экран показывал бы предпоследнее состояние данных -- то есть
+ *    врал бы о документе. Рисует только ответ последнего запроса; у отказа
+ *    запроса то же правило, иначе ошибка отменённого запроса легла бы
+ *    поверх свежего содержания. */
+function createPreviewLoader({ load, show, delay = PREVIEW_DELAY, alive = () => true }) {
+  let timer = null;
+  /* Метка последнего запроса. Своя метка у каждого запроса и сравнение по
+   * тождеству, а не номер со счётом: считать в этом файле нечего (см. начало). */
+  let latest = null;
+  function cancel() {
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+  }
+  async function send(document) {
+    /* Экран, который заказывал предпросмотр, мог смениться, пока шла пауза в
+     * вводе: человек правил поле и ушёл. Такой запрос не отправляется вовсе --
+     * это не просто рисование в мёртвый DOM, это отрисовка документа Word на
+     * сервере для экрана, которого больше нет. */
+    if (!alive()) return;
+    const mine = {};
+    latest = mine;
+    show({ status: 'loading', document });
+    let data = null;
+    try {
+      data = await load(document);
+    } catch (error) {
+      if (mine === latest && alive()) show({ status: 'failed', document, error });
+      return;
+    }
+    if (mine === latest && alive()) show({ status: 'shown', document, data });
+  }
+  return {
+    now(document) { cancel(); return send(document); },
+    later(document) { cancel(); timer = setTimeout(() => { timer = null; send(document); }, delay); },
+  };
+}
+
 /* Реестр идущих сборок. Живёт на уровне МОДУЛЯ, а не экрана: экран при каждом
  * переходе строится заново, и замок, лежавший в нём, снимался бы переходом на
  * «Карточку тендера» и обратно -- вторая сборка уходила бы в ту же папку, а
@@ -290,6 +344,7 @@ if (typeof module === 'object' && module.exports) {
   module.exports = {
     ApiFailure, api, splitWarning, recordForWrite, writeRecord, splitPasted, lotPayload,
     differenceKind, describeTender, documentChoices, serviceOf, toggleId, createBuilder, createBuildRegistry, buildRegistry,
+    createPreviewLoader, PREVIEW_DELAY,
   };
 }
 
@@ -313,6 +368,11 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         else if (key === 'value') el.value = value;
         else if (key === 'checked') el.checked = Boolean(value);
         else if (key === 'disabled') el.disabled = Boolean(value);
+        /* hidden -- свойством, а не атрибутом: дальше его снимают и ставят
+         * свойством (`state.hidden = false`), и два способа на одно состояние
+         * разошлись бы -- в браузере незаметно, а в заглушке DOM узел остался
+         * бы спрятанным по атрибуту и видимым по свойству. */
+        else if (key === 'hidden') el.hidden = Boolean(value);
         else if (key.startsWith('on')) el.addEventListener(key.slice(2), value);
         else el.setAttribute(key, value === true ? '' : value);
       }
@@ -1205,7 +1265,8 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         return;
       }
       const lookups = await loadLookups(['customers', 'participants', 'services']);
-      const [employees] = await Promise.all([api('GET', '/api/employees')]);
+      const [employees, profiles, catalogue] = await Promise.all([
+        api('GET', '/api/employees'), api('GET', '/api/profiles'), api('GET', '/api/documents')]);
       const base = tender ? `/api/tenders/${tender.id}` : '';
       const record = tender || {};
       /* условия, которых требуют формы заказчика: ключи человек видит готовыми */
@@ -1220,8 +1281,13 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         pendingTenderNotice = null;
       }
       let headDirty = false;
+      let preview = null;         // область предпросмотра: появится ниже, вместе с калькулятором
       const dirtyTag = h('span', { class: 'state-tag', text: 'есть несохранённые изменения', hidden: true });
-      const form = buildForm(TENDER_FIELDS(lookups, deal), record, lookups, () => { headDirty = true; dirtyTag.hidden = false; });
+      const form = buildForm(TENDER_FIELDS(lookups, deal), record, lookups, () => {
+        headDirty = true;
+        dirtyTag.hidden = false;
+        if (preview) preview.edited();        // правка поля -- предпросмотр обновится с задержкой
+      });
       ctx.dirty.push(() => headDirty);
       const saveHead = h('button', { type: 'button', class: 'primary', text: isNew ? 'Создать тендер' : 'Сохранить тендер' });
       saveHead.addEventListener('click', async () => {
@@ -1242,6 +1308,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
           if (warning) headMsg.show('warning', 'Тендер сохранён.', [warning]); else headMsg.show('ok', 'Тендер сохранён.');
           form.mark(null);
           if (calc) calc.refreshEstimate();
+          if (preview) preview.refresh();     // данные записаны: документ стал другим
         } catch (error) {
           form.mark(error);
           headMsg.error(error);
@@ -1272,7 +1339,10 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
 
       /* -- строки тендера -- */
       let calc = null;
-      const changed = () => { if (calc) calc.refreshEstimate(); };
+      const changed = () => {
+        if (calc) calc.refreshEstimate();
+        if (preview) preview.refresh();
+      };
 
       const lotTable = makeRowTable({
         path: `${base}/items`, nameKey: 'name', addText: 'Добавить позицию', emptyText: 'Позиций лота пока нет. Добавьте их или вставьте списком.',
@@ -1588,8 +1658,96 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         return { el, refreshEstimate };
       }
 
-      root.append(h('div', { class: 'two-col' }, h('div', {}, headCard, lotCard, laborCard, materialsCard, subcontractCard), calc.el));
+      /* -- предпросмотр документа -- */
+      preview = previewArea();
+      function previewArea() {
+        /* Что показывает эта область -- и чего в ней нет. Содержание документа:
+         * абзацы и таблицы в том порядке, в котором документ их печатает, с
+         * подставленными значениями. Шрифтов, отступов, разбиения на страницы
+         * и рамок таблиц здесь нет и не будет -- это не вид документа в Word, и
+         * обещать его нельзя: второй Word в браузере разошёлся бы с настоящим
+         * документом в первый же день.
+         *
+         * Считает всё сервер. Строки, суммы, предупреждения и отказ приходят
+         * готовыми -- здесь ни одной арифметики над деньгами, как и во всём
+         * этом файле. */
+        const choices = documentChoices(profiles, record, catalogue);
+        const msg = notice();            // отказ сборки и сбой запроса
+        const warn = notice();           // предупреждения документа
+        const blocksBox = h('div', { class: 'preview-blocks' });
+        const state = h('p', { class: 'hint', text: 'Обновляется…', hidden: true });
+        const unsaved = h('p', { class: 'notice warning', hidden: true,
+          text: 'В шапке тендера есть несохранённые правки: предпросмотр показывает то, что уже сохранено в программе. Нажмите «Сохранить тендер», чтобы увидеть их в документе.' });
+        const select = h('select', { 'aria-label': 'Документ для предпросмотра' },
+          choices.map((c) => h('option', { value: c.name, text: c.name })));
+        if (choices.length) select.value = (choices.find((c) => c.checked) || choices[0]).name;
+
+        const loader = createPreviewLoader({
+          load: (document) => api('POST', `${base}/preview`, { document }),
+          alive: () => isCurrentRender(ctx),
+          show: (outcome) => {
+            state.hidden = outcome.status !== 'loading';
+            if (outcome.status === 'loading') return;
+            msg.clear();
+            warn.clear();
+            if (outcome.status === 'failed') { blocksBox.replaceChildren(); msg.error(outcome.error); return; }
+            draw(outcome.data || {});
+          },
+        });
+
+        function draw(data) {
+          /* Отказ -- тем же видом, что отказ сборки: документ по нынешним данным
+           * не собрать, и пустая область вместо этой фразы была бы молчащим
+           * отказом. Предупреждения -- своим видом и всегда, даже рядом с
+           * отказом: они и есть главная польза предпросмотра. */
+          if (data.kind === 'refusal') {
+            blocksBox.replaceChildren();
+            msg.show('error', 'Не собрано — и почему', [str(data.refusal)]);
+          } else {
+            drawBlocks(data.blocks || []);
+          }
+          if ((data.warnings || []).length) {
+            warn.show('warning', 'Предупреждения — проверьте перед подачей', data.warnings.map(str));
+          }
+        }
+
+        function drawBlocks(blocks) {
+          if (!blocks.length) {
+            blocksBox.replaceChildren(h('p', { class: 'empty', text: 'В документе не напечатано ни абзаца, ни таблицы: проверьте его шаблон.' }));
+            return;
+          }
+          blocksBox.replaceChildren(...blocks.map((block) => (block.kind === 'table'
+            ? h('div', { class: 'table-wrap' }, h('table', { class: 'preview-table' },
+              h('tbody', {}, (block.rows || []).map((row) => h('tr', {}, (row || []).map((cell) => h('td', { text: str(cell) })))))))
+            : h('p', { class: 'preview-p', text: str(block.text) }))));
+        }
+
+        function ask(when) {
+          if (!choices.length || !select.value) {
+            blocksBox.replaceChildren(h('p', { class: 'empty', text: 'Сервер не прислал список документов, и в профиле заказчика их нет. Обновите страницу.' }));
+            return;
+          }
+          when(select.value);
+        }
+        select.addEventListener('change', () => ask(loader.now));   // выбран другой документ -- спрашиваем его, а не показываем прежний
+        const again = h('button', { type: 'button', text: 'Обновить предпросмотр', onclick: () => ask(loader.now) });
+        const el = h('div', { class: 'card' }, h('h2', { text: 'Предпросмотр документа' }),
+          h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Документ' }), select),
+          h('p', { class: 'hint', text: 'Это содержание документа: абзацы и таблицы с подставленными значениями, в порядке документа. Шрифтов, отступов и разбиения на страницы здесь нет — так документ выглядит только в Word.' }),
+          h('div', { class: 'actions', style: 'margin-top:0' }, again), unsaved, state,
+          msg.el, warn.el, blocksBox);
+        return {
+          el,
+          refresh() { unsaved.hidden = !headDirty; ask(loader.now); },
+          edited() { unsaved.hidden = false; ask(loader.later); },
+        };
+      }
+
+      root.append(h('div', { class: 'two-col' },
+        h('div', {}, headCard, lotCard, laborCard, materialsCard, subcontractCard),
+        h('div', {}, calc.el, preview.el)));
       calc.refreshEstimate();
+      preview.refresh();
     }
 
     /* ================================================================== */

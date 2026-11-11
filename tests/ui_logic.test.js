@@ -403,6 +403,108 @@ test('build: a built package whose folder could not be remembered still reports 
   assert.match(outcome.note, /Не сохранено/);
 });
 
+// ---- предпросмотр: задержка и маркер отрисовки -----------------------------------------
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/* Загрузчик предпросмотра с подставным обращением к серверу: `answer(document,
+ * n)` отдаёт обещание ответа, `shown` -- всё, что он просил показать. Задержка
+ * короткая: проверяется правило, а не 700 миллисекунд. */
+function loaderWith(answer, { delay = 20, alive = () => true } = {}) {
+  const asked = [];
+  const shown = [];
+  const loader = app.createPreviewLoader({
+    delay,
+    alive,
+    load: (document) => { asked.push(document); return answer(document, asked.length); },
+    show: (outcome) => shown.push(outcome),
+  });
+  return { loader, asked, shown, drawn: () => shown.filter((o) => o.status !== 'loading') };
+}
+
+test('preview: three edits in a row ask the server once, after the pause in typing', async () => {
+  const { loader, asked, drawn } = loaderWith(async () => ({ kind: 'word', blocks: [] }));
+  loader.later('Декларация соответствия');
+  loader.later('Декларация соответствия');
+  loader.later('Декларация соответствия');
+  assert.deepEqual(asked, [], 'во время ввода сервер не спрашивается');
+  await sleep(60);
+  assert.deepEqual(asked, ['Декларация соответствия'], 'после паузы -- один запрос');
+  assert.deepEqual(drawn().map((o) => o.status), ['shown']);
+});
+
+test('preview: asking now cancels the edit that was waiting for its pause', async () => {
+  const { loader, asked } = loaderWith(async () => ({ kind: 'word', blocks: [] }));
+  loader.later('Декларация соответствия');
+  await loader.now('Справка о МТР');
+  await sleep(60);
+  assert.deepEqual(asked, ['Справка о МТР'],
+    'отложенный запрос про прежний документ не ушёл после того, как спросили про другой');
+});
+
+test('preview: the answer of an older request does not overwrite the newer one', async () => {
+  /* Отрисовка документа идёт десятки миллисекунд, и ответы приходят в любом
+   * порядке. Старший ответ, легший поверх младшего, показал бы предпоследнее
+   * состояние данных -- то есть соврал бы о документе. */
+  const release = [];
+  const { loader, shown, drawn } = loaderWith(
+    (document) => new Promise((resolve) => release.push(() => resolve({ kind: 'word', blocks: [{ kind: 'p', text: document }] }))));
+  const first = loader.now('Декларация соответствия');
+  const second = loader.now('Справка о МТР');
+  release[1]();                 // свежий ответ пришёл первым
+  await second;
+  release[0]();                 // а старый -- вторым
+  await first;
+  assert.deepEqual(drawn().map((o) => o.document), ['Справка о МТР'],
+    'нарисован только ответ последнего запроса');
+  assert.equal(shown.filter((o) => o.status === 'loading').length, 2, 'оба запроса сказали, что идут');
+});
+
+test('preview: a failure of an older request does not overwrite the newer answer either', async () => {
+  const release = [];
+  const { loader, drawn } = loaderWith((document) => new Promise((resolve, reject) => {
+    release.push(document === 'Справка о МТР'
+      ? () => resolve({ kind: 'word', blocks: [] })
+      : () => reject(new Error('связь оборвалась')));
+  }));
+  const first = loader.now('Декларация соответствия');
+  const second = loader.now('Справка о МТР');
+  release[1]();
+  await second;
+  release[0]();
+  await first;
+  assert.deepEqual(drawn().map((o) => o.status), ['shown'],
+    'ошибка отменённого запроса не легла поверх свежего содержания');
+});
+
+test('preview: an answer for a screen that is gone is not drawn at all', async () => {
+  let here = true;
+  const { loader, drawn } = loaderWith(async () => ({ kind: 'word', blocks: [] }),
+    { alive: () => here });
+  const running = loader.now('Декларация соответствия');
+  here = false;                 // человек ушёл на другой экран, пока сервер отрисовывал
+  await running;
+  assert.deepEqual(drawn(), [], 'ответ в мёртвый экран не рисуется');
+});
+
+test('preview: a request whose screen is gone before the pause ends is not sent at all', async () => {
+  /* Человек правил поле и ушёл с карточки. Отрисовка документа на сервере для
+   * экрана, которого больше нет, -- не «просто лишний запрос»: это секунды
+   * работы и файл на диске ради никому не нужного ответа. */
+  let here = true;
+  const { loader, asked, drawn } = loaderWith(async () => ({ kind: 'word', blocks: [] }),
+    { alive: () => here });
+  loader.later('Декларация соответствия');
+  here = false;                 // человек ушёл с карточки, пока шла пауза
+  await sleep(60);
+  assert.deepEqual(asked, [], 'запрос ушёл на сервер для мёртвого экрана');
+  assert.deepEqual(drawn(), []);
+});
+
+test('preview: the pause in typing is 700 ms', () => {
+  assert.equal(app.PREVIEW_DELAY, 700);
+});
+
 // ---- настоящий сервер ---------------------------------------------------------------------
 
 const BASE = process.env.TENDER_BASE;

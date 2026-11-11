@@ -634,8 +634,11 @@ live('render: creating a tender whose number is taken says so on the new tender,
 
     // экран сменился на новый тендер, и предупреждение переехало вместе с ним.
     // Смотрим на сам блок предупреждения: слова «запись №» стоят и в списке тендеров,
-    // и найденные где попало они ничего не доказывают.
-    const warningBoxes = () => page.all((e) => e.className.includes('notice') && e.className.includes('warning'));
+    // и найденные где попало они ничего не доказывают. Блок ищется в карточке шапки,
+    // а не на всём экране: предупреждения о самом документе живут в предпросмотре,
+    // и их число -- не предмет этой проверки.
+    const warningBoxes = () => page.card('Шапка тендера')
+      .all((e) => e.className.includes('notice') && e.className.includes('warning'));
     assert.equal(page.world.location.hash, `#/tender/${second.id}`);
     assertClean(page.text(), 'новый тендер-двойник');
     assert.equal(warningBoxes().length, 1, 'предупреждение выведено не как предупреждение, или его нет');
@@ -649,7 +652,8 @@ live('render: creating a tender whose number is taken says so on the new tender,
     assert.equal(warningBoxes().length, 1, 'после повторного сохранения предупреждение пропало');
     warned = warningBoxes()[0].textContent;
     assert.ok(warned.includes(`запись № ${s.tender.id}`) && warned.includes('Тендер сохранён'));
-    assert.equal(page.all((e) => e.className.includes('notice') && e.className.includes('ok')).length, 0,
+    assert.equal(page.card('Шапка тендера')
+      .all((e) => e.className.includes('notice') && e.className.includes('ok')).length, 0,
       'тендер с двойником сохранён «просто хорошо»');
 
     // шапка с текущим тендером тоже различает двойников
@@ -674,7 +678,174 @@ live('render: a tender whose number is free is created with no warning', async (
     const text = page.text();
     assertClean(text, 'новый тендер без двойника');
     assert.ok(!text.includes('уже записан'), 'предупреждение о двойнике без двойника');
-    assert.equal(page.all((e) => e.className.includes('notice') && e.className.includes('warning')).length, 0);
+    assert.equal(page.card('Шапка тендера')
+      .all((e) => e.className.includes('notice') && e.className.includes('warning')).length, 0);
+  });
+});
+
+// ---- предпросмотр документа --------------------------------------------------------
+
+/* Область предпросмотра на карточке тендера. Что здесь проверяется: что блоки
+ * сервера становятся абзацами и таблицами, что отказ и предупреждения видны
+ * своими видами, что выбор другого документа спрашивает именно его и что
+ * правка поля даёт ОДИН запрос после паузы. Чего не проверяется: вид области,
+ * прокрутка и то, похож ли результат на документ в Word -- это человек. */
+/* Ожидание по условию, а не «подождать 80 мс»: пока запрос держит заслонка,
+ * page.idle() не успокоится, а сборка экрана на медленной машине занимает
+ * больше, чем любое число, которое тут захочется написать. */
+async function waitFor(check, what, limit = 300) {
+  for (let i = 0; i < limit; i += 1) {
+    if (check()) return;
+    await sleep(10);
+  }
+  assert.fail(`не дождались: ${what}`);
+}
+
+const previewCard = (page) => page.card('Предпросмотр документа');
+const previewSelect = (page) => page.all((e) => e.tagName === 'SELECT'
+  && e.attributes['aria-label'] === 'Документ для предпросмотра')[0];
+const noticesIn = (card, kind) => card.all((e) => e.className.includes('notice')
+  && e.className.includes(kind) && !e.hidden);
+
+live('render: the preview draws the paragraphs and tables the server sent, and its warnings as warnings', async () => {
+  const s = await seed('P1');
+  await withPage(async (page) => {
+    page.tweaks.push({ match: isPost(/\/preview$/), edit: () => ({
+      document: 'Справка о МТР', kind: 'word', refusal: null,
+      blocks: [{ kind: 'p', text: 'Предмет закупки: Разработка КЭР' },
+        { kind: 'table', rows: [['Должность', 'ФИО'], ['Директор', 'Рабичко Е. М.']] },
+        { kind: 'p', text: 'Директор: Рабичко Е. М.' }],
+      warnings: ['В документе «Справка о МТР» остались пустые графы: Банк.'],
+    }) });
+    await page.goto(`#/tender/${s.tender.id}`);
+    const card = previewCard(page);
+    assertClean(card.textContent, 'предпросмотр');
+    // абзац нарисован абзацем, таблица -- таблицей, и в том же порядке
+    const paragraphs = card.all((e) => e.tagName === 'P' && e.className.includes('preview-p'));
+    assert.deepEqual(paragraphs.map((p) => p.textContent),
+      ['Предмет закупки: Разработка КЭР', 'Директор: Рабичко Е. М.']);
+    const rows = card.all((e) => e.tagName === 'TR' && e.parentNode.tagName === 'TBODY'
+      && e.parentNode.parentNode.className.includes('preview-table'));
+    assert.deepEqual(rows.map((tr) => tr.children.map((td) => td.textContent)),
+      [['Должность', 'ФИО'], ['Директор', 'Рабичко Е. М.']],
+      'таблица документа нарисована не таблицей или не теми клетками');
+    const warned = noticesIn(card, 'warning');
+    assert.equal(warned.length, 1, 'предупреждение документа выведено не как предупреждение');
+    assert.ok(warned[0].textContent.includes('остались пустые графы: Банк'));
+    assert.equal(noticesIn(card, 'error').length, 0, 'предупреждение показано как отказ');
+  });
+});
+
+live('render: a refused preview shows the refusal of the server, not an empty area', async () => {
+  const s = await seed('P2');
+  await withPage(async (page) => {
+    const refusal = '«Заявка на участие» собирается по форме заказчика, а в профиле этого заказчика форма для него не назначена.';
+    page.tweaks.push({ match: isPost(/\/preview$/), edit: () => ({
+      document: 'Заявка на участие', kind: 'refusal', blocks: [], warnings: [], refusal }) });
+    await page.goto(`#/tender/${s.tender.id}`);
+    const card = previewCard(page);
+    assertClean(card.textContent, 'отказ предпросмотра');
+    const shown = noticesIn(card, 'error');
+    assert.equal(shown.length, 1, 'отказ показан не отказом (или область просто пуста)');
+    assert.ok(shown[0].textContent.includes('форма для него не назначена'),
+      `отказ сервера не выведен дословно: ${shown[0].textContent}`);
+    assert.equal(card.all((e) => e.className.includes('preview-p')).length, 0,
+      'рядом с отказом нарисовано содержание');
+  });
+});
+
+live('render: choosing another document asks the server for THAT document', async () => {
+  const s = await seed('P3');
+  await withPage(async (page) => {
+    page.tweaks.push({ match: isPost(/\/preview$/), edit: (data, body) => ({
+      document: body.document, kind: 'word', refusal: null, warnings: [],
+      blocks: [{ kind: 'p', text: `Содержание: ${body.document}` }] }) });
+    await page.goto(`#/tender/${s.tender.id}`);
+    const select = previewSelect(page);
+    assert.ok(select, 'нет выбора документа для предпросмотра');
+    assert.equal(select.value, 'Справка о МТР', 'по умолчанию выбран не первый документ профиля');
+    assert.ok(previewCard(page).textContent.includes('Содержание: Справка о МТР'));
+
+    select.value = 'Декларация соответствия';
+    select.dispatchEvent({ type: 'change', bubbles: true });
+    await page.idle();
+    const asked = page.log.filter((c) => c.url.endsWith('/preview')).map((c) => c.body.document);
+    assert.deepEqual(asked, ['Справка о МТР', 'Декларация соответствия'],
+      'выбор другого документа не ушёл на сервер');
+    const text = previewCard(page).textContent;
+    assert.ok(text.includes('Содержание: Декларация соответствия'), text);
+    assert.ok(!text.includes('Содержание: Справка о МТР'), 'показан прежний документ');
+  });
+});
+
+live('render: three edits of a field in a row ask the preview once, after the pause', async () => {
+  const s = await seed('P4');
+  await withPage(async (page) => {
+    await page.goto(`#/tender/${s.tender.id}`);
+    const count = () => page.log.filter((c) => c.url.endsWith('/preview')).length;
+    assert.equal(count(), 1, 'предпросмотр не запрошен при открытии карточки');
+    const subject = page.field('Предмет закупки');
+    page.type(subject, 'Разработка КЭ');
+    page.type(subject, 'Разработка КЭР');
+    page.type(subject, 'Разработка КЭР и ПДВ');
+    await page.idle();
+    assert.equal(count(), 1, 'запрос ушёл на каждую букву');
+    await sleep(900);                       // пауза в вводе -- 700 мс
+    await page.idle();
+    assert.equal(count(), 2, 'после паузы в вводе предпросмотр не обновился');
+    // правка не сохранена, и об этом сказано ВИДИМЫМ предупреждением:
+    // предпросмотр показывает сохранённые данные, а не то, что набрано в поле
+    assert.ok(noticesIn(previewCard(page), 'warning')
+      .some((box) => box.textContent.includes('несохранённые правки')),
+      'предпросмотр молчит о том, что показывает не правку, а сохранённое');
+  });
+});
+
+live('render: leaving the tender card during the pause asks nothing for the screen that is gone', async () => {
+  const s = await seed('P6');
+  await withPage(async (page) => {
+    await page.goto(`#/tender/${s.tender.id}`);
+    const count = () => page.log.filter((c) => c.url.endsWith('/preview')).length;
+    const atOpen = count();
+    page.type(page.field('Предмет закупки'), 'Разработка КЭР и ПДВ');
+    await page.goto('#/refs/organizations');       // ушли, не дождавшись паузы
+    await sleep(900);
+    await page.idle();
+    assert.equal(count(), atOpen,
+      'отложенный запрос ушёл на сервер для карточки, с которой человек уже ушёл');
+  });
+});
+
+live('render: the answer of an older preview request does not overwrite the newer one', async () => {
+  const s = await seed('P5');
+  await withPage(async (page) => {
+    let release = () => {};
+    let seen = 0;
+    try {
+      page.tweaks.push({ match: isPost(/\/preview$/), edit: (data, body) => ({
+        document: body.document, kind: 'word', refusal: null, warnings: [],
+        blocks: [{ kind: 'p', text: `Содержание: ${body.document}` }] }) });
+      // первый запрос (при открытии карточки) держим, пока не придёт ответ второго
+      const asked = () => page.log.filter((c) => c.url.endsWith('/preview')).length;
+      page.gates.push({ match: (url, method) => method === 'POST' && url.endsWith('/preview')
+        && (seen += 1) === 1, promise: new Promise((resolve) => { release = resolve; }) });
+      page.world.location.hash = `#/tender/${s.tender.id}`;
+      await waitFor(() => previewSelect(page), 'выбор документа в предпросмотре');
+      const select = previewSelect(page);
+      select.value = 'Декларация соответствия';
+      select.dispatchEvent({ type: 'change', bubbles: true });
+      await waitFor(() => asked() === 2, 'запрос про выбранный документ');
+      await waitFor(() => previewCard(page).textContent.includes('Содержание: Декларация'),
+        'ответ про выбранный документ нарисован');
+      release();                      // и только теперь отвечает первый запрос
+      await page.idle();
+      const text = previewCard(page).textContent;
+      assert.ok(text.includes('Содержание: Декларация соответствия'), text);
+      assert.ok(!text.includes('Содержание: Справка о МТР'),
+        'ответ старого запроса затёр свежий: на экране не тот документ, который выбран');
+    } finally {
+      release();
+    }
   });
 });
 

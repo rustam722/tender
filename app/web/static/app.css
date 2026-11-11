@@ -182,6 +182,20 @@ tfoot td { font-weight: 700; border-top: 2px solid var(--line-strong); border-bo
 .gap .line { margin: 2px 0; }
 .stale { color: #7a5b00; background: var(--warn-bg); border-radius: 4px; padding: 2px 8px; font-size: .85rem; display: inline-block; margin-top: 6px; }
 
+/* ---- предпросмотр документа ----
+   Содержание, а не вид в Word: шрифты, отступы и разбиение на страницы здесь
+   не изображаются намеренно. Область ограничена по высоте и прокручивается:
+   документ длиннее экрана не должен уносить вниз всё, что под ним. */
+.preview-blocks {
+  margin-top: 10px; max-height: 60vh; overflow: auto; background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px;
+}
+.preview-blocks:empty { display: none; }
+.preview-p { margin: 0 0 6px; overflow-wrap: anywhere; }
+.preview-table { background: var(--surface); margin: 6px 0 10px; }
+.preview-table td { font-size: .9rem; overflow-wrap: anywhere; }
+.preview-table tr:first-child td { font-weight: 600; color: var(--muted); }
+
 /* ---- сборка ---- */
 .result-list { margin: 6px 0 12px; padding-left: 20px; }
 .result-list code, code.path { background: var(--surface-2); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; overflow-wrap: anywhere; }
