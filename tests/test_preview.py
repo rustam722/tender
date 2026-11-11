@@ -218,6 +218,38 @@ def test_a_document_that_cannot_be_built_is_a_refusal_not_an_empty_preview(
     assert "форма для него не назначена" in result.refusal
 
 
+def test_a_warning_already_earned_is_told_even_when_the_document_is_refused(
+        repo, dirs, temp_home):
+    """Беда, о которой уже можно сказать, говорится и при отказе.
+
+    Отказ закрывает один документ, но не отменяет того, что человеку уже
+    известно про его данные. Если сказать только «собрать нельзя», он
+    поправит форму, пересоберёт -- и узнает о второй беде лишь тогда. На
+    закупке со сроком в двенадцать дней каждый такой круг стоит дня.
+
+    Проверка нужна отдельно от «предупреждения доходят до предпросмотра»:
+    тот тест идёт по УСПЕШНОМУ пути. Мутант, собирающий предупреждения
+    только на успехе, прошёл весь набор из 960 проверок -- в коде это
+    заявлено комментарием «предупреждения собираются до любого отказа»,
+    и до сих пор заявление ничем не держалось.
+
+    Здесь обе беды сразу: раскладка таблиц не назначена (предупреждение
+    контекста, оно уже заслужено) и шаблон не читается (отказ отрисовки).
+    """
+    experience = "Справка об опыте"
+    templates, _ = dirs
+    (templates / f"{experience}.docx").write_bytes(b"not a docx at all")
+    tid = make_tender(repo, documents=[experience],
+                      docs={experience: DocSpec()})      # раскладки нет
+
+    result = preview_document(tid, experience, repo)
+
+    assert result.kind == "refusal"
+    assert "не открывается" in result.refusal or "не читается" in result.refusal
+    (warning,) = result.warnings
+    assert "не назначена" in warning and "раскладка таблиц" in warning
+
+
 def test_a_refusal_of_a_preview_says_the_same_words_as_a_refusal_of_the_package(
         repo, dirs, temp_home, tmp_path):
     """Одни и те же слова на один и тот же отказ: два текста про одну беду
