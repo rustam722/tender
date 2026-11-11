@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from app import config, db
-from app.models import ROLE_PARTICIPANT, LotItem, Tender
+from app.models import ROLE_CUSTOMER, ROLE_PARTICIPANT, LotItem, Tender
 from app.render.context import DOCUMENTS, TABLE_DOCUMENTS, build_context
 from app.render.docx_render import render_docx
 from app.repo import Repo
@@ -70,7 +70,7 @@ def test_technosfera_requisites_match_registry(repo):
 def test_every_seeded_profile_has_existing_template_files(repo):
     seed(repo)
     profiles = repo.list_customer_profiles()
-    assert len(profiles) == 3
+    assert len(profiles) == 4
     for profile in profiles:
         for name, spec in profile.docs.items():
             assert name in DOCUMENTS, f"{name!r} -- не каноническое имя"
@@ -80,6 +80,43 @@ def test_every_seeded_profile_has_existing_template_files(repo):
                 assert (config.CELLMAPS_DIR / spec.cellmap).is_file()
             if spec.layout:
                 assert (config.LAYOUTS_DIR / spec.layout).is_file()
+
+
+def test_the_profile_of_avtospetstrans_builds_the_bid_by_their_own_form(repo):
+    """Заказчик закупки № 32616547309 знаком программе: его реквизиты взяты
+    из документации, а заявка собирается ПО ЕГО форме -- общего бланка
+    «Заявка на участие.docx» у этого документа нет и быть не может."""
+    from app.render.context import CUSTOMER_FORM_DOCUMENTS
+    seed(repo)
+    customer = autospetstrans_customer(repo)
+    assert (customer.kpp, customer.ogrn) == ("100101001", "1021000526315")
+    profile = repo.find_customer_profile(customer.id)
+    assert profile.documents == [BID, "Письмо о крупности сделки"]
+    assert profile.docs[BID].template == AUTOSPETSTRANS_FORM
+    assert BID in CUSTOMER_FORM_DOCUMENTS
+    assert not (config.TEMPLATES_DOCS_DIR / f"{BID}.docx").is_file()
+
+
+def test_the_bid_of_avtospetstrans_carries_its_own_declaration(repo):
+    """Декларации соответствия в профиле нет НАРОЧНО, и текста декларации
+    тоже. П. 3.4 документации её требует, но Приложение № 4 этого заказчика
+    несёт её в себе: в анкете стоит «Настоящей заявкой декларируем
+    соответствие требованиям Документации об аукционе» и пять пунктов.
+    Наш бланк рядом был бы вторым ответом на то же требование, да ещё
+    формулировками 44-ФЗ в закупке по 223-ФЗ.
+
+    Тест держит именно это решение: если декларацию добавят в профиль,
+    он покраснеет и спросит, зачем."""
+    import docx
+    seed(repo)
+    profile = repo.find_customer_profile(autospetstrans_customer(repo).id)
+    assert "Декларация соответствия" not in profile.documents
+    assert profile.declaration_text == ""
+    form = docx.Document(config.TEMPLATES_DOCS_DIR / AUTOSPETSTRANS_FORM)
+    printed = "\n".join(
+        [p.text for p in form.paragraphs]
+        + [c.text for t in form.tables for row in t.rows for c in row.cells])
+    assert "декларируем соответствие требованиям Документации" in printed
 
 
 def test_profile_documents_are_canonical_and_described(repo):
@@ -240,6 +277,30 @@ def test_signature_guard_also_reads_workbooks(tmp_path):
     assert "xl/media/image1.png" in _images_outside_whitelist(tmp_path)[0]
 
 
+def test_no_template_formats_the_already_formatted_today():
+    """Ни один шаблон не зовёт `date_long(today)` или `date_ru(today)`.
+
+    Это не придирка к стилю: `today` приходит в шаблон готовой строкой
+    «ДД.ММ.ГГГГ», и вторая формовка роняет отрисовку по-настоящему --
+    `ValueError: Дата «11.11.2026» не распознана`. Срабатывает она только на
+    тендере БЕЗ даты документа, потому что стоит такая подстановка в запасной
+    ветке `{{ date_long(tender.doc_date) or date_long(today) }}`. Так и было
+    в форме Автоспецтранса: девять шаблонов отрисовывались, а десятый падал
+    на пустой дате. Для длинной формы в контексте есть `today_long`."""
+    import re
+    import zipfile
+    bad = []
+    for template in sorted(Path(config.TEMPLATES_DOCS_DIR).glob("*.docx")):
+        with zipfile.ZipFile(template) as archive:
+            parts = [name for name in archive.namelist()
+                     if name.startswith("word/") and name.endswith(".xml")]
+            text = "".join(archive.read(name).decode("utf-8") for name in parts)
+        plain = re.sub(r"<[^>]+>", "", text)
+        for call in re.findall(r"date_(?:ru|long)\(\s*today\s*\)", plain):
+            bad.append(f"{template.name}: {call}")
+    assert bad == [], bad
+
+
 def test_every_seeded_word_template_renders_with_a_real_context(repo, tmp_path):
     """Шаблоны после правки (убрана подпись, итоги КП) по-прежнему собираются."""
     seed(repo)
@@ -311,7 +372,7 @@ def test_seed_if_empty_does_not_touch_a_base_that_already_has_data(repo):
 def test_one_surviving_record_is_enough_to_count_as_not_empty(repo):
     # пустота проверяется по каждому справочнику: одна организация в базе --
     # уже не первый запуск
-    from app.models import ROLE_CUSTOMER, Organization
+    from app.models import Organization
     repo.save_organization(Organization(role=ROLE_CUSTOMER, inn="2904016130",
                                         short_name="МУП «Полигон»"))
     assert seed_if_empty(repo) is False
@@ -346,24 +407,28 @@ def test_the_program_fills_the_references_at_its_first_start(tmp_path, capsys):
 # отдала документ и ничего не сказала -- узнать об этом человек мог только
 # от закупочной комиссии.
 
-ANKETA = "Анкета участника"
+BID = "Заявка на участие"
 AUTOSPETSTRANS_FORM = "Заявка на участие Автоспецтранс.docx"
+AUTOSPETSTRANS_INN = "1001043249"
+
+
+def autospetstrans_customer(repo):
+    """Заказчик из наполнения, а не выдуманный рядом: эти тесты держат живой
+    случай, и держать его на подставном профиле значило бы проверять не то,
+    что увидит человек."""
+    return next(org for org in repo.list_organizations(ROLE_CUSTOMER)
+                if org.inn == AUTOSPETSTRANS_INN)
 
 
 def autospetstrans_tender(repo, **requisites) -> int:
-    from app.models import ROLE_CUSTOMER, CustomerProfile, DocSpec, Organization
     seed(repo)
     me = repo.find_organization_by_inn("5904188041")
     if requisites:
         from dataclasses import replace as dc_replace
         repo.save_organization(dc_replace(me, **requisites))
-    customer = repo.save_organization(Organization(
-        role=ROLE_CUSTOMER, short_name="ПМУП «Автоспецтранс»", inn="5903004541"))
-    repo.save_customer_profile(CustomerProfile(
-        customer_id=customer, documents=[ANKETA],
-        docs={ANKETA: DocSpec(template=AUTOSPETSTRANS_FORM, prefix="1.")}))
+    customer = autospetstrans_customer(repo)
     tid = repo.save_tender(Tender(
-        customer_id=customer, participant_id=me.id,
+        customer_id=customer.id, participant_id=me.id,
         purchase_number="32514010203", subject="Разработка КЭР",
         deadline="90 дней с даты заключения договора", doc_date="2025-11-10"))
     repo.save_lot_item(LotItem(tender_id=tid, position=1, name="Разработка КЭР",
@@ -379,10 +444,10 @@ BANK = {"bank_name": "Филиал «Нижегородский» АО «АЛЬ�
 def test_the_form_of_the_new_customer_names_its_empty_requisites(repo, tmp_path):
     from app.render.package import build_package
     tid = autospetstrans_tender(repo)
-    result = build_package(tid, [ANKETA], tmp_path / "out", repo)
-    assert [p.name for p in result.written] == [f"1.{ANKETA}.docx"]
+    result = build_package(tid, [BID], tmp_path / "out", repo)
+    assert [p.name for p in result.written] == [f"1.{BID}.docx"]
     (document, text), = result.warnings
-    assert document == ANKETA
+    assert document == BID
     for name in ("Банк", "БИК", "Расчётный счёт", "Корреспондентский счёт",
                  "Основание полномочий"):
         assert name in text, name
@@ -394,8 +459,8 @@ def test_the_same_form_with_the_requisites_filled_says_nothing(repo, tmp_path):
     # обратная сторона: заполнили -- и предупреждения нет ни одного
     from app.render.package import build_package
     tid = autospetstrans_tender(repo, **BANK)
-    result = build_package(tid, [ANKETA], tmp_path / "out", repo)
-    assert [p.name for p in result.written] == [f"1.{ANKETA}.docx"]
+    result = build_package(tid, [BID], tmp_path / "out", repo)
+    assert [p.name for p in result.written] == [f"1.{BID}.docx"]
     assert result.warnings == []
 
 
@@ -405,7 +470,7 @@ def test_the_form_prints_the_requisites_it_was_given(repo, tmp_path):
     import docx
     from app.render.package import build_package
     tid = autospetstrans_tender(repo, **BANK)
-    result = build_package(tid, [ANKETA], tmp_path / "out", repo)
+    result = build_package(tid, [BID], tmp_path / "out", repo)
     document = docx.Document(result.written[0])
     text = "\n".join(
         [p.text for p in document.paragraphs]

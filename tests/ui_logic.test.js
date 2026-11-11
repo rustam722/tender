@@ -541,12 +541,14 @@ live('live: build asks about replacement by document names, locks, and remembers
 
   const profiles = await app.api('GET', '/api/profiles');
   const catalogue = await app.api('GET', '/api/documents');
-  assert.equal(catalogue.length, 10);
+  // Длину каталога задаёт сервер (DOCUMENTS), а не этот тест: здесь проверяется,
+  // что профиль ОТМЕЧАЕТ в полном списке, а не подменяет его собой.
+  assert.ok(catalogue.includes('Декларация соответствия') && catalogue.length >= 10);
   const choices = app.documentChoices(profiles, tender, catalogue);
   assert.deepEqual(choices.filter((c) => c.checked).map((c) => c.name), ['Справка о МТР', 'Декларация соответствия']);
-  assert.equal(choices.length, 10, 'профиль отметил нужное, но список остался полным');
+  assert.equal(choices.length, catalogue.length, 'профиль отметил нужное, но список остался полным');
   const bare = app.documentChoices([], tender, catalogue);        // заказчик без профиля
-  assert.equal(bare.length, 10);
+  assert.equal(bare.length, catalogue.length);
 
   const asked = [];
   const busy = [];

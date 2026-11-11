@@ -25,7 +25,8 @@ DOC_MTR = "Справка о МТР"
 
 TOP_LEVEL_KEYS = {
     "org", "customer", "tender", "items", "estimate", "labor", "employees",
-    "assets", "experience", "declaration_text", "conditions", "today", "money",
+    "assets", "experience", "declaration_text", "conditions", "today", "today_long",
+    "money",
     "money_total", "materials", "subcontract", "date_ru", "date_long", "warnings",
     "printed_price_wo_vat", "rounding",
 }
@@ -118,6 +119,22 @@ def test_context_has_all_documented_keys(repo_with_koryazhma):
     assert ctx["tender"]["price_wo_vat"] == Decimal("5700000.00")
     for table in ("employees", "assets", "experience"):
         assert set(ctx[table]) == {"headers", "rows"}
+
+
+def test_today_comes_in_both_forms_already_formatted(repo):
+    """`today` и `today_long` -- готовые строки одного и того же дня. Обе
+    нужны затем, чтобы шаблону не понадобился `date_long(today)`: `today`
+    уже отформатирован, и такая подстановка роняет отрисовку (ValueError
+    «дата не распознана») -- ровно на том тендере, у которого нет даты
+    документа, то есть там, где шаблон к этой подмене и обращается."""
+    from datetime import date
+    ctx = build_context(repo.save_tender(Tender()), repo)
+    today = date.today()
+    assert ctx["today"] == today.strftime("%d.%m.%Y")
+    assert ctx["today_long"] == ctx["date_long"](today.isoformat())
+    assert str(today.day) in ctx["today_long"] and "г." in ctx["today_long"]
+    with pytest.raises(ValueError):
+        ctx["date_long"](ctx["today"])            # вот что ловит эта пара
 
 
 def test_sparse_tender_still_has_every_key(repo):
