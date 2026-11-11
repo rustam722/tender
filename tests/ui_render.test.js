@@ -677,3 +677,38 @@ live('render: a tender whose number is free is created with no warning', async (
     assert.equal(page.all((e) => e.className.includes('notice') && e.className.includes('warning')).length, 0);
   });
 });
+
+// ---- копия справочников ------------------------------------------------------------
+
+live('render: the copy button on the references screen names the file it made', async () => {
+  await withPage(async (page) => {
+    await page.goto('#/refs/organizations');
+    const button = page.button('Сохранить копию справочников');
+    button.click();
+    await page.idle();
+    const text = page.text();
+    assert.ok(text.includes('Копия сохранена.'), 'не сказано, что копия сохранена');
+    assert.ok(/tender-\d{4}-\d{2}-\d{2}-\d{6}(-\d+)?\.db/.test(text),
+      `путь копии не показан человеку: ${text.slice(0, 400)}`);
+    assertClean(text, 'копия справочников');
+  });
+});
+
+live('render: the copy button is locked while the copy is being made and freed after', async () => {
+  await withPage(async (page) => {
+    await page.goto('#/refs/organizations');
+    let open;
+    page.gates.push({ match: (url, method) => method === 'POST' && url === '/api/backup',
+      promise: new Promise((resolve) => { open = resolve; }) });
+    const button = page.button('Сохранить копию справочников');
+    button.click();
+    await page.idle();
+    assert.equal(page.button('Сохранить копию справочников').disabled, true,
+      'кнопка не заблокирована, пока копия снимается -- второе нажатие снимет вторую');
+    open();
+    await page.idle();
+    assert.equal(page.button('Сохранить копию справочников').disabled, false,
+      'кнопка осталась заблокированной после того, как копия снята');
+    assert.ok(page.text().includes('Копия сохранена.'));
+  });
+});

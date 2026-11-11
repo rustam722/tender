@@ -531,3 +531,85 @@ def test_main_works_on_the_database_it_is_given(tmp_path, monkeypatch, capsys):
         assert all(counts(Repo(conn)).values())
     finally:
         conn.close()
+
+
+# ---- копия базы при запуске ---------------------------------------------------------
+
+def test_the_launch_copies_the_database_before_it_touches_the_schema(tmp_path,
+                                                                     monkeypatch,
+                                                                     capsys):
+    """Копия снимается ДО миграций: неверная миграция не должна попасть в копию.
+
+    Проверяется не вызов, а порядок: база версии 6 с организацией внутри, запуск
+    на ней доводит схему до нынешней -- а в копии версия осталась прежней."""
+    from app import db as db_module
+    from app.web import __main__ as entry
+    path = tmp_path / "своя.db"
+    conn = db_module.connect(path)
+    try:
+        for number in range(1, 7):                       # ровно до версии 6
+            conn.executescript(db_module._MIGRATIONS[number - 1])
+            conn.execute(f"PRAGMA user_version = {number}")
+        conn.execute("INSERT INTO organization (inn) VALUES ('5904188041')")
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(entry, "build_server",
+                        lambda app, port=entry.PORT: (_ for _ in ()).throw(
+                            entry.BindError("занято")))
+    assert entry.main(db_path=path) == 1
+    assert "Копия базы сохранена" in capsys.readouterr().out
+
+    (copy,) = (path.parent / db_module.BACKUPS_DIR_NAME).glob("*.db")
+    back = db_module.connect(copy)
+    try:
+        assert back.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert back.execute("SELECT COUNT(*) FROM organization").fetchone()[0] == 1
+    finally:
+        back.close()
+    live = db_module.connect(path)
+    try:
+        assert live.execute("PRAGMA user_version").fetchone()[0] == db_module.SCHEMA_VERSION
+    finally:
+        live.close()
+
+
+def test_a_failed_backup_says_so_and_does_not_stop_the_program(tmp_path, monkeypatch,
+                                                               capsys):
+    """Без копии человек должен знать, что копии нет -- но работать ему это не
+    мешает: справочники целы, программа поднимается."""
+    from app import db as db_module
+    from app.web import __main__ as entry
+    path = tmp_path / "своя.db"
+
+    def no_room(*args, **kwargs):
+        raise OSError("на диске нет места")
+
+    monkeypatch.setattr(entry.db, "backup", no_room)
+    monkeypatch.setattr(entry, "build_server",
+                        lambda app, port=entry.PORT: (_ for _ in ()).throw(
+                            entry.BindError("занято")))
+    assert entry.main(db_path=path) == 1              # дошло до сервера
+    out = capsys.readouterr().out
+    assert "Копия базы НЕ сохранена" in out and "нет места" in out
+    assert "Traceback" not in out
+    assert path.is_file()                              # база создана и наполнена
+    conn = db_module.connect(path)
+    try:
+        assert all(counts(Repo(conn)).values())
+    finally:
+        conn.close()
+
+
+def test_the_first_launch_on_a_new_machine_says_nothing_about_copies(tmp_path,
+                                                                     monkeypatch,
+                                                                     capsys):
+    """Базы ещё нет -- копировать нечего, и говорить об этом не о чем."""
+    from app.web import __main__ as entry
+    monkeypatch.setattr(entry, "build_server",
+                        lambda app, port=entry.PORT: (_ for _ in ()).throw(
+                            entry.BindError("занято")))
+    assert entry.main(db_path=tmp_path / "новая.db") == 1
+    out = capsys.readouterr().out
+    assert "Копия базы" not in out
+    assert "Справочники заполнены" in out

@@ -1977,3 +1977,39 @@ def test_the_database_does_not_forbid_two_tenders_with_one_number(tmp_path):
         assert len(repo.list_tenders()) == 2
     finally:
         conn.close()
+
+
+# ---- копия базы по просьбе человека -------------------------------------------------
+
+def test_a_backup_asked_for_on_the_screen_names_the_file_it_made(client):
+    """Копия, о которой человек не знает, где лежит, -- не копия: ответ
+    называет полный путь."""
+    from app import db as db_module
+    made = ok(client.post("/api/backup", json={}))
+    path = Path(made["path"])
+    assert path.is_file() and path.name == made["name"]
+    assert path.parent.name == db_module.BACKUPS_DIR_NAME
+    conn = db_module.connect(path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db_module.SCHEMA_VERSION
+    finally:
+        conn.close()
+
+
+def test_a_backup_that_cannot_be_written_is_a_russian_refusal(client, monkeypatch):
+    """Диск полон или папка защищена -- человеку сказано по-русски, что
+    проверить, и ни строки английского исключения."""
+    from app.web import routes
+    monkeypatch.setattr(routes.db, "backup",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("No space left")))
+    body = refused(client.post("/api/backup", json={}), status=500)
+    assert "Копия базы не сохранена" in body["error"]
+    assert "место на диске" in body["error"]
+
+
+def test_asking_for_a_backup_of_a_database_that_does_not_exist_says_so(client,
+                                                                       monkeypatch):
+    from app.web import routes
+    monkeypatch.setattr(routes.db, "backup", lambda *a, **k: None)
+    body = refused(client.post("/api/backup", json={}))
+    assert "Копировать нечего" in body["error"]

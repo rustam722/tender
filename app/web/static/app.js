@@ -787,7 +787,27 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       const tabs = h('nav', { class: 'tabs', 'aria-label': 'Справочники' },
         REF_TABS.map((t) => h('a', { href: `#/refs/${t.key}`, text: t.title, 'aria-current': t.key === tabKey ? 'page' : undefined })),
         h('a', { href: '#/refs/settings', text: 'Настройки', 'aria-current': tabKey === 'settings' ? 'page' : undefined }));
-      root.append(h('h1', { text: 'Справочники' }), tabs);
+      /* Копия справочников -- рядом с самими справочниками, а не в настройках:
+       * человек нажимает её перед тем, как что-то переделывать, и ищет глазами
+       * здесь. Автоматическая копия снимается при каждом запуске программы,
+       * но между запусками проходят недели. */
+      const copyMsg = notice();
+      const copyButton = h('button', {
+        type: 'button', class: 'small', text: 'Сохранить копию справочников',
+        onclick: async () => {
+          copyButton.disabled = true;          // второе нажатие снимет вторую копию
+          try {
+            const made = await api('POST', '/api/backup', {});
+            copyMsg.show('ok', 'Копия сохранена.', [made.path]);
+          } catch (error) {
+            copyMsg.error(error);
+          } finally {
+            copyButton.disabled = false;
+          }
+        },
+      });
+      root.append(h('h1', { text: 'Справочники' }), tabs,
+                  h('p', { class: 'hint' }, copyButton), copyMsg.el);
       if (tabKey === 'settings') { await settingsView(root, ctx); return; }
       if (!tab) { root.append(h('p', { class: 'empty', text: 'Такого справочника нет.' })); return; }
       await crudView(root, tab, ctx);

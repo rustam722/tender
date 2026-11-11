@@ -1,5 +1,6 @@
 """Соединение с SQLite, типы Decimal и миграции схемы."""
 import sqlite3
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -249,6 +250,70 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+BACKUPS_DIR_NAME = "копии"
+BACKUPS_KEPT = 20
+
+
+def backup(path: Path, keep: int = BACKUPS_KEPT) -> Path | None:
+    """Снимает копию базы в папку «копии» рядом с ней; возвращает путь копии.
+
+    `None`, когда копировать нечего: базы ещё нет (первый запуск). Папка копий
+    тогда не создаётся -- пустая папка на новом компьютере заставила бы человека
+    искать, что пропало.
+
+    Зачем это есть. Справочники фирмы -- кадры, оборудование, МТР, опыт, ставки,
+    профили заказчиков -- и все её тендеры лежат в одном файле. Копии не было
+    никакой: побился файл, снесли папку, умер диск -- и работы нет.
+
+    Копия снимается средствами SQLite (`Connection.backup`), а не `shutil.copy`.
+    Честно о причине: СЕГОДНЯ разницы нет -- журнал у базы обычный (режим WAL
+    не включён), и копия файла вышла бы такой же. Проверено пробой: с открытой
+    незавершённой записью оба способа дают целую копию. Разница появится, если
+    журнал когда-нибудь переведут в WAL: тогда свежие данные живут в соседнем
+    файле `-wal`, и копия одного `.db` их потеряет -- молча. `Connection.backup`
+    правилен при любом режиме журнала и сам знает про спутники файла, поэтому
+    выбран он. Тестом это не доказывается, и теста с таким именем здесь нет.
+
+    Копий хранится `keep` последних, старшие удаляются -- иначе папка растёт
+    без предела на машине, где программу запускают каждый день.
+
+    Старшинство считается по времени изменения файла, а не по имени: имя
+    получает пометку `-2`, `-3`, если в ту же секунду уже снимали копию, и по
+    именам порядок вышел бы неверным.
+
+    Восстановления из копии кнопкой нет нарочно: восстановление затирает
+    нынешние данные, и делать это одним нажатием опасно. Человек копирует файл
+    руками -- см. docs/КАК-РАБОТАТЬ.md.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None
+    folder = path.parent / BACKUPS_DIR_NAME
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    target = folder / f"tender-{stamp}.db"
+    number = 2
+    while target.exists():
+        target = folder / f"tender-{stamp}-{number}.db"
+        number += 1
+
+    source = sqlite3.connect(path)
+    try:
+        copy = sqlite3.connect(target)
+        try:
+            source.backup(copy)
+        finally:
+            copy.close()
+    finally:
+        source.close()
+
+    extra = sorted(folder.glob("tender-*.db"),
+                   key=lambda one: (one.stat().st_mtime, one.name))[:-keep or None]
+    for old in extra:
+        old.unlink(missing_ok=True)
+    return target
 
 
 def migrate(conn: sqlite3.Connection) -> None:

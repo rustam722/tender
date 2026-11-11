@@ -618,6 +618,27 @@ def _documents():
     return jsonify(list(DOCUMENTS))
 
 
+def _backup():
+    """Копия базы по просьбе человека: перед правкой справочников, перед
+    отправкой заявки -- когда он сам решил, что момент важный.
+
+    Автоматическая копия снимается при каждом запуске (app/web/__main__.py),
+    но между запусками программа может работать неделями, и за это время
+    справочники успевают измениться. Ответ называет полный путь файла: копия,
+    о которой человек не знает, где лежит, не копия.
+    """
+    try:
+        copy = db.backup(current_app.config["DB_PATH"])
+    except (OSError, sqlite3.Error) as exc:
+        raise ApiError(
+            f"Копия базы не сохранена: {exc}. Проверьте, есть ли место на диске "
+            "и права на запись в папку рядом с базой.", status=500) from exc
+    if copy is None:
+        raise ApiError("Копировать нечего: базы данных ещё нет. Она появится "
+                       "после первой записи в справочники.")
+    return jsonify({"path": str(copy), "name": copy.name})
+
+
 def _inn(inn: str):
     if not _INN.fullmatch(inn):
         raise ApiError("ИНН должен состоять из 10 цифр (организация) или из 12 "
@@ -652,6 +673,7 @@ def register(app) -> None:
 
     app.add_url_rule("/", "index", lambda: render_template("index.html"))
     app.add_url_rule("/api/inn/<inn>", "inn", _inn, methods=["GET"])
+    app.add_url_rule("/api/backup", "backup", _backup, methods=["POST"])
     app.add_url_rule("/api/tenders/<int:tender_id>/items", "items_replace", _replace_items,
                      methods=["PUT"])
     app.add_url_rule("/api/tenders/<int:tender_id>/labor", "labor_replace", _replace_labor,

@@ -87,6 +87,29 @@ def fill_references(db_path) -> None:
         conn.close()
 
 
+def save_backup(db_path: Path) -> None:
+    """Копия базы перед запуском -- до того, как `create_app` доведёт схему.
+
+    Именно до миграций: если миграция окажется неверной, копия останется
+    снятой с базы ПРЕЖНЕЙ схемы, и терять будет нечего. После миграций копия
+    была бы уже испорченной тем же, от чего защищает.
+
+    Сбой копирования программу не останавливает: диск полон, папка защищена,
+    файл занят -- всё это повод сказать человеку, а не отказать ему в работе.
+    Молча сбой не проходит: без копии он должен знать, что копии нет.
+    """
+    try:
+        copy = db.backup(db_path)
+    except (OSError, sqlite3.Error) as exc:
+        logging.getLogger(__name__).exception("Не удалось сохранить копию базы")
+        print(f"Копия базы НЕ сохранена: {exc}. Программа работает, но данные "
+              "сейчас без резервной копии -- проверьте, есть ли место на диске "
+              f"и права на запись в папку {Path(db_path).parent}.")
+        return
+    if copy is not None:
+        print(f"Копия базы сохранена: {copy}")
+
+
 def main(db_path=None) -> int:
     """Запуск программы. `db_path` -- база, с которой работать; None -- рабочая
     база программы (`config.DB_PATH`).
@@ -97,6 +120,7 @@ def main(db_path=None) -> int:
     временный путь и ничего не подменяет.
     """
     db_path = Path(config.DB_PATH if db_path is None else db_path)
+    save_backup(db_path)
     try:
         app = create_app(db_path)
     except (OSError, sqlite3.Error):
