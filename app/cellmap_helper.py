@@ -330,12 +330,16 @@ def _reached(graph: dict[tuple[str, int, int], list[_Rect]]) -> list[_Rect]:
     stack = [coord for coord in graph if coord not in read_by_formula]
     while stack:
         coord = stack.pop()
+        # Единственная защита от круга в ссылках (A1 = A2, A2 = A1): клетка
+        # разворачивается один раз. Второй такой проверки в обходе нет нарочно
+        # -- запас, который нельзя сломать тестом, скрывает, чем держится
+        # завершение обхода.
         if coord in walked:
-            continue                    # защита от круга в ссылках
+            continue
         walked.add(coord)
         for rect in graph[coord]:
             reached.append(rect)
-            stack.extend(other for other in inside(rect) if other not in walked)
+            stack.extend(inside(rect))
     return reached
 
 

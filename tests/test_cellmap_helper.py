@@ -14,6 +14,7 @@
 """
 import json
 import re
+import threading
 import zipfile
 from decimal import Decimal
 from pathlib import Path
@@ -217,13 +218,22 @@ def test_the_view_of_the_arktikgaz_book_shows_its_rate_and_its_total_formula():
 
 
 def test_reading_a_workbook_does_not_change_its_file(tmp_path):
-    """Шаблон заказчика только читается: помощник открывает его, а не правит."""
+    """Шаблон заказчика только читается: помощник открывает его, а не правит.
+
+    Книга здесь своя, а не копия настоящей формы: проверка не должна зависеть
+    от того, читал ли настоящую форму какой-нибудь тест до неё."""
+    book = make_book(tmp_path / "f.xlsx", {
+        "A1": "Субподряд", "E60": 2, "G48": "=F60*E60"})
+    before = book.read_bytes()
+    read_workbook(book)
+    unreachable_cells(book, ["F63"])
+    assert book.read_bytes() == before
     copy = tmp_path / "Калькуляция.xlsx"
     copy.write_bytes(ARKTIKGAZ.read_bytes())
-    before = copy.read_bytes()
+    was = copy.read_bytes()
     read_workbook(copy)
     unreachable_cells(copy, ["F63"])
-    assert copy.read_bytes() == before
+    assert copy.read_bytes() == was
 
 
 # ---- достижимость --------------------------------------------------------------
@@ -353,11 +363,29 @@ def test_a_reference_to_another_workbook_does_not_make_a_local_cell_reachable(
 
 
 def test_a_circle_of_references_does_not_hang_the_helper(tmp_path):
-    """Книга заказчика бывает битой: A1 = A2, A2 = A1. Обход такого круга
-    обязан закончиться и отдать ответ, а не зависнуть."""
+    """Книга заказчика бывает битой: G48 = G49, а G49 = G48 + F60. Обход
+    такого круга обязан закончиться и отдать ответ, а не зависнуть.
+
+    Круг лежит ПОД итогом (D21 -> G54 -> G48:G50), иначе обход в него и не
+    зашёл бы: клетки, которых не читает никто, итогами и остаются, и тест на
+    круге в стороне ничего бы не доказывал.
+
+    Ответа ждёт отдельный поток: зависший обход должен дать красный тест,
+    а не остановленный прогон, по которому не видно, что именно сломалось."""
     book = make_book(tmp_path / "f.xlsx", {
-        "A1": "=A2", "A2": "=A1", "D21": "=G54", "G54": "=СУММ(G48:G50)"})
-    assert unreachable_cells(book, ["G49", "F60"]) == ["F60"]
+        "D21": "=G54", "G54": "=СУММ(G48:G50)", "G48": "=G49",
+        "G49": "=G48+F60"})
+    answer = []
+    worker = threading.Thread(
+        target=lambda: answer.append(
+            unreachable_cells(book, ["G49", "F60", "F61"])),
+        daemon=True)
+    worker.start()
+    worker.join(15)
+    assert not worker.is_alive(), "обход круга в ссылках не закончился"
+    # и ответ -- не пустая отговорка: клетку под кругом помощник нашёл (F60
+    # читает G49), а клетку вне книги назвал
+    assert answer == [["F61"]]
 
 
 def test_the_answer_keeps_the_order_of_the_asked_addresses_and_names_each_once(
