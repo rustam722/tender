@@ -107,8 +107,12 @@ class PackageResult:
     warnings: list[tuple[str, str]] = field(default_factory=list)
 
 
-class _Refusal(Exception):
-    """Документ не собран; текст -- причина для пользователя."""
+class Refusal(Exception):
+    """Документ не собран; текст -- причина для пользователя.
+
+    Этим же отказом (и теми же словами) отвечает предпросмотр: «документ
+    собирается по форме заказчика, форма не назначена в профиле» -- одна беда,
+    и два текста про неё разошлись бы на первой же правке."""
 
 
 def _units(text: str) -> int:
@@ -196,7 +200,7 @@ def _target(out_dir: Path, document: str, prefix: str, extension: str) -> Path:
     # документ пишется под временным именем, оно длиннее короткого целевого:
     # если не умещается оно, документ не записать, и отказ нужен сразу
     if room < 1 or path_room < _TEMP_LENGTH + len(extension):
-        raise _Refusal(
+        raise Refusal(
             f"Путь к папке слишком длинный: для имени файла не остаётся места "
             f"(Windows открывает пути не длиннее {MAX_PATH_LENGTH} знаков). "
             "Выберите папку ближе к корню диска.")
@@ -223,12 +227,18 @@ def _forms_of_other_customers(document: str, repo: Repo) -> str:
     return (" Такой же документ назначен в профилях: " + "; ".join(found) + ".")
 
 
-def _template_path(document: str, template: str, repo: Repo) -> Path:
+def template_path(document: str, template: str, repo: Repo) -> Path:
+    """Файл шаблона документа; документ, которому его взять негде, -- `Refusal`.
+
+    Общий шаг сборки и предпросмотра: какой шаблон возьмёт сборка и о каком
+    шаблоне говорит предпросмотр, решает один код. `template` -- имя из профиля
+    заказчика (`DocSpec.template`), пустое -- наш бланк «<документ>.docx».
+    """
     # Документ по форме заказчика без назначенной формы: общего бланка у него
     # нет, и звать человека положить «<документ>.docx» в папку -- посылать его
     # делать бессмысленное.
     if not template and document in CUSTOMER_FORM_DOCUMENTS:
-        raise _Refusal(
+        raise Refusal(
             f"«{document}» собирается по форме заказчика, а в профиле этого "
             "заказчика форма для него не назначена. Своего бланка у такого "
             "документа нет: форма у каждого заказчика своя. Укажите файл "
@@ -238,52 +248,89 @@ def _template_path(document: str, template: str, repo: Repo) -> Path:
     name = template or f"{document}.docx"
     path = config.TEMPLATES_DOCS_DIR / name
     if path.suffix.lower() not in _SUPPORTED:
-        raise _Refusal(
+        raise Refusal(
             f"Шаблон «{name}» имеет тип «{path.suffix or 'без расширения'}»: "
             "поддерживаются только Word (.docx) и Excel (.xlsx). Проверьте имя "
             "шаблона в профиле заказчика.")
     if not path.is_file():
-        raise _Refusal(
+        raise Refusal(
             f"Шаблон «{name}» не найден в папке {config.TEMPLATES_DOCS_DIR.name}. "
             "Положите файл с этим именем в папку или укажите другой шаблон "
             "в профиле заказчика.")
     return path
 
 
+def cellmap_path(template: Path, spec) -> Path | None:
+    """Файл карты ячеек книги заказчика; шаблон Word -- `None`.
+
+    Книга без карты или с картой, которой нет на диске, -- `Refusal`. Общий шаг
+    сборки и предпросмотра: отказ про одну и ту же ненайденную карту сказан
+    одними словами в обоих местах.
+    """
+    if template.suffix.lower() != ".xlsx":
+        return None
+    if not spec or not spec.cellmap:
+        # Недостижимо: DocSpec отвергает .xlsx без карты при создании, а
+        # пустой template всегда даёт .docx. Оставлено на случай профиля,
+        # собранного в обход DocSpec; не полагайтесь на эту ветку.
+        raise Refusal(
+            f"Для книги «{template.name}» в профиле заказчика не указана "
+            "карта ячеек. Добавьте её в описание документа.")
+    path = config.CELLMAPS_DIR / spec.cellmap
+    if not path.is_file():
+        raise Refusal(
+            f"Карта ячеек {spec.cellmap} не найдена в папке "
+            f"{config.CELLMAPS_DIR.name}. Проверьте имя файла в профиле заказчика.")
+    return path
+
+
+def declaration_refusal(document: str, template: Path, context: dict) -> str:
+    """Почему документ с пустым текстом декларации собирать нельзя; пустая
+    строка -- можно.
+
+    Декларация без требований: заголовок, «декларирует соответствие следующим
+    требованиям:» и пустое место. Значение идёт через `.splitlines()`, пустоту
+    графы там не видно, и никто бы не сказал. Законной пустоты тут нет, а
+    смотрим на шаблон, не на имя: форма другого заказчика может печатать
+    требования сама, и тогда пустой текст в профиле ей не мешает.
+
+    Один текст на сборку и предпросмотр: предпросмотр обязан отказать теми же
+    словами, иначе человек увидит в нём пустой документ, а в сборке -- отказ.
+    """
+    if (template.suffix.lower() != ".docx"
+            or str(context["declaration_text"]).strip()
+            or not template_uses(template, "declaration_text")):
+        return ""
+    return (
+        f"«{document}» печатает текст декларации из профиля заказчика, а он пуст: "
+        "документ вышел бы с заголовком и без единого требования. Впишите "
+        "требования в поле «Текст декларации» профиля заказчика (экран "
+        "«Справочники», вкладка «Профили заказчиков») и соберите пакет заново.")
+
+
 def _plan_one(document: str, spec, out_dir: Path, taken: set[str],
               repo: Repo) -> tuple[Path, Path]:
-    """Шаблон и итоговый путь документа, либо _Refusal, если документ заведомо
+    """Шаблон и итоговый путь документа, либо Refusal, если документ заведомо
     не будет записан. Общий шаг для planned_files и build_package: путь, о
     котором спросил экран, и путь, который запишет сборка, считаются одним кодом.
     Занятое имя вносится в `taken`. `repo` -- только для подсказки в отказе
     (в чьих профилях назначена форма этого документа)."""
-    template = _template_path(document, spec.template if spec else "", repo)
+    template = template_path(document, spec.template if spec else "", repo)
     target = _target(out_dir, document, spec.prefix if spec else "",
                      template.suffix.lower())
     if os.path.dirname(os.path.abspath(target)) != str(out_dir):
-        raise _Refusal("Имя файла получилось с путём к другой папке; "
+        raise Refusal("Имя файла получилось с путём к другой папке; "
                        "документ не записан.")       # недостижимо после очистки
     if target.name.casefold() in taken:
-        raise _Refusal(
+        raise Refusal(
             f"Имя файла «{target.name}» совпало с другим документом пакета: "
             "второй не записан. Задайте документам разные префиксы в профиле "
             "заказчика.")
     if target.is_dir():
-        raise _Refusal(
+        raise Refusal(
             f"На месте файла «{target.name}» в папке лежит папка с таким же "
             "именем. Переименуйте или уберите её, либо выберите другую папку.")
-    if template.suffix.lower() == ".xlsx":
-        if not spec or not spec.cellmap:
-            # Недостижимо: DocSpec отвергает .xlsx без карты при создании, а
-            # пустой template всегда даёт .docx. Оставлено на случай профиля,
-            # собранного в обход DocSpec; не полагайтесь на эту ветку.
-            raise _Refusal(
-                f"Для книги «{template.name}» в профиле заказчика не указана "
-                "карта ячеек. Добавьте её в описание документа.")
-        if not (config.CELLMAPS_DIR / spec.cellmap).is_file():
-            raise _Refusal(
-                f"Карта ячеек {spec.cellmap} не найдена в папке "
-                f"{config.CELLMAPS_DIR.name}. Проверьте имя файла в профиле заказчика.")
+    cellmap_path(template, spec)
     taken.add(target.name.casefold())
     return template, target
 
@@ -361,7 +408,7 @@ def _left_in_folder(tender_id: int, document: str, spec, out_dir: Path,
     называть её этим именем было бы неправдой."""
     try:
         _, target = _plan_one(document, spec, out_dir, set(), repo)
-    except _Refusal:
+    except Refusal:
         return None
     if not target.is_file() or target in written:
         return None
@@ -382,7 +429,7 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
     template, target = _plan_one(document, spec, out_dir, taken, repo)
     replacing = target.exists()
     if replacing and not overwrite:
-        raise _Refusal(
+        raise Refusal(
             f"Файл «{target.name}» уже есть в папке: он не перезаписан, чтобы "
             "не потерять ваши правки. Разрешите замену существующих файлов, "
             "переименуйте или удалите его либо выберите другую папку.")
@@ -390,18 +437,9 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
     context = build_context(tender_id, repo, document=document,
                            experience_ids=experience_ids)
     warnings.extend((document, text) for text in context["warnings"])
-    if (template.suffix.lower() == ".docx" and not str(context["declaration_text"]).strip()
-            and template_uses(template, "declaration_text")):
-        # Декларация без требований: заголовок, «декларирует соответствие следующим
-        # требованиям:» и пустое место. Значение идёт через .splitlines(), пустоту
-        # графы там не видно, и никто бы не сказал. Законной пустоты тут нет, а
-        # смотрим на шаблон, не на имя: форма другого заказчика может печатать
-        # требования сама, и тогда пустой текст в профиле ей не мешает.
-        raise _Refusal(
-            f"«{document}» печатает текст декларации из профиля заказчика, а он пуст: "
-            "документ вышел бы с заголовком и без единого требования. Впишите "
-            "требования в поле «Текст декларации» профиля заказчика (экран "
-            "«Справочники», вкладка «Профили заказчиков») и соберите пакет заново.")
+    refusal = declaration_refusal(document, template, context)
+    if refusal:
+        raise Refusal(refusal)
     # Единый путь записи: документ всегда пишется под временным именем рядом с
     # целью и становится настоящим файлом одним действием. Так оборванная или
     # неудавшаяся запись оставляет только `~pkg-…`, который уберёт подметание,
@@ -421,11 +459,11 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
             # Модули рендера честно называют тот путь, который им дали, то есть
             # временный. Пользователь такого файла не видел: подменяется только
             # имя файла, а причина отказа остаётся как есть.
-            raise _Refusal(str(exc).replace(work.name, target.name)) from exc
+            raise Refusal(str(exc).replace(work.name, target.name)) from exc
         try:
             (os.replace if replacing else os.rename)(work, target)
         except OSError as exc:
-            raise _Refusal(_move_refusal(target, replacing)) from exc
+            raise Refusal(_move_refusal(target, replacing)) from exc
     except BaseException:
         try:
             work.unlink(missing_ok=True)
@@ -482,7 +520,7 @@ def planned_files(tender_id: int, documents: list[str], out_dir: Path,
         spec = profile.docs.get(document) if profile else None
         try:
             _, target = _plan_one(document, spec, out_dir, taken, repo)
-        except _Refusal:
+        except Refusal:
             continue
         plan.append((document, target))
     return plan
@@ -534,7 +572,7 @@ def build_package(tender_id: int, documents: list[str], out_dir: Path,
             path = _build_one(tender_id, document, spec, out_dir, repo,
                               taken, result.warnings, prices, overwrite,
                               experience_ids)
-        except _Refusal as exc:
+        except Refusal as exc:
             result.skipped.append((document, str(exc)))
             skipped.append((document, spec))
         except (TemplateError, CellMapError, LayoutError, ContextError) as exc:

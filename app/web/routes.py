@@ -33,6 +33,8 @@ JSON, кроме главной страницы; все отказы -- {"error
     POST   /api/tenders/<id>/solve          подбор часов под цену без НДС (не сохраняет)
     POST   /api/tenders/<id>/plan           какие файлы запишет сборка и какие уже есть
     POST   /api/tenders/<id>/build          сборка пакета
+    POST   /api/tenders/<id>/preview        содержание одного документа до сборки
+                                            (отказ по данным -- 200 с kind refusal)
 
 Каждый POST обязан нести Content-Type: application/json: так чужая страница в
 браузере не сможет «простым» запросом (без предварительной проверки) записать
@@ -58,6 +60,7 @@ from app.render.context import (
     DOCUMENTS, build_context, labor_rows, money, required_conditions,
 )
 from app.render.package import build_package, planned_files
+from app.render.preview import preview_document
 from app.render.xlsx_render import CellMapError, load_cellmap
 from app.repo import Repo
 from app.web import errors, schema
@@ -351,25 +354,26 @@ def _tender(tender_id: int):
 _PACKAGE_FIELDS = ("documents", "output_dir", "overwrite", "experience_ids")
 
 
-def _document_names(value) -> list[str]:
-    """Имена документов из тела. Это ключи шаблонов («Справка о МТР»), а не пути:
+def _document_name(value, label: str, where: list) -> str:
+    """Имя документа из тела. Это ключ шаблонов («Справка о МТР»), а не путь:
     разделители, диск и управляющие знаки в имени -- отказ: шаблон ищется как
     `<имя>.docx` в папке шаблонов, и имя с «../» читало бы вне неё."""
+    if not isinstance(value, str):
+        raise ApiError(f"{label}: название документа должно быть текстом.", path=where)
+    if (not value.strip() or any(ch in value for ch in "/\\:")
+            or any(ord(ch) < 32 for ch in value)):
+        raise ApiError(f"{label}: название документа пустое или содержит "
+                       "знаки пути (/ \\ :) или управляющие знаки.", path=where)
+    return value.strip()
+
+
+def _document_names(value) -> list[str]:
+    """Имена документов состава пакета из тела."""
     if not isinstance(value, list):
         raise ApiError("Поле «Состав пакета»: должно быть списком названий документов.",
                        path=["documents"])
-    names = []
-    for i, name in enumerate(value):
-        where = ["documents", i]
-        if not isinstance(name, str):
-            raise ApiError(f"Состав пакета, №{i + 1}: название документа должно быть текстом.",
-                           path=where)
-        if (not name.strip() or any(ch in name for ch in "/\\:")
-                or any(ord(ch) < 32 for ch in name)):
-            raise ApiError(f"Состав пакета, №{i + 1}: название документа пустое или содержит "
-                           "знаки пути (/ \\ :) или управляющие знаки.", path=where)
-        names.append(name.strip())
-    return names
+    return [_document_name(name, f"Состав пакета, №{i + 1}", ["documents", i])
+            for i, name in enumerate(value)]
 
 
 def _package_request(tender_id: int, data: dict):
@@ -440,6 +444,29 @@ def _conditions(tender_id: int):
                   "documents": documents}
                  for name, documents in rows.items()],
         "warnings": warnings})
+
+
+def _preview(tender_id: int):
+    """Содержание одного документа по нынешним данным тендера.
+
+    Отказ по данным («документ собирается по форме заказчика, форма не
+    назначена в профиле») отдаётся кодом 200 с `kind: "refusal"`, а не 400:
+    запрос верен, неверны данные тендера, и эта фраза -- содержимое
+    предпросмотра, а не ошибка обращения. 400 здесь остаётся за неверным
+    запросом: нет имени документа, имя не текст, имя со знаками пути.
+    """
+    repo = get_repo()
+    _tender(tender_id)
+    data = json_body()
+    _only(data, ("document",), "предпросмотр документа")
+    if "document" not in data:
+        raise ApiError("Не указан документ, содержание которого показать.",
+                       path=["document"])
+    document = _document_name(data["document"], "Предпросмотр", ["document"])
+    result = preview_document(tender_id, document, repo)
+    return jsonify({"document": document, "kind": result.kind,
+                    "blocks": result.blocks, "warnings": result.warnings,
+                    "refusal": result.refusal})
 
 
 def _plan(tender_id: int):
@@ -720,5 +747,5 @@ def register(app) -> None:
     app.add_url_rule("/api/tenders/<int:tender_id>/conditions", "conditions",
                      _conditions, methods=["GET"])
     for name, view in (("estimate", _estimate), ("solve", _solve), ("plan", _plan),
-                       ("build", _build)):
+                       ("build", _build), ("preview", _preview)):
         app.add_url_rule(f"/api/tenders/<int:tender_id>/{name}", name, view, methods=["POST"])

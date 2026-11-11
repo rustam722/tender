@@ -523,6 +523,31 @@ def _open(template: Path):
             "или не является книгой Excel (.xlsx).") from exc
 
 
+def planned_writes(cell_map: CellMap, context: dict) -> list[tuple[str, object]]:
+    """Что карта запишет в книгу: пары «адрес, значение» в порядке записи.
+
+    Книгу не открывает и не пишет -- считает значения по контексту. Отсюда их
+    берёт `fill_workbook`, и отсюда же их берёт предпросмотр, который называет
+    человеку, какие клетки формы заполнятся и чем: назвать одно, а записать
+    другое -- ровно тот обман, из-за которого предпросмотр был бы хуже своего
+    отсутствия.
+
+    Пустое значение обязательной одиночной клетки -- `CellMapError`, как при
+    заполнении; законно пустая клетка (`optional`) в список не попадает:
+    в книге она останется такой, как в форме заказчика.
+    """
+    writes: list[tuple[str, object]] = []             # (адрес, значение)
+    for address, expr in cell_map.cells.items():
+        required = address not in cell_map.optional
+        value = _evaluate(expr, context, address, required=required)
+        if not required and _blank(value):
+            continue                  # законно пусто: клетка как в форме заказчика
+        writes.append((address, value))
+    for block in cell_map.rows:
+        writes.extend(_row_writes(block, context))
+    return writes
+
+
 def fill_workbook(template: Path, cell_map: CellMap, context: dict,
                   out: Path) -> Path:
     """Заполняет книгу заказчика по карте и сохраняет её в out.
@@ -547,15 +572,7 @@ def fill_workbook(template: Path, cell_map: CellMap, context: dict,
         ws = wb[cell_map.sheet]
         protected = bool(ws.protection.sheet)
 
-        writes = []                                   # (адрес, значение)
-        for address, expr in cell_map.cells.items():
-            required = address not in cell_map.optional
-            value = _evaluate(expr, context, address, required=required)
-            if not required and _blank(value):
-                continue              # законно пусто: клетка как в форме заказчика
-            writes.append((address, value))
-        for block in cell_map.rows:
-            writes.extend(_row_writes(block, context))
+        writes = planned_writes(cell_map, context)
         for address, _ in writes:
             _check_writable(ws, address, protected)
 

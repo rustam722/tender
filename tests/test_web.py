@@ -781,6 +781,67 @@ def test_plan_and_build_agree_on_paths(client, tmp_path, dirs):
     assert [f["path"] for f in planned] == [w["path"] for w in built]
 
 
+def test_preview_returns_the_blocks_of_the_document(client, dirs):
+    templates, _ = dirs
+    make_template(templates / "Декларация.docx", "Предмет: {{ tender.subject }}")
+    tender = make_tender(client)
+    body = ok(client.post(f"/api/tenders/{tender['id']}/preview",
+                          json={"document": "Декларация"}))
+    assert body["kind"] == "word"
+    assert body["document"] == "Декларация"
+    assert body["refusal"] is None
+    assert body["blocks"] == [{"kind": "p", "text": "Предмет: Разработка КЭР"}]
+
+
+def test_a_refused_preview_is_answered_with_200_and_a_refusal_not_400(client, dirs):
+    """Отказ по данным -- не ошибка запроса: запрос верен, неверны данные
+    тендера, и фраза про форму заказчика -- содержимое предпросмотра. 400
+    заставил бы экран показать её как сбой программы."""
+    templates, _ = dirs
+    tender = make_tender(client)
+    body = ok(client.post(f"/api/tenders/{tender['id']}/preview",
+                          json={"document": "Заявка на участие"}))
+    assert body["kind"] == "refusal"
+    assert body["blocks"] == []
+    assert "собирается по форме заказчика" in body["refusal"]
+    assert CYRILLIC.search(body["refusal"])
+
+
+def test_preview_warnings_reach_the_response(client, dirs):
+    templates, _ = dirs
+    make_template(templates / "Декларация.docx", "Банк: {{ org.bank_name }}")
+    tender = make_tender(client)
+    body = ok(client.post(f"/api/tenders/{tender['id']}/preview",
+                          json={"document": "Декларация"}))
+    assert body["kind"] == "word"
+    assert any("остались пустые графы" in text for text in body["warnings"]), body["warnings"]
+
+
+def test_preview_refusals_of_the_request_itself(client, dirs):
+    templates, _ = dirs
+    make_template(templates / "Декларация.docx", "x")
+    tender = make_tender(client)
+    url = f"/api/tenders/{tender['id']}/preview"
+    refused(client.post("/api/tenders/999/preview", json={"document": "Декларация"}), 404)
+    assert "документ" in refused(client.post(url, json={}))["error"]
+    refused(client.post(url, json={"document": 5}))
+    refused(client.post(url, json={"document": "   "}))
+    refused(client.post(url, json={"document": "../вне папки"}))
+    refused(client.post(url, json={"document": "Декларация", "extra": 1}))
+
+
+def test_a_preview_writes_nothing_into_the_output_folder_of_the_tender(
+        client, tmp_path, dirs):
+    templates, _ = dirs
+    make_template(templates / "Декларация.docx", "Предмет: {{ tender.subject }}")
+    out = tmp_path / "выход"
+    out.mkdir()
+    tender = make_tender(client, output_dir=str(out))
+    ok(client.post(f"/api/tenders/{tender['id']}/preview",
+                   json={"document": "Декларация"}))
+    assert list(out.iterdir()) == []
+
+
 def test_build_documents_default_to_the_customer_profile(client, tmp_path, dirs):
     templates, _ = dirs
     make_template(templates / "Декларация.docx", "x")
