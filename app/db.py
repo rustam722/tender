@@ -238,6 +238,16 @@ _MIGRATIONS = [
     PRAGMA user_version = 6;  -- номер этой миграции: при копировании сменить
     COMMIT;
     """,
+    # 7: подтверждённые результаты обзора архива.
+    """
+    BEGIN;
+    CREATE TABLE IF NOT EXISTS archive_entry (
+        source_path TEXT PRIMARY KEY NOT NULL,
+        snapshot TEXT NOT NULL
+    );
+    PRAGMA user_version = 7;
+    COMMIT;
+    """,
 ]
 
 SCHEMA_VERSION = len(_MIGRATIONS)

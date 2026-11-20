@@ -25,6 +25,7 @@
 """
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -305,6 +306,22 @@ def _is_junk(name: str) -> bool:
             or os.path.splitext(low)[1] in _JUNK_EXT | _SIGNATURE_EXT)
 
 
+def _linked(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    return os.name == "nt" and bool(
+        path.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _subfolders(path: Path) -> list[str]:
+    return sorted(child.name for child in path.iterdir()
+                  if child.is_dir() and not _linked(child))
+
+
+def _raise_walk_error(error: OSError) -> None:
+    raise error
+
+
 def _scan_tender(group: str, folder: Path, group_outcome: tuple[str, str] | None) -> ArchiveEntry:
     name = folder.name
     outcome = _outcome(name)
@@ -312,14 +329,14 @@ def _scan_tender(group: str, folder: Path, group_outcome: tuple[str, str] | None
     if outcome is None and group_outcome:
         outcome, source = group_outcome
 
-    subfolders = sorted(d for d in os.listdir(folder) if (folder / d).is_dir())
+    subfolders = _subfolders(folder)
     roles = {sub: _role(sub) for sub in subfolders}
 
     papers: list[BidPaper] = []
     protocols: list[str] = []
     unclassified = documentation = 0
-    for dirpath, dirnames, filenames in os.walk(folder):
-        dirnames.sort()
+    for dirpath, dirnames, filenames in os.walk(folder, onerror=_raise_walk_error):
+        dirnames[:] = sorted(name for name in dirnames if not _linked(Path(dirpath) / name))
         relative_dir = Path(dirpath).relative_to(folder)
         top = relative_dir.parts[0] if relative_dir.parts else None
         role = roles.get(top, "other") if top else "root"
@@ -364,11 +381,11 @@ def scan_archive(root) -> list[ArchiveEntry]:
         raise ArchiveError(f"{root} -- не папка, а файл: укажите папку архива.")
 
     entries: list[ArchiveEntry] = []
-    for top in sorted(d for d in os.listdir(root) if (root / d).is_dir()):
+    for top in _subfolders(root):
         path = root / top
         if _GROUP_YEAR.match(top) or _GROUP_WON.match(top):
             group_outcome = ("won", f"папка «{top}»") if _GROUP_WON.match(top) else None
-            for sub in sorted(d for d in os.listdir(path) if (path / d).is_dir()):
+            for sub in _subfolders(path):
                 entries.append(_scan_tender(top, path / sub, group_outcome))
         else:
             entries.append(_scan_tender(LOOSE_GROUP, path, None))

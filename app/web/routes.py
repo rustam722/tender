@@ -22,6 +22,8 @@ JSON, кроме главной страницы; все отказы -- {"error
         справочники: organizations employees assets experience services profiles tenders
     GET    /api/documents                   канонические имена документов пакета
     PUT    /api/tenders/<id>/items|labor    замена всего списка одной транзакцией
+    GET    /api/archive                     сохранённые закупки из архива
+    POST   /api/archive/preview|import      просмотр и сохранение выбранных закупок
     GET/POST /api/settings                  настройки калькуляции
     GET/POST/DELETE /api/tenders/<id>/items|labor|costs[/<row_id>]
                                             позиции лота, трудозатраты, материалы и
@@ -43,14 +45,14 @@ JSON, кроме главной страницы; все отказы -- {"error
 import json
 import re
 import sqlite3
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from flask import current_app, g, jsonify, render_template, request
 
-from app import config, db
+from app import archive_scan, config, db
 from app.calc import (
     Estimate, LaborLine, estimate, money_total, price_gap, printed_labor,
     solve_hours,
@@ -687,6 +689,63 @@ def _settings_save():
     return jsonify(present(SETTINGS, repo.get_settings()))
 
 
+# ---- архив закупок ------------------------------------------------------------
+
+def _archive_snapshot(data: dict) -> dict[str, dict]:
+    value = data.get("folder")
+    if (not isinstance(value, str) or not value.strip()
+            or any(ord(ch) < 32 for ch in value)
+            or not Path(value.strip()).is_absolute()
+            or value.strip().startswith(("//", "\\\\"))):
+        raise ApiError("Укажите полный путь к локальной папке архива.", path=["folder"])
+
+    try:
+        folder = Path(value.strip()).resolve(strict=True)
+        entries = archive_scan.scan_archive(folder)
+    except FileNotFoundError:
+        raise ApiError("Папка архива не найдена. Проверьте путь и подключение диска.",
+                       path=["folder"]) from None
+    except archive_scan.ArchiveError as exc:
+        raise ApiError(str(exc), path=["folder"]) from exc
+    except (OSError, RuntimeError):
+        raise ApiError("Не удалось прочитать архив. Проверьте доступ к папке и её "
+                       "вложенным папкам.", path=["folder"]) from None
+
+    snapshot = {}
+    for entry in entries:
+        key = entry.path.relative_to(folder).as_posix()
+        row = asdict(entry)
+        row.update(key=key, path=str(entry.path))
+        for paper in row["bid_papers"]:
+            paper["kind_labels"] = [archive_scan.KINDS[kind][0] for kind in paper["kinds"]]
+        snapshot[key] = row
+    return snapshot
+
+
+def _archive_preview():
+    data = json_body()
+    _only(data, ("folder",), "просмотр архива")
+    return jsonify(list(_archive_snapshot(data).values()))
+
+
+def _archive_import():
+    data = json_body()
+    _only(data, ("folder", "selected"), "сохранение архива")
+    selected = data.get("selected")
+    if (not isinstance(selected, list) or not selected
+            or any(not isinstance(key, str) or not key for key in selected)):
+        raise ApiError("Выберите закупки для сохранения.", path=["selected"])
+
+    snapshot = _archive_snapshot(data)
+    if any(key not in snapshot for key in selected):
+        raise ApiError("Выбранные папки изменились. Просканируйте архив ещё раз.",
+                       409, path=["selected"])
+    entries = [snapshot[key] for key in dict.fromkeys(selected)]
+    repo = get_repo()
+    repo.save_archive_entries(entries)
+    return jsonify(repo.list_archive_entries())
+
+
 # ---- регистрация --------------------------------------------------------------
 
 def register(app) -> None:
@@ -701,6 +760,12 @@ def register(app) -> None:
     app.add_url_rule("/", "index", lambda: render_template("index.html"))
     app.add_url_rule("/api/inn/<inn>", "inn", _inn, methods=["GET"])
     app.add_url_rule("/api/backup", "backup", _backup, methods=["POST"])
+    app.add_url_rule("/api/archive", "archive_list",
+                     lambda: jsonify(get_repo().list_archive_entries()))
+    app.add_url_rule("/api/archive/preview", "archive_preview", _archive_preview,
+                     methods=["POST"])
+    app.add_url_rule("/api/archive/import", "archive_import", _archive_import,
+                     methods=["POST"])
     app.add_url_rule("/api/tenders/<int:tender_id>/items", "items_replace", _replace_items,
                      methods=["PUT"])
     app.add_url_rule("/api/tenders/<int:tender_id>/labor", "labor_replace", _replace_labor,

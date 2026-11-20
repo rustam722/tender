@@ -106,6 +106,18 @@ class Repo:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
 
+    def list_archive_entries(self) -> list[dict]:
+        rows = self.conn.execute("SELECT snapshot FROM archive_entry ORDER BY source_path")
+        return [json.loads(row["snapshot"]) for row in rows]
+
+    def save_archive_entries(self, entries: list[dict]) -> None:
+        with self.conn:
+            self.conn.executemany(
+                "INSERT INTO archive_entry (source_path, snapshot) VALUES (?, ?) "
+                "ON CONFLICT(source_path) DO UPDATE SET snapshot = excluded.snapshot",
+                ((entry["path"], json.dumps(entry, ensure_ascii=False)) for entry in entries),
+            )
+
     # ---- общие помощники -------------------------------------------------
 
     def _upsert(self, ent: _Entity, obj, row_id: int | None) -> int:

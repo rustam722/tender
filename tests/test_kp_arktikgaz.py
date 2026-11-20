@@ -945,8 +945,13 @@ def test_the_same_price_in_both_papers_says_nothing(repo, tmp_path):
     # читать. На ровных данных Арктикгаза молчат и прочие сторожа
     result = two_papers(repo, tmp_path, "4000000")
     assert result.skipped == [] and len(result.written) == 2
-    assert kp_total(result.written[0]) == "4 000 000,00" \
-        or kp_total(result.written[1]) == "4 000 000,00"
+    written = {p.suffix: p for p in result.written}
+    assert kp_total(written[".docx"]) == "4 000 000,00"
+    workbook = load_workbook(written[".xlsx"])
+    try:
+        assert evaluate(workbook[SHEET], "D26") == Decimal("4000000")
+    finally:
+        workbook.close()
     assert result.warnings == []
 
 

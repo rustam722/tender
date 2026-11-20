@@ -12,6 +12,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const fs = require('node:fs');
 const { createWorld } = require('./fake_dom.js');
 
 const BASE = process.env.TENDER_BASE;
@@ -881,5 +882,70 @@ live('render: the copy button is locked while the copy is being made and freed a
     assert.equal(page.button('Сохранить копию справочников').disabled, false,
       'кнопка осталась заблокированной после того, как копия снята');
     assert.ok(page.text().includes('Копия сохранена.'));
+  });
+});
+
+live('render: select archive tenders and open an experience draft', async () => {
+  const source = path.join(OUT_DIR, 'Архив');
+  const tender = 'Энергосбыт КЭР до 14.03.2025 выиграли';
+  const bid = path.join(source, tender, 'Заявка');
+  fs.mkdirSync(bid, { recursive: true });
+  fs.mkdirSync(path.join(source, 'Другая закупка'));
+  fs.writeFileSync(path.join(bid, 'Коммерческое предложение.docx'), 'не файл Word');
+
+  await withPage(async (page) => {
+    await page.goto('#/archive');
+    page.input('Полный путь к папке архива').value = source;
+    const form = page.all((element) => element.tagName === 'FORM')[0];
+    form.dispatchEvent({ type: 'submit', bubbles: true });
+    await page.idle();
+    assert.ok(page.text().includes('Коммерческое предложение.docx'));
+    assert.ok(page.text().includes('Выиграли'));
+    const save = page.button('Сохранить выбранные');
+    assert.equal(save.disabled, true);
+    const choice = page.input(`Сохранить закупку ${tender}`);
+    choice.checked = true;
+    choice.dispatchEvent({ type: 'change', bubbles: true });
+    save.click();
+    await page.idle();
+    assert.ok(page.text().includes('Выбранные закупки сохранены.'));
+    await page.goto('#/refs');
+    await page.goto('#/archive');
+    assert.ok(page.card('Сохранённые закупки').textContent.includes(tender));
+    assert.ok(!page.card('Сохранённые закупки').textContent.includes('Другая закупка'));
+
+    page.input('Полный путь к папке архива').value = source;
+    page.all((element) => element.tagName === 'FORM')[0].dispatchEvent({ type: 'submit', bubbles: true });
+    await page.idle();
+    const all = page.input('Отметить все найденные закупки');
+    all.checked = true;
+    all.dispatchEvent({ type: 'change', bubbles: true });
+    await page.press(page.button('Сохранить выбранные'));
+    const saved = page.card('Сохранённые закупки');
+    assert.ok(saved.textContent.includes('Другая закупка'));
+
+    const entry = (await call('GET', '/api/archive')).find((item) => item.folder === tender);
+    const existing = await call('POST', '/api/experience', {
+      customer_name: entry.customer_guess, contract_number: 'АРХИВ-123', subject: 'Существующий договор',
+    });
+    const details = saved.all((element) => element.tagName === 'DETAILS' &&
+      element.children[0].textContent === tender)[0];
+    await page.press(page.button('Добавить в опыт', details));
+    assert.equal(page.field('Заказчик').value, entry.customer_guess);
+    assert.equal(page.field('Статус исполнения').value, '');
+    page.type(page.field('Номер контракта'), 'АРХИВ-123');
+    await page.press(page.button('Сохранить'));
+    assert.ok(page.text().includes('Проверьте существующие договоры'));
+    assert.equal((await call('GET', '/api/experience')).filter((item) =>
+      item.contract_number === existing.contract_number).length, 1);
+
+    page.type(page.field('Номер контракта'), 'АРХИВ-456');
+    page.type(page.field('Предмет'), 'Выполненная работа из архива');
+    page.type(page.field('Статус исполнения'), 'исполнен');
+    page.type(page.field('Сумма, руб.'), '100000');
+    await page.press(page.button('Сохранить'));
+    assert.ok(page.text().includes('Сохранено.'), page.text());
+    const added = (await call('GET', '/api/experience')).find((item) => item.contract_number === 'АРХИВ-456');
+    assert.equal(added.subject, 'Выполненная работа из архива');
   });
 });

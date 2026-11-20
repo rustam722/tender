@@ -1277,14 +1277,15 @@ def test_refused_move_of_a_new_document_is_a_skip_without_leftovers(
     make_template(templates / f"{MTR}.docx", "x")
     tid = make_tender(repo, documents=[DECLARATION, MTR])
     out = tmp_path / "out"
-    real_rename = package_module.os.rename
+    method = "rename" if package_module.os.name == "nt" else "link"
+    real_move = getattr(package_module.os, method)
 
     def refuse_first(src, dst):
         if Path(dst).name == f"{DECLARATION}.docx":
             raise PermissionError("denied")
-        return real_rename(src, dst)
+        return real_move(src, dst)
 
-    monkeypatch.setattr(package_module.os, "rename", refuse_first)
+    monkeypatch.setattr(package_module.os, method, refuse_first)
     result = build_package(tid, [DECLARATION, MTR], out, repo)
     assert [p.name for p in result.written] == [f"{MTR}.docx"]
     assert result.skipped[0][0] == DECLARATION
@@ -1315,7 +1316,7 @@ def test_a_file_that_appears_meanwhile_is_not_clobbered_when_not_overwriting(
 def room_for_temp_folder(tmp_path: Path, room: int) -> Path:
     """Папка, после которой для имени файла остаётся ровно `room` знаков."""
     length = package_module.MAX_PATH_LENGTH - room - 1
-    return tmp_path / ("к" * (length - len(str(tmp_path)) - 1))
+    return tmp_path / ("k" * (length - len(str(tmp_path)) - 1))
 
 
 def test_path_budget_counts_the_longer_temp_name(
@@ -1371,7 +1372,9 @@ def test_save_failure_of_a_word_document_names_the_final_file_not_the_temp_one(
 
     def cannot_save(self, *args, **kwargs):
         # замок Word: ERROR_SHARING_VIOLATION, как его отдаёт Windows
-        raise PermissionError(errno.EACCES, "locked", None, 32)
+        error = PermissionError(errno.EACCES, "locked")
+        error.winerror = 32
+        raise error
 
     monkeypatch.setattr(docxtpl.DocxTemplate, "save", cannot_save)
     out = tmp_path / "out"
@@ -1395,7 +1398,9 @@ def test_save_failure_of_an_excel_form_names_the_final_file_not_the_temp_one(
     tid = rosneft_tender(repo)
 
     def cannot_save(self, filename):
-        raise PermissionError(errno.EACCES, "locked", None, 32)
+        error = PermissionError(errno.EACCES, "locked")
+        error.winerror = 32
+        raise error
 
     monkeypatch.setattr(workbook_module.Workbook, "save", cannot_save)
     result = build_package(tid, [TKP], tmp_path / "out", repo)

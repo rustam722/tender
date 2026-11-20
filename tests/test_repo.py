@@ -331,7 +331,7 @@ def test_migrate_twice_keeps_version_and_data(tmp_path):
     repo.save_tender_labor(TenderLaborRow(tender_id=tid, post="a"))
     repo.save_tender_cost_item(TenderCostItem(tender_id=tid, kind="materials"))
     db.migrate(conn)  # повторный вызов ничего не меняет и не стирает
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 6
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     assert len(repo.list_tender_labor(tid)) == 1
     assert len(repo.list_tender_cost_items(tid)) == 1
     assert repo.get_tender(tid).experience_ids == [4, 7]
@@ -627,7 +627,7 @@ def test_migration_5_moves_layouts_and_prefixes_into_docs(tmp_path):
     assert {"layouts", "file_prefixes"} <= cols and "docs" not in cols
 
     db.migrate(conn)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 6
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     _assert_profiles_moved(conn)
     # записанные миграцией данные -- обычный JSON без экранирования кириллицы
     (raw,) = conn.execute(
@@ -830,7 +830,7 @@ def test_migration_6_adds_tender_service_keeping_data(tmp_path):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(tender)")}
     assert "service_id" not in cols
     db.migrate(conn)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION == 6
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     repo = Repo(conn)
     tender = repo.get_tender(1)
     assert tender.purchase_number == "42" and tender.service_id is None

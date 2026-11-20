@@ -161,6 +161,7 @@ function createWorld({ fetch }) {
   make('a', 'nav-refs').setAttribute('href', '#/refs');
   make('a', 'nav-tender').setAttribute('href', '#/tender');
   make('a', 'nav-build').setAttribute('href', '#/build');
+  make('a', 'nav-archive').setAttribute('href', '#/archive');
   make('div', 'current-tender');
   const screen = make('main', 'screen');
   const dialog = make('dialog', 'dialog');

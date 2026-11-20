@@ -376,7 +376,7 @@ def coerce(value, hint, entity, path):
 
 
 def check_out_dir(value, entity: Entity, path: list) -> str:
-    """Папка пакета: абсолютный локальный путь с диском, не в папке программы.
+    """Папка пакета: абсолютный локальный путь, вне папки программы.
 
     Строка приходит из браузера, а по ней сборка создаёт папку и пишет файлы.
     Поэтому отказываем: относительным путям (неясно, от чего они считаются),
@@ -392,11 +392,13 @@ def check_out_dir(value, entity: Entity, path: list) -> str:
         fail(entity, path, "папка не указана.")
     if any(ord(ch) < 32 for ch in text):
         fail(entity, path, "в пути есть управляющие знаки.")
-    if text.startswith(("\\\\", "//")) or not _DRIVE_PATH.match(text):
-        fail(entity, path, "укажите полный путь к папке на этом компьютере, начиная с "
-                           "диска, например C:\\Тендеры\\Заявка. Сетевые папки и "
-                           "относительные пути не принимаются.")
-    if ":" in text[2:]:
+    windows = os.name == "nt"
+    absolute = _DRIVE_PATH.match(text) if windows else text.startswith("/")
+    if not absolute or text.startswith(("//", "\\\\")):
+        example = r"C:\Тендеры\Заявка" if windows else "/home/user/Тендеры/Заявка"
+        fail(entity, path, f"укажите полный локальный путь к папке, например {example}. "
+                           "Сетевые и относительные пути не принимаются.")
+    if windows and ":" in text[2:]:
         fail(entity, path, "в пути не должно быть знака «:» после имени диска.")
     folder = os.path.normpath(text)
     resolved = Path(os.path.realpath(folder))

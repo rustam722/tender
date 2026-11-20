@@ -16,7 +16,8 @@
     о МТР»), а не наше, поэтому префикс берётся из `DocSpec.prefix`.
   * Имя очищается от символов, запрещённых в Windows, и укорачивается так,
     чтобы влезть и в 255 знаков имени, и в 259 знаков полного пути. Обрезается
-    только имя файла: содержимое документа остаётся целым.
+    только имя файла: содержимое документа остаётся целым. На Linux имя
+    дополнительно ограничено 255 байтами.
   * Любой документ пишется под временным именем (`~pkg-xxxxxxxx.ext`) рядом с
     целью и становится файлом одним rename/replace: остаток оборванной записи
     никогда не носит настоящего имени, а в начале сборки такие остатки
@@ -62,7 +63,8 @@ from app.render.xlsx_render import CellMapError, fill_workbook, load_cellmap
 from app.repo import Repo
 
 
-MAX_NAME_LENGTH = 255       # предел имени файла в NTFS, в знаках UTF-16
+MAX_NAME_LENGTH = 255       # единицы UTF-16 в NTFS
+MAX_NAME_BYTES = 255        # байты имени в Linux
 MAX_PATH_LENGTH = 259       # MAX_PATH Windows без завершающего нуля: дальше
                             # Проводник, Word и Excel файл не открывают
 _SUPPORTED = (".docx", ".xlsx")
@@ -120,11 +122,13 @@ def _units(text: str) -> int:
     return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
 
 
-def _truncate(text: str, limit: int) -> str:
-    out, used = [], 0
+def _truncate(text: str, limit: int, byte_limit: int | None = None) -> str:
+    out, used, used_bytes = [], 0, 0
     for ch in text:
         width = 2 if ord(ch) > 0xFFFF else 1
-        if used + width > limit:
+        if byte_limit is not None:
+            used_bytes += len(os.fsencode(ch))
+        if used + width > limit or (byte_limit is not None and used_bytes > byte_limit):
             break
         out.append(ch)
         used += width
@@ -137,7 +141,8 @@ def _clean(ch: str) -> str:
     return "" if ch < " " or ch == _DEL else ch
 
 
-def safe_filename(name: str, max_length: int = MAX_NAME_LENGTH) -> str:
+def safe_filename(name: str, max_length: int = MAX_NAME_LENGTH, *,
+                  byte_limit: int | None = None) -> str:
     """Имя, допустимое в Windows: без `: / \\ | ? * " < >`, без пробелов по краям
     и точки на конце, не длиннее `max_length`. Кириллица, «» и № остаются.
 
@@ -151,8 +156,8 @@ def safe_filename(name: str, max_length: int = MAX_NAME_LENGTH) -> str:
     # CON, NUL, COM1... (и «CON.txt») Windows не даёт создать как файл
     if text.split(".")[0].strip().upper() in _RESERVED:
         text = "_" + text
-    text = _truncate(text, max_length).rstrip(". ")
-    return text or _truncate(_FALLBACK_NAME, max_length)
+    text = _truncate(text, max_length, byte_limit).rstrip(". ")
+    return text or _truncate(_FALLBACK_NAME, max_length, byte_limit)
 
 
 def _make_folder(out_dir: Path) -> None:
@@ -204,7 +209,8 @@ def _target(out_dir: Path, document: str, prefix: str, extension: str) -> Path:
             f"Путь к папке слишком длинный: для имени файла не остаётся места "
             f"(Windows открывает пути не длиннее {MAX_PATH_LENGTH} знаков). "
             "Выберите папку ближе к корню диска.")
-    return out_dir / (safe_filename(prefix + document, room) + extension)
+    byte_limit = None if os.name == "nt" else MAX_NAME_BYTES - len(extension)
+    return out_dir / (safe_filename(prefix + document, room, byte_limit=byte_limit) + extension)
 
 
 def _forms_of_other_customers(document: str, repo: Repo) -> str:
@@ -444,8 +450,8 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
     # целью и становится настоящим файлом одним действием. Так оборванная или
     # неудавшаяся запись оставляет только `~pkg-…`, который уберёт подметание,
     # но не огрызок под настоящим именем, и заменяемый файл цел, пока новый не
-    # готов. rename не затирает чужой файл, появившийся за это время;
-    # replace -- только при разрешённой замене.
+    # готов. Без разрешения на замену публикуем файл только под свободным
+    # именем: rename на Windows, жёсткая ссылка на Linux.
     work = _temp_path(target)
     blanks: list[str] = []
     try:
@@ -461,15 +467,19 @@ def _build_one(tender_id: int, document: str, spec, out_dir: Path, repo: Repo,
             # имя файла, а причина отказа остаётся как есть.
             raise Refusal(str(exc).replace(work.name, target.name)) from exc
         try:
-            (os.replace if replacing else os.rename)(work, target)
+            if overwrite:
+                os.replace(work, target)
+            elif os.name == "nt":
+                os.rename(work, target)
+            else:
+                os.link(work, target)
         except OSError as exc:
             raise Refusal(_move_refusal(target, replacing)) from exc
-    except BaseException:
+    finally:
         try:
             work.unlink(missing_ok=True)
         except OSError:
-            pass        # настоящая причина важнее; остаток подметёт следующая сборка
-        raise
+            pass        # остаток временного файла подметёт следующая сборка
     # Дальше -- только то, что верно про файл, уже лежащий в папке под своим
     # именем: его цена и его пустые графы. До переноса говорить об этом рано --
     # «напечатано» о бумаге, которой в папке нет, уже один раз было неправдой.

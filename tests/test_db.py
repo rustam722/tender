@@ -19,7 +19,7 @@ def test_migrate_creates_tables(conn):
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"organization", "employee", "asset", "experience",
             "service", "org_settings", "customer_profile",
-            "tender", "lot_item"} <= names
+            "tender", "lot_item", "archive_entry"} <= names
 
 
 def test_migrate_is_idempotent(conn):
@@ -34,7 +34,6 @@ def test_fresh_database_has_docs_and_no_old_profile_columns(conn):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(customer_profile)")}
     assert "docs" in cols
     assert not {"layouts", "file_prefixes"} & cols
-    assert db.SCHEMA_VERSION == 6
 
 
 def test_foreign_keys_are_enforced(conn):

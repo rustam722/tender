@@ -258,13 +258,15 @@ def test_empty_rows_keep_every_header_cell(tmp_path):
 # Раньше любой OSError получал подсказку «проверьте, что файл не открыт в Word»:
 # человек шёл закрывать Word, которого не открывал, а на диске не было места
 # или в папку было нельзя записывать. Эти пробы и держат разводку причин.
+SHARING_VIOLATION = PermissionError(errno.EACCES, "The process cannot access the file")
+SHARING_VIOLATION.winerror = 32
+
 SAVE_FAILURES = [
     (OSError(errno.ENOSPC, "No space left on device"),
      "на диске не осталось места", ("Word", "права")),
     (PermissionError(errno.EACCES, "Permission denied"),
      "в эту папку нельзя записывать", ("в Word", "на диске")),
-    (PermissionError(errno.EACCES, "The process cannot access the file",
-                     None, 32),
+    (SHARING_VIOLATION,
      "открыт в другой программе", ("на диске", "права на папку")),
     (FileNotFoundError(errno.ENOENT, "No such file or directory"),
      "папки для него больше нет", ("Word", "на диске")),

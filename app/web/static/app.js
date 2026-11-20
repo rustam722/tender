@@ -438,6 +438,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       $('#nav-build').setAttribute('href', '#/build');
       $('#current-tender').textContent = '';
     }
+    let pendingArchiveExperience = null;
     let pendingTenderNotice = null;       // {tenderId, text}: предупреждение, которое переживает переход
     let active = { token: 0, dirty: [] };
     let renderToken = 0;
@@ -475,7 +476,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       active = mine;
       const parts = location.hash.replace(/^#\/?/, '').split('/');
       const screen = parts[0] || 'refs';
-      for (const [name, id] of [['refs', 'nav-refs'], ['tender', 'nav-tender'], ['build', 'nav-build']]) {
+      for (const [name, id] of [['refs', 'nav-refs'], ['tender', 'nav-tender'], ['build', 'nav-build'], ['archive', 'nav-archive']]) {
         const link = $(`#${id}`);
         if (name === screen) link.setAttribute('aria-current', 'page'); else link.removeAttribute('aria-current');
       }
@@ -483,7 +484,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       target.replaceChildren(h('p', { class: 'loading', text: 'Загрузка…' }));
       const root = h('div');
       try {
-        const handler = { refs: refsScreen, tender: tenderScreen, build: buildScreen }[screen];
+        const handler = { refs: refsScreen, tender: tenderScreen, build: buildScreen, archive: archiveScreen }[screen];
         if (!handler) { go('#/refs'); return; }
         await handler(root, parts.slice(1), mine);
       } catch (error) {
@@ -492,6 +493,140 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
         root.replaceChildren(box.el);
       }
       if (mine.token === renderToken) target.replaceChildren(root);
+    }
+
+    const archiveOutcomes = {
+      won: 'Выиграли', won_partly: 'Выиграли частично', lost: 'Проиграли',
+      not_applied: 'Заявку не подали', refused: 'Отказали', missed: 'Не успели',
+      cancelled: 'Закупку отменили',
+    };
+
+    function archiveDetails(entry, saved = false) {
+      const outcome = archiveOutcomes[entry.outcome] || 'Не указан';
+      const papers = entry.bid_papers.map((paper) => h('li', {
+        text: `${paper.path} — ${paper.kind_labels.join(', ')}`,
+      }));
+      return h('details', {},
+        h('summary', { text: entry.folder }),
+        h('p', { class: 'hint', text: entry.path }),
+        h('dl', {},
+          h('dt', { text: 'Заказчик по названию папки' }), h('dd', { text: entry.customer_guess || DASH }),
+          h('dt', { text: 'Срок подачи' }), h('dd', { text: entry.deadline || DASH }),
+          h('dt', { text: 'Услуги' }), h('dd', { text: entry.services.join(', ') || DASH }),
+          h('dt', { text: 'Исход по названию папки' }),
+          h('dd', { text: entry.outcome_source ? `${outcome} (${entry.outcome_source})` : outcome })),
+        h('h3', { text: 'Файлы из папок заявки' }),
+        papers.length ? h('ul', {}, papers) : h('p', { text: 'Файлы заявки не найдены.' }),
+        entry.protocol_files.length ? h('div', {},
+          h('h3', { text: 'Протоколы заказчика' }),
+          h('ul', {}, entry.protocol_files.map((path) => h('li', { text: path })))) : null,
+        saved ? h('button', {
+          type: 'button', class: 'small', text: 'Добавить в опыт',
+          onclick: () => {
+            pendingArchiveExperience = entry;
+            go('#/refs/experience');
+          },
+        }) : null);
+    }
+
+    async function archiveScreen(root, _args, ctx) {
+      const folder = h('input', { type: 'text', required: true, autocomplete: 'off',
+        'aria-label': 'Полный путь к папке архива' });
+      const scan = h('button', { type: 'submit', class: 'primary', text: 'Просканировать папку' });
+      const form = h('form', { class: 'card' },
+        h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Полный путь к папке архива' }), folder),
+        h('p', { class: 'hint', text: 'Укажите путь на компьютере, где запущена программа. Данные определяются по именам папок и файлов.' }),
+        h('div', { class: 'actions' }, scan));
+      const msg = notice();
+      const preview = h('section', { class: 'card', hidden: true });
+      const saved = h('div');
+      let scannedFolder = '';
+      let choices = [];
+      const save = h('button', { type: 'button', class: 'primary', text: 'Сохранить выбранные', disabled: true });
+      const results = h('div');
+      const selectAll = h('input', { type: 'checkbox', 'aria-label': 'Отметить все найденные закупки' });
+      const selectAllRow = h('label', {}, selectAll, ' Отметить все найденные закупки');
+      const selected = () => choices.filter(({ control }) => control.checked).map(({ key }) => key);
+      const showSaved = (entries) => saved.replaceChildren(...(entries.length
+        ? entries.map((entry) => archiveDetails(entry, true))
+        : [h('p', { text: 'Сохранённых закупок пока нет.' })]));
+      const setBusy = (busy) => {
+        scan.disabled = busy;
+        folder.disabled = busy;
+        for (const { control } of choices) control.disabled = busy;
+        const keys = selected();
+        selectAll.disabled = busy || !choices.length;
+        selectAllRow.hidden = !choices.length;
+        selectAll.checked = choices.length > 0 && keys.length === choices.length;
+        selectAll.indeterminate = keys.length > 0 && !selectAll.checked;
+        save.disabled = busy || !keys.length;
+      };
+      selectAll.addEventListener('change', () => {
+        for (const { control } of choices) control.checked = selectAll.checked;
+        setBusy(false);
+      });
+
+      folder.addEventListener('input', () => {
+        if (folder.value === scannedFolder) return;
+        preview.hidden = true;
+        choices = [];
+        save.disabled = true;
+        msg.clear();
+      });
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (scan.disabled) return;
+        msg.clear();
+        preview.hidden = true;
+        choices = [];
+        const source = folder.value;
+        setBusy(true);
+        try {
+          const entries = await api('POST', '/api/archive/preview', { folder: source });
+          if (!isCurrentRender(ctx)) return;
+          scannedFolder = source;
+          results.replaceChildren(...entries.map((entry) => {
+            const control = h('input', { type: 'checkbox', 'aria-label': `Сохранить закупку ${entry.folder}` });
+            choices.push({ key: entry.key, control });
+            control.addEventListener('change', () => setBusy(false));
+            return h('div', {}, h('label', {}, control, ' Сохранить'), archiveDetails(entry));
+          }));
+          if (!entries.length) results.append(h('p', { text: 'В папке не найдено закупок.' }));
+          preview.hidden = false;
+        } catch (error) {
+          if (isCurrentRender(ctx)) msg.error(error);
+        } finally {
+          setBusy(false);
+        }
+      });
+
+      save.addEventListener('click', async () => {
+        if (save.disabled) return;
+        msg.clear();
+        const keys = selected();
+        setBusy(true);
+        try {
+          const entries = await api('POST', '/api/archive/import', { folder: scannedFolder, selected: keys });
+          if (!isCurrentRender(ctx)) return;
+          showSaved(entries);
+          for (const { control } of choices) control.checked = false;
+          msg.show('ok', 'Выбранные закупки сохранены.');
+        } catch (error) {
+          if (isCurrentRender(ctx)) msg.error(error);
+        } finally {
+          setBusy(false);
+        }
+      });
+
+      preview.append(h('h2', { text: 'Найденные закупки' }), selectAllRow, results,
+        h('div', { class: 'actions' }, save));
+      root.append(h('h1', { text: 'Архив закупок' }), form, msg.el, preview,
+        h('section', { class: 'card' }, h('h2', { text: 'Сохранённые закупки' }), saved));
+      try {
+        showSaved(await api('GET', '/api/archive'));
+      } catch (error) {
+        msg.error(error);
+      }
     }
 
     /* ---- формы: поля, значения, сбор правок ---- */
@@ -870,10 +1005,14 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
                   h('p', { class: 'hint' }, copyButton), copyMsg.el);
       if (tabKey === 'settings') { await settingsView(root, ctx); return; }
       if (!tab) { root.append(h('p', { class: 'empty', text: 'Такого справочника нет.' })); return; }
-      await crudView(root, tab, ctx);
+      const archiveEntry = tabKey === 'experience' ? pendingArchiveExperience : null;
+      pendingArchiveExperience = null;
+      await crudView(root, tab, ctx, archiveEntry);
     }
 
-    async function crudView(root, cfg, ctx) {
+    const experienceKey = (value) => str(value).trim().replace(/\s+/g, ' ').toLowerCase();
+
+    async function crudView(root, cfg, ctx, archiveEntry = null) {
       const [items, lookups] = await Promise.all([api('GET', cfg.path), loadLookups(cfg.lookups || [])]);
       let list = items;
       let selected = null;          // { record, isNew }
@@ -926,6 +1065,26 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
           try {
             const edits = form.collect();
             if (cfg.finish) cfg.finish(edits);
+            if (archiveEntry && selected.isNew) {
+              const contract = experienceKey(edits.contract_number);
+              const customer = experienceKey(edits.customer_name);
+              const matches = contract ? list.filter((item) => experienceKey(item.contract_number) === contract) : [];
+              if (matches.length) {
+                const sameCustomer = matches.some((item) => experienceKey(item.customer_name) === customer);
+                if (sameCustomer || !(await ask({
+                  title: 'Проверьте номер договора',
+                  message: 'Такой номер уже есть в справочнике. Создать отдельную запись?',
+                  items: matches.map((item) => `${item.customer_name} — ${item.subject}`),
+                  ok: 'Создать отдельную запись',
+                }))) {
+                  searchInput.value = edits.contract_number;
+                  search = searchInput.value;
+                  drawList();
+                  msg.show('warning', 'Проверьте существующие договоры в списке слева.');
+                  return;
+                }
+              }
+            }
             const { record: saved, warning } = await writeRecord(cfg.path, recordForWrite(selected.record, edits));
             formDirty = false;
             list = await api('GET', cfg.path);
@@ -964,6 +1123,17 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       if (roleSelect) roleSelect.addEventListener('change', () => { filterRole = roleSelect.value; drawList(); });
       const addButton = h('button', { type: 'button', class: 'primary', text: `Добавить ${cfg.one}`,
         onclick: () => choose(cfg.blank ? cfg.blank(filterRole) : {}, true) });
+      if (archiveEntry) {
+        const service = archiveEntry.services.length === 1
+          ? lookups.serviceRecords.find((item) => item.code === archiveEntry.services[0]) : null;
+        selected = {
+          isNew: true,
+          record: { customer_name: archiveEntry.customer_guess, service_id: service?.id },
+        };
+        searchInput.value = archiveEntry.customer_guess;
+        search = searchInput.value;
+        root.append(h('p', { class: 'hint', text: `Из архива: ${archiveEntry.folder}. Проверьте заказчика и услугу. Добавляйте выполненные работы по договору и акту.` }));
+      }
       drawList();
       drawForm();
       root.append(msg.el, h('div', { class: 'refs-layout' },
@@ -1813,7 +1983,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       drawExperience();
 
       /* папка и сборка */
-      const folder = h('input', { type: 'text', value: str(tender.output_dir), autocomplete: 'off', placeholder: 'C:\\Тендеры\\Название заявки', 'aria-label': 'Папка для пакета' });
+      const folder = h('input', { type: 'text', value: str(tender.output_dir), autocomplete: 'off', placeholder: 'Полный путь к папке на компьютере с программой', 'aria-label': 'Папка для пакета' });
       const msg = notice();
       const resultBox = h('div');
       const buildButton = h('button', { type: 'button', class: 'primary big', text: 'Собрать пакет' });
@@ -1878,7 +2048,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
             expList, expSummary)),
         h('div', { class: 'card sticky' }, h('h2', { text: 'Сборка' }),
           h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Папка, в которую собрать пакет' }), folder,
-            h('span', { class: 'hint', text: 'Полный путь на этом компьютере, например C:\\Тендеры\\Коряжма. Браузер не умеет выбирать папку, поэтому путь вводится текстом (его можно скопировать из проводника). Папка запоминается в тендере после первой сборки.' })),
+            h('span', { class: 'hint', text: 'Полный путь на этом компьютере, например C:\\Тендеры\\Коряжма в Windows или /home/user/Тендеры/Коряжма в Linux. Браузер не умеет выбирать папку, поэтому путь вводится текстом (его можно скопировать из проводника). Папка запоминается в тендере после первой сборки.' })),
           h('div', { class: 'actions' }, buildButton), msg.el, resultBox)));
       if (isCurrentRender(ctx)) buildRegistry.attach(tender.id, { setBusy, show: showOutcome });
     }
