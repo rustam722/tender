@@ -87,7 +87,7 @@ from app.models import (
     ROLE_PARTICIPANT, TENDER_LABELS,
     CustomerProfile, DocSpec, LotItem, Organization, TenderCostItem, TenderLaborRow,
 )
-from app.render import gpn_forms
+from app.render import gpn_forms, source_forms
 from app.render.layouts import TableLayout, build_rows, load_layout
 from app.render.xlsx_render import (
     RATE_FIELDS, load_cellmap, lone_path, read_rates, required_cell_paths,
@@ -737,7 +737,7 @@ _GPN_LOT_TEMPLATES = frozenset({
 
 
 def word_conditions(document: str, spec: DocSpec) -> tuple[str, ...]:
-    extra = gpn_forms.extra_word_form(document, spec)
+    extra = gpn_forms.extra_word_form(document, spec) or source_forms.word_form(document, spec)
     if extra:
         return extra.conditions + ((extra.confirmation,) if extra.confirmation else ())
     if document == GPN_ASSESSMENT and spec.template.endswith(" КТ-576.docx"):
@@ -836,13 +836,20 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
             + ", ".join(f"«{name}»" for name in missing)
             + ". Впишите ответы в таблицу «Ответы по условиям сделки» на "
             "карточке тендера -- условия этой формы там уже перечислены.")
-    extra = gpn_forms.extra_word_form(document or "", spec) if spec else None
+    extra = ((gpn_forms.extra_word_form(document or "", spec)
+              or source_forms.word_form(document or "", spec)) if spec else None)
     if extra and extra.confirmation and conditions[extra.confirmation].strip().casefold() != "подтверждаю":
         raise ContextError(
             f"Форма «{document}» содержит заявление от имени участника. "
             f"Для сборки внесите «Подтверждаю» в поле «{extra.confirmation}» "
             "после проверки сведений и условий документа.")
     template_name = spec.template if spec else ""
+    if template_name == source_forms.IP_OFFER_TEMPLATE:
+        if not _lot_price(items):
+            raise ContextError("Для оферты укажите позиции лота и цены на карточке тендера.")
+        if conditions[source_forms.ROLE].strip() not in ("Участник закупки", "Лидер коллективного участника"):
+            raise ContextError("В поле «Оферта — роль участника» укажите «Участник закупки» "
+                               "или «Лидер коллективного участника» по документации закупки.")
     if template_name in gpn_forms.BID_TEMPLATE_NAMES:
         for key, allowed in ((gpn_forms.BID_AGREEMENT, ("1", "2")),
                              (gpn_forms.BID_APPROVAL, ("1", "2", "3"))):
@@ -851,10 +858,10 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
                                    f"в поле «{key}». Допустимые значения: {', '.join(allowed)}.")
     selected_employees = (_picked_resources(tender.employee_ids, repo.get_employee,
                                             document, "сотрудников")
-                          if template_name == GPN_STAFF_TEMPLATE else [])
+                          if template_name in {GPN_STAFF_TEMPLATE, source_forms.IP_STAFF_TEMPLATE} else [])
     selected_assets = (_picked_resources(tender.asset_ids, repo.get_asset,
                                          document, "оборудование и другие ресурсы")
-                       if template_name == GPN_ASSETS_TEMPLATE else [])
+                       if template_name in {GPN_ASSETS_TEMPLATE, source_forms.IP_ASSETS_TEMPLATE} else [])
     # Документ, который печатает цену по позициям лота, напечатает ровно то,
     # что сложится из их цен, -- и на нуле встанет в список «Записано» как ни
     # в чём не бывало. Коммерческое предложение на ноль рублей -- не документ:

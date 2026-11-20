@@ -1987,13 +1987,15 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       drawExperience();
 
       const resourceTypes = [
-        { key: 'employee_ids', template: 'ГПН — форма 5 Кадровые ресурсы.docx',
-          path: '/api/employees', title: 'Сотрудники для формы 5',
+        { key: 'employee_ids', templates: ['ГПН — форма 5 Кадровые ресурсы.docx',
+            'Инфраструктурные проекты — форма 9 Кадры.docx'],
+          path: '/api/employees', title: 'Сотрудники для справки',
           label: (r) => [r.full_name, r.position].filter(Boolean).join(' — ') },
-        { key: 'asset_ids', template: 'ГПН — форма 8 МТР.docx',
-          path: '/api/assets', title: 'Ресурсы для формы 8',
+        { key: 'asset_ids', templates: ['ГПН — форма 8 МТР.docx',
+            'Инфраструктурные проекты — форма 8 МТР.docx'],
+          path: '/api/assets', title: 'Ресурсы для справки',
           label: (r) => [r.name, r.maker_model, r.ownership_basis].filter(Boolean).join(' — ') },
-      ].filter((kind) => Object.values(profile?.docs || {}).some((spec) => spec.template === kind.template));
+      ].filter((kind) => Object.values(profile?.docs || {}).some((spec) => kind.templates.includes(spec.template)));
       const resourceSelections = {};
       const resourceCards = await Promise.all(resourceTypes.map(async (kind) => {
         const options = await api('GET', kind.path);

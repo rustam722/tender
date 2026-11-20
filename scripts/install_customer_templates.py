@@ -8,6 +8,7 @@ from dataclasses import replace
 from app import config, db
 from app.models import ROLE_CUSTOMER, CustomerProfile, DocSpec, Organization
 from app.render.gpn_forms import extra_document_specs
+from app.render.source_forms import customer_specs
 from app.render.xlsx_render import load_cellmap
 from app.repo import Repo
 
@@ -54,6 +55,7 @@ CUSTOMER_TEMPLATES = (
          OFFER: DocSpec(template="Гознак КБФ — форма 2 Техническое предложение.docx",
                         prefix="Черновик 2. "),
      }),
+    *customer_specs(),
 )
 
 
@@ -99,7 +101,7 @@ def install(repo: Repo) -> list[str]:
         if added:
             # У нефтяных заказчиков подбирают приложения и ценовую форму по лоту.
             default = [key for key in added
-                       if key == BID or (key == OFFER and not specs[key].cellmap)]
+                       if key == BID or (key == OFFER and specs[key].template.startswith("Гознак КБФ"))]
             documents = list(dict.fromkeys([*profile.documents, *default]))
             repo.save_customer_profile(replace(profile, docs=docs, documents=documents))
             messages.append(f"{source.short_name} — добавлено: {', '.join(added)}.")
