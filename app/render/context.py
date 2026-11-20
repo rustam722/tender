@@ -39,6 +39,8 @@
     employees, assets, experience
                        {"headers": [...], "rows": [[...]]} под раскладку
     selected_experience выбранные договоры до форматирования таблицы, с суммой Decimal
+    selected_employees  сотрудники, выбранные для формы 5
+    selected_assets     ресурсы, выбранные для формы 8
     declaration_text   текст декларации из профиля заказчика
     conditions         ответы по условиям сделки: условие -> ответ
     rounding           разрядность округления итога без НДС (int, настройка
@@ -714,6 +716,46 @@ def _printed_price(document: str, cell_map, items: list[dict],
     return None
 
 
+GPN_STAFF_TEMPLATE = "ГПН — форма 5 Кадровые ресурсы.docx"
+GPN_ASSETS_TEMPLATE = "ГПН — форма 8 МТР.docx"
+GPN_ASSESSMENT = "Оценка соответствия КТ-576"
+GPN_ASSESSMENT_ANSWERS = (
+    "КТ-576 — 1. Доля материалов иностранного происхождения",
+    "КТ-576 — 2. Сервисные центры в России",
+    "КТ-576 — 3. Права на техническую документацию",
+    "КТ-576 — 4. Доля резидентов ЕАЭС в организации",
+    "КТ-576 — 5. Документы о производстве продукции в ЕАЭС",
+)
+_GPN_LOT_TEMPLATES = frozenset({
+    GPN_STAFF_TEMPLATE,
+    GPN_ASSETS_TEMPLATE,
+    "ГПН — форма 6 Опыт.docx",
+    "ННГ — форма 1 Заявка.docx",
+    "Хантос — форма 1 Заявка.docx",
+    "Славнефть-МНГ — форма 1 Заявка.docx",
+})
+
+
+def word_conditions(document: str, spec: DocSpec) -> tuple[str, ...]:
+    if document == GPN_ASSESSMENT and spec.template.endswith(" КТ-576.docx"):
+        return GPN_ASSESSMENT_ANSWERS
+    if spec.template in _GPN_LOT_TEMPLATES:
+        return ("Номер лота",)
+    return ()
+
+
+def _picked_resources(ids, find, document, selection_name):
+    if not ids:
+        raise ContextError(
+            f"Для «{document}» отметьте {selection_name} на экране «Сборка».")
+    try:
+        return [asdict(find(record_id)) for record_id in dict.fromkeys(ids)]
+    except LookupError:
+        raise ContextError(
+            f"В отборе для «{document}» есть удалённые записи. "
+            f"Заново отметьте {selection_name} на экране «Сборка».") from None
+
+
 def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
                   experience_ids: list[int] | tuple[int, ...] | None = None) -> dict:
     """Собирает контекст тендера. Неизвестный id -- LookupError по-русски.
@@ -777,16 +819,24 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
     # семи неудачных сборок. Умолчания нет: «подтверждаю», подставленное за
     # человека, связало бы фирму условием, которого никто не читал, -- так же,
     # как пустая обязательная клетка, это отказ, а не догадка.
+    fields_to_check = word_conditions(document or "", spec) if spec else ()
     if cell_map is not None:
-        missing = [name for name in required_conditions(cell_map)
-                   if not str(conditions.get(name, "")).strip()]
-        if missing:
-            raise ContextError(
-                f"Форма «{document}» требует ответов по условиям сделки, а в "
-                "тендере их нет: "
-                + ", ".join(f"«{name}»" for name in missing)
-                + ". Впишите ответы в таблицу «Ответы по условиям сделки» на "
-                "карточке тендера -- условия этой формы там уже перечислены.")
+        fields_to_check = (*fields_to_check, *required_conditions(cell_map))
+    missing = [name for name in fields_to_check if not str(conditions.get(name, "")).strip()]
+    if missing:
+        raise ContextError(
+            f"Форма «{document}» требует ответов по условиям сделки, а в "
+            "тендере их нет: "
+            + ", ".join(f"«{name}»" for name in missing)
+            + ". Впишите ответы в таблицу «Ответы по условиям сделки» на "
+            "карточке тендера -- условия этой формы там уже перечислены.")
+    template_name = spec.template if spec else ""
+    selected_employees = (_picked_resources(tender.employee_ids, repo.get_employee,
+                                            document, "сотрудников")
+                          if template_name == GPN_STAFF_TEMPLATE else [])
+    selected_assets = (_picked_resources(tender.asset_ids, repo.get_asset,
+                                         document, "оборудование и другие ресурсы")
+                       if template_name == GPN_ASSETS_TEMPLATE else [])
     # Документ, который печатает цену по позициям лота, напечатает ровно то,
     # что сложится из их цен, -- и на нуле встанет в список «Записано» как ни
     # в чём не бывало. Коммерческое предложение на ноль рублей -- не документ:
@@ -844,6 +894,8 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
         "assets": _table(layouts["assets"], repo.list_assets()),
         "experience": _table(layouts["experience"], selected),
         "selected_experience": [asdict(record) for record in selected],
+        "selected_employees": selected_employees,
+        "selected_assets": selected_assets,
         "declaration_text": profile.declaration_text if profile else "",
         "conditions": conditions,
         # Разрядность округления итога -- для клетки округления книги (D88

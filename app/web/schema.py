@@ -421,6 +421,11 @@ def _check_field(entity: Entity, name: str, value, path: list):
             fail(entity, path, "такой даты нет в календаре. Формат: ГГГГ-ММ-ДД.")
     if name in entity.dirs and value:
         return check_out_dir(value, entity, path)
+    if entity is TENDERS and name in {"employee_ids", "asset_ids"}:
+        for index, record_id in enumerate(value):
+            if not 0 < record_id <= MAX_INT:
+                fail(entity, path + [index], "неверный номер записи справочника.")
+        return list(dict.fromkeys(value))
     if name == "total_rounding_digits":
         low, high = _ROUNDING_RANGE
         if not low <= value <= high:

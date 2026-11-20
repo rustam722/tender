@@ -59,7 +59,7 @@ from app.calc import (
 )
 from app.inn.lookup import build_draft
 from app.render.context import (
-    DOCUMENTS, build_context, labor_rows, money, required_conditions,
+    DOCUMENTS, build_context, labor_rows, money, required_conditions, word_conditions,
 )
 from app.render.package import build_package, planned_files
 from app.render.preview import preview_document
@@ -431,6 +431,8 @@ def _conditions(tender_id: int):
     rows: dict[str, list[str]] = {}         # условие -> документы, что его требуют
     warnings: list[str] = []
     for document, spec in (profile.docs.items() if profile else ()):
+        for name in word_conditions(document, spec):
+            rows.setdefault(name, []).append(document)
         if not spec.cellmap:
             continue
         try:

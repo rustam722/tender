@@ -248,6 +248,14 @@ _MIGRATIONS = [
     PRAGMA user_version = 7;
     COMMIT;
     """,
+    # 8: состав команды и ресурсов конкретной закупки.
+    """
+    BEGIN;
+    ALTER TABLE tender ADD COLUMN employee_ids TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE tender ADD COLUMN asset_ids TEXT NOT NULL DEFAULT '[]';
+    PRAGMA user_version = 8;
+    COMMIT;
+    """,
 ]
 
 SCHEMA_VERSION = len(_MIGRATIONS)

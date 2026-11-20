@@ -283,6 +283,9 @@ function createBuilder({ api: call, confirmReplace, registry = buildRegistry }) 
       return { status: 'failed', error: 'Укажите папку, в которую собирать пакет.', remember: false };
     }
     const base = `/api/tenders/${tenderId}`;
+    if (request.resources) {
+      await call('POST', '/api/tenders', { id: tenderId, ...request.resources });
+    }
     const body = { documents, output_dir: outputDir, experience_ids: experienceIds };
     const plan = await call('POST', `${base}/plan`, body);
     const existing = plan.files.filter((file) => file.exists);
@@ -1941,7 +1944,8 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       const choices = documentChoices(profiles, tender, catalogue);
       const chosen = new Set(choices.filter((c) => c.checked).map((c) => c.name));
       const docList = h('div', { class: 'check-list' });
-      const hasProfile = profiles.some((p) => String(p.customer_id) === String(tender.customer_id));
+      const profile = profiles.find((p) => String(p.customer_id) === String(tender.customer_id));
+      const hasProfile = Boolean(profile);
       function drawDocs() {
         docList.replaceChildren(...choices.map((c) => h('label', {},
           h('input', { type: 'checkbox', checked: chosen.has(c.name), onchange: (e) => { if (e.target.checked) chosen.add(c.name); else chosen.delete(c.name); } }),
@@ -1982,6 +1986,32 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       serviceSelect.addEventListener('change', () => { serviceFilter = serviceSelect.value; drawExperience(); });
       drawExperience();
 
+      const resourceTypes = [
+        { key: 'employee_ids', template: 'ГПН — форма 5 Кадровые ресурсы.docx',
+          path: '/api/employees', title: 'Сотрудники для формы 5',
+          label: (r) => [r.full_name, r.position].filter(Boolean).join(' — ') },
+        { key: 'asset_ids', template: 'ГПН — форма 8 МТР.docx',
+          path: '/api/assets', title: 'Ресурсы для формы 8',
+          label: (r) => [r.name, r.maker_model, r.ownership_basis].filter(Boolean).join(' — ') },
+      ].filter((kind) => Object.values(profile?.docs || {}).some((spec) => spec.template === kind.template));
+      const resourceSelections = {};
+      const resourceCards = await Promise.all(resourceTypes.map(async (kind) => {
+        const options = await api('GET', kind.path);
+        resourceSelections[kind.key] = (tender[kind.key] || []).map(String);
+        const list = h('div', { class: 'check-list' }, options.map((record) => {
+          const name = kind.label(record);
+          return h('label', {},
+            h('input', { type: 'checkbox', checked: resourceSelections[kind.key].includes(String(record.id)),
+              'aria-label': name, onchange: (event) => {
+                resourceSelections[kind.key] = toggleId(resourceSelections[kind.key], record.id, event.target.checked);
+              } }),
+            h('span', { text: name }));
+        }));
+        if (!options.length) list.append(h('p', { class: 'empty', text: 'Добавьте записи в соответствующий справочник.' }));
+        return h('div', { class: 'card' }, h('h2', { text: kind.title }),
+          h('p', { class: 'hint', text: 'Отметьте записи для этого лота. Отбор сохраняется при сборке.' }), list);
+      }));
+
       /* папка и сборка */
       const folder = h('input', { type: 'text', value: str(tender.output_dir), autocomplete: 'off', placeholder: 'Полный путь к папке на компьютере с программой', 'aria-label': 'Папка для пакета' });
       const msg = notice();
@@ -1997,7 +2027,8 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
       });
       buildButton.addEventListener('click', async () => {
         const outcome = await builder.run({ tenderId: tender.id, documents: choices.filter((c) => chosen.has(c.name)).map((c) => c.name),
-          outputDir: folder.value, experienceIds: selected });
+          outputDir: folder.value, experienceIds: selected,
+          resources: resourceTypes.length ? { ...resourceSelections } : undefined });
         if (outcome.status === 'busy') msg.show('warning', 'Сборка этого тендера или в эту папку уже идёт. Дождитесь её окончания.');
       });
       /* Состояние кнопки и результат приходят из реестра: так они переживают переход
@@ -2045,7 +2076,7 @@ if (typeof document !== 'undefined' && document.getElementById('screen')) {
           h('div', { class: 'card' }, h('h2', { text: 'Опыт для справки' }),
             h('div', { class: 'inline' }, h('div', {}, h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Показать опыт по услуге' }), serviceSelect))),
             h('p', { class: 'hint', text: serviceFilter ? 'Показан опыт по услуге тендера; выберите «Все услуги», чтобы увидеть остальное.' : 'В тендере не выбрана услуга (поле «Услуга» в шапке): показан весь опыт.' }),
-            expList, expSummary)),
+            expList, expSummary), resourceCards),
         h('div', { class: 'card sticky' }, h('h2', { text: 'Сборка' }),
           h('label', { class: 'field' }, h('span', { class: 'lbl', text: 'Папка, в которую собрать пакет' }), folder,
             h('span', { class: 'hint', text: 'Полный путь на этом компьютере, например C:\\Тендеры\\Коряжма в Windows или /home/user/Тендеры/Коряжма в Linux. Браузер не умеет выбирать папку, поэтому путь вводится текстом (его можно скопировать из проводника). Папка запоминается в тендере после первой сборки.' })),

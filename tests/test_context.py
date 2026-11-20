@@ -26,7 +26,7 @@ DOC_MTR = "Справка о МТР"
 TOP_LEVEL_KEYS = {
     "org", "customer", "tender", "items", "estimate", "labor", "employees",
     "assets", "experience", "declaration_text", "conditions", "today", "today_long",
-    "money", "number_ru", "selected_experience",
+    "money", "number_ru", "selected_experience", "selected_employees", "selected_assets",
     "money_total", "materials", "subcontract", "date_ru", "date_long", "warnings",
     "printed_price_wo_vat", "rounding",
 }
