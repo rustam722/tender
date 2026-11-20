@@ -38,6 +38,7 @@
                        rate_value и amount_value -- Decimal
     employees, assets, experience
                        {"headers": [...], "rows": [[...]]} под раскладку
+    selected_experience выбранные договоры до форматирования таблицы, с суммой Decimal
     declaration_text   текст декларации из профиля заказчика
     conditions         ответы по условиям сделки: условие -> ответ
     rounding           разрядность округления итога без НДС (int, настройка
@@ -48,6 +49,7 @@
     today_long         та же дата, «24» октября 2025 г.; `date_long(today)`
                        в шаблоне -- ошибка: `today` уже отформатирован
     money              функция: Decimal -> «5 985 000,00»
+    number_ru          функция: точное число с десятичной запятой
     money_total        функция: список Decimal -> Decimal, сумма строк, каждая из
                        которых округлена до копеек так, как напечатана; для
                        итогов под столбцами (app.calc.money_total)
@@ -116,6 +118,7 @@ DOCUMENTS = (
     "Справка об опыте",
     "Анкета участника",
     "Заявка на участие",
+    "Оценка соответствия КТ-576",
 )
 
 # Документы, которые собираются ПО ФОРМЕ ЗАКАЗЧИКА: общего бланка у них нет и
@@ -139,6 +142,7 @@ CUSTOMER_FORM_DOCUMENTS = frozenset({
     "ТКП по форме заказчика",
     "Анкета участника",
     "Заявка на участие",
+    "Оценка соответствия КТ-576",
 })
 
 # Документы, несущие табличную справку, -- имена из списка документов
@@ -839,6 +843,7 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
         "employees": _table(layouts["employees"], repo.list_employees()),
         "assets": _table(layouts["assets"], repo.list_assets()),
         "experience": _table(layouts["experience"], selected),
+        "selected_experience": [asdict(record) for record in selected],
         "declaration_text": profile.declaration_text if profile else "",
         "conditions": conditions,
         # Разрядность округления итога -- для клетки округления книги (D88
@@ -853,6 +858,7 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
         "today_long": date_long(_today().isoformat()),
         "money": money,
         "money_total": money_total,
+        "number_ru": number_ru,
         "date_ru": date_ru,
         "date_long": date_long,
         "warnings": warnings,
