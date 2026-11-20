@@ -7,6 +7,7 @@ from dataclasses import replace
 
 from app import config, db
 from app.models import ROLE_CUSTOMER, CustomerProfile, DocSpec, Organization
+from app.render.gpn_forms import extra_document_specs
 from app.render.xlsx_render import load_cellmap
 from app.repo import Repo
 
@@ -29,6 +30,7 @@ def _gpn_forms(label, price_label, assessment_number):
         "Оценка соответствия КТ-576": DocSpec(
             template=f"{price_label} — форма {assessment_number} КТ-576.docx",
             prefix=f"Черновик форма {assessment_number}. "),
+        **extra_document_specs(label),
     }
 
 

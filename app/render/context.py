@@ -87,6 +87,7 @@ from app.models import (
     ROLE_PARTICIPANT, TENDER_LABELS,
     CustomerProfile, DocSpec, LotItem, Organization, TenderCostItem, TenderLaborRow,
 )
+from app.render import gpn_forms
 from app.render.layouts import TableLayout, build_rows, load_layout
 from app.render.xlsx_render import (
     RATE_FIELDS, load_cellmap, lone_path, read_rates, required_cell_paths,
@@ -121,6 +122,7 @@ DOCUMENTS = (
     "Анкета участника",
     "Заявка на участие",
     "Оценка соответствия КТ-576",
+    *gpn_forms.DOCUMENT_NAMES,
 )
 
 # Документы, которые собираются ПО ФОРМЕ ЗАКАЗЧИКА: общего бланка у них нет и
@@ -145,6 +147,7 @@ CUSTOMER_FORM_DOCUMENTS = frozenset({
     "Анкета участника",
     "Заявка на участие",
     "Оценка соответствия КТ-576",
+    *gpn_forms.DOCUMENT_NAMES,
 })
 
 # Документы, несущие табличную справку, -- имена из списка документов
@@ -730,15 +733,18 @@ _GPN_LOT_TEMPLATES = frozenset({
     GPN_STAFF_TEMPLATE,
     GPN_ASSETS_TEMPLATE,
     "ГПН — форма 6 Опыт.docx",
-    "ННГ — форма 1 Заявка.docx",
-    "Хантос — форма 1 Заявка.docx",
-    "Славнефть-МНГ — форма 1 Заявка.docx",
 })
 
 
 def word_conditions(document: str, spec: DocSpec) -> tuple[str, ...]:
+    extra = gpn_forms.extra_word_form(document, spec)
+    if extra:
+        return extra.conditions + ((extra.confirmation,) if extra.confirmation else ())
     if document == GPN_ASSESSMENT and spec.template.endswith(" КТ-576.docx"):
         return GPN_ASSESSMENT_ANSWERS
+    if spec.template in gpn_forms.BID_TEMPLATE_NAMES:
+        return (gpn_forms.LOT_NUMBER, gpn_forms.BID_AGREEMENT, gpn_forms.BID_APPROVAL,
+                gpn_forms.BID_ATTACHMENTS)
     if spec.template in _GPN_LOT_TEMPLATES:
         return ("Номер лота",)
     return ()
@@ -830,7 +836,19 @@ def build_context(tender_id: int, repo: Repo, *, document: str | None = None,
             + ", ".join(f"«{name}»" for name in missing)
             + ". Впишите ответы в таблицу «Ответы по условиям сделки» на "
             "карточке тендера -- условия этой формы там уже перечислены.")
+    extra = gpn_forms.extra_word_form(document or "", spec) if spec else None
+    if extra and extra.confirmation and conditions[extra.confirmation].strip().casefold() != "подтверждаю":
+        raise ContextError(
+            f"Форма «{document}» содержит заявление от имени участника. "
+            f"Для сборки внесите «Подтверждаю» в поле «{extra.confirmation}» "
+            "после проверки сведений и условий документа.")
     template_name = spec.template if spec else ""
+    if template_name in gpn_forms.BID_TEMPLATE_NAMES:
+        for key, allowed in ((gpn_forms.BID_AGREEMENT, ("1", "2")),
+                             (gpn_forms.BID_APPROVAL, ("1", "2", "3"))):
+            if conditions[key].strip() not in allowed:
+                raise ContextError(f"Для формы «{document}» укажите номер варианта "
+                                   f"в поле «{key}». Допустимые значения: {', '.join(allowed)}.")
     selected_employees = (_picked_resources(tender.employee_ids, repo.get_employee,
                                             document, "сотрудников")
                           if template_name == GPN_STAFF_TEMPLATE else [])
